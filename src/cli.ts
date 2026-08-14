@@ -11,9 +11,10 @@ import { liveDeps, runInit } from "./commands/init.ts";
 import { liveClaudeDeps, runClaude } from "./commands/claude.ts";
 import { liveDoctorDeps, runDoctor } from "./commands/doctor.ts";
 import { runStatus } from "./commands/status.ts";
+import { liveUpdateDeps, runUpdate } from "./commands/update.ts";
 import { ttyPrompter } from "./secrets.ts";
 
-export type Verb = "init" | "claude" | "claude new" | "doctor" | "status";
+export type Verb = "init" | "claude" | "claude new" | "doctor" | "status" | "update";
 
 export interface Dispatch {
   verb: Verb | null;
@@ -21,7 +22,7 @@ export interface Dispatch {
   args: string[];
 }
 
-const VERBS = new Set(["init", "claude", "doctor", "status"]);
+const VERBS = new Set(["init", "claude", "doctor", "status", "update"]);
 
 /**
  * Pure: map argv to a verb plus untouched passthrough arguments.
@@ -60,6 +61,7 @@ export function usage(): string {
     row("claude new", "force a new session"),
     row("doctor", "diagnose a broken setup"),
     row("status", "show federation and session state"),
+    row("update", "install the latest suite CLI"),
     "",
     nextCommand("suite init"),
   ].join("\n");
@@ -90,6 +92,7 @@ export async function run(argv: string[]): Promise<number> {
     const { args } = parse(argv);
     return runClaude(await liveClaudeDeps(), { userArgs: args, force: verb === "claude new" });
   }
+  if (verb === "update") return runUpdate(liveUpdateDeps());
   if (verb === "doctor") return runDoctor(await liveDoctorDeps());
   return runStatus(await liveDoctorDeps());
 }
