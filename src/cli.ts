@@ -9,6 +9,7 @@
 import { VERSION } from "./version.ts";
 import { row, nextCommand } from "./ui.ts";
 import { liveDeps, runInit } from "./commands/init.ts";
+import { liveClaudeDeps, runClaude } from "./commands/claude.ts";
 import { ttyPrompter } from "./secrets.ts";
 
 export type Verb = "init" | "claude" | "claude new" | "doctor" | "status";
@@ -34,9 +35,7 @@ export function parse(argv: string[]): Dispatch {
   return { verb: head as Verb, args: rest };
 }
 
-const STUBS: Record<Exclude<Verb, "init">, string> = {
-  claude: "suite claude is implemented in stage 5.",
-  "claude new": "suite claude new is implemented in stage 5.",
+const STUBS: Record<Exclude<Verb, "init" | "claude" | "claude new">, string> = {
   doctor: "suite doctor is implemented in stage 6.",
   status: "suite status is implemented in stage 6.",
 };
@@ -89,7 +88,13 @@ export async function run(argv: string[]): Promise<number> {
     const { exitCode } = await runInit(liveDeps(ttyPrompter()), parseInitOptions(argv.slice(1)));
     return exitCode;
   }
-  console.log(STUBS[verb as Exclude<Verb, "init">]);
+  if (verb === "claude" || verb === "claude new") {
+    // Everything after the verb is Claude's, verbatim: the wrapper reads no
+    // options of its own here, so a user flag can never be eaten by us.
+    const { args } = parse(argv);
+    return runClaude(await liveClaudeDeps(), { userArgs: args, force: verb === "claude new" });
+  }
+  console.log(STUBS[verb as Exclude<Verb, "init" | "claude" | "claude new">]);
   return 0;
 }
 

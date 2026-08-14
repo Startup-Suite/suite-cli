@@ -158,6 +158,58 @@ If tmux is not installed, `suite` can still run the agent directly — **with a
 warning**, never silently. A silent fallback would reproduce the exact failure
 persistence exists to prevent.
 
+## `suite claude`
+
+`suite claude [...]` runs
+`claude --dangerously-load-development-channels server:suite-channel <your args>`
+inside the session for this directory. Channel plugins must be on Anthropic's
+allowlist to load normally; until this one is approved every session needs that
+flag, and the wrapper injects it so that when it is approved the flag
+disappears from one place and nobody's muscle memory changes.
+
+* **live** → attach. **none** → create detached, then attach. `Ctrl-b d`, or
+  closing the terminal, leaves the agent running; `suite claude` again
+  re-attaches to the *same* session.
+* **stale** → **recycled, out loud.** The dead session is named on stdout, then
+  killed by name (`kill-session -t`, never `kill-server`) and a fresh agent
+  starts. Silently attaching would present a dead agent as a healthy one.
+* `suite claude new [...]` is the **one** explicit way to force a second
+  session; it picks the next free name (`…-2`, `…-3`) rather than colliding.
+* The child's exit code is `suite`'s exit code, and the attach path keeps the
+  real TTY.
+
+### `-p` bypasses tmux — a decision, not an accident
+
+`suite claude -p '…'` **execs Claude directly and never touches tmux**, not even
+to detect session state. `-p` is a one-shot scripted call whose output the
+caller captures: forcing it through an interactive attach would hide its stdout
+inside a pane, hand it a terminal it does not want, and leave a session behind
+for a process that had nothing to persist. There is no session to keep alive,
+so there is nothing for tmux to buy. `--print` is treated identically, including
+after `--`, because that is how Claude itself reads it.
+
+### Passthrough is total
+
+The wrapper parses the verb `new` and a single leading `--`, and nothing else.
+Every other argument reaches Claude **verbatim and in order**, after the
+injected flag — `--resume`, `--version`, `-p`, and arguments that look like
+flags a wrapper might want to own. Nothing goes near a shell, so `$HOME`,
+quotes and spaces are literal bytes. Tests assert the exact delivered argv for
+each of those cases. `suite claude -- new` is how you send the literal word
+`new` to Claude.
+
+### The first-run notice
+
+On the **first run on a machine only**, `suite claude` prints one line saying it
+is loading a development channel plugin that is not yet on Anthropic's
+allowlist — a `!` in yellow, the sentence at default weight, a blank line, and
+silence on every run after that. No box and no border: a box is recurring chrome
+that reads as a permanent banner, and this is something that happened once, not
+something that lives there. It is deliberate rather than noise — **a wrapper
+that silently hides a flag containing the word "dangerously" trains you not to
+look at the next one.** The seen-flag is stored in
+`~/.config/suite/state.json`, never in a repository.
+
 ## MCP registration
 
 `suite init` writes both MCP entries with `claude mcp add` rather than editing
