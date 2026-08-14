@@ -93,12 +93,26 @@ function installCurlStub(sandbox: Sandbox, { succeed = true } = {}): void {
         "  shift",
         "done",
         `[ -n "$out" ] || exit 3`,
-        `cp ${JSON.stringify(bodyPath)} "$out"`,
+        // `cat >` rather than `cp`: the lean PATH carries cat and not cp, and
+        // a stub that reaches for a tool the fixture excludes would fail the
+        // test for a reason that has nothing to do with the launcher.
+        `cat ${JSON.stringify(bodyPath)} >"$out"`,
       ].join("\n")
     : ["#!/bin/sh", "exit 22"].join("\n");
   const curl = join(sandbox.stubBin, "curl");
   writeFileSync(curl, `${script}\n`);
   chmodSync(curl, 0o755);
+}
+
+/**
+ * An `unzip` that need do nothing: the launcher only asks whether it is on
+ * PATH, because the bun.sh installer -- not the launcher -- is what actually
+ * unzips. Its presence is the only thing under test.
+ */
+function installUnzipStub(sandbox: Sandbox): void {
+  const unzip = join(sandbox.stubBin, "unzip");
+  writeFileSync(unzip, "#!/bin/sh\nexit 0\n");
+  chmodSync(unzip, 0o755);
 }
 
 function runSuite(
@@ -191,6 +205,51 @@ describe("suite launcher with bun absent", () => {
     expect(r.status).toBe(127);
     expect(r.stderr).toContain("bun is not installed");
     expect(existsSync(sandbox.installedBun)).toBe(false);
+  });
+
+  /**
+   * One pair, deliberately: a guard that fires unconditionally would satisfy
+   * the absent case on its own. Only the present case can tell "checks for
+   * unzip" apart from "always refuses", so neither test means anything
+   * without the other.
+   */
+  describe("the unzip precondition", () => {
+    test("unzip absent: the tool is named, exit is 127, and nothing is half-installed", () => {
+      const sandbox = makeSandbox();
+      installCurlStub(sandbox);
+      // No unzip stub: under the lean PATH unzip is absent by construction.
+      const r = runSuite(sandbox, ["init"], "y\n", { lean: true });
+
+      expect(r.stderr).toContain("unzip");
+      expect(r.status).toBe(127);
+      // Refusing after downloading, or after part-writing ~/.bun, would be a
+      // worse outcome than the failure it replaces.
+      expect(existsSync(sandbox.installedBun)).toBe(false);
+      expect(existsSync(join(sandbox.home, ".bun"))).toBe(false);
+    });
+
+    test("unzip present: the same accepted install proceeds and re-execs", () => {
+      const sandbox = makeSandbox();
+      installCurlStub(sandbox);
+      installUnzipStub(sandbox);
+      const r = runSuite(sandbox, ["init"], "y\n", { lean: true });
+
+      expect(r.stderr).toContain("bun installed.");
+      expect(r.status).toBe(0);
+      expect(r.stdout).toContain("stub-bun");
+      expect(existsSync(sandbox.installedBun)).toBe(true);
+    });
+
+    test("the check stays after the offer: declining still exits 1, not 127", () => {
+      const sandbox = makeSandbox();
+      installCurlStub(sandbox);
+      const r = runSuite(sandbox, ["init"], "n\n", { lean: true });
+
+      expect(r.stderr).toContain("not installing bun");
+      expect(r.status).toBe(1);
+      expect(r.stderr).not.toContain("unzip");
+      expect(existsSync(join(sandbox.home, ".bun"))).toBe(false);
+    });
   });
 
   test("--version still answers without bun and without prompting", () => {

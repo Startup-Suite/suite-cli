@@ -53,9 +53,19 @@ bootstrap_bun() {
 		;;
 	esac
 
-	for tool in curl bash; do
+	# unzip belongs on this list because the bun.sh installer downloads a zip
+	# and unzips it: without unzip the installer fails partway, leaving a
+	# confusing error from someone else's script instead of a named
+	# precondition from ours. It is CHECKED, never installed -- installing it
+	# would mean a package manager, which means root, and this file's contract
+	# is "no sudo, ever". A fix whose failure mode is invisible to a root
+	# container and fatal for an unprivileged user is the wrong fix, so we say
+	# what is missing and stop.
+	for tool in curl bash unzip; do
 		if ! command -v "$tool" >/dev/null 2>&1; then
 			printf 'suite: %s is needed to install bun, and is not on PATH.\n' "$tool" >&2
+			printf 'suite: install %s yourself (suite never runs a package manager, and never sudo), then re-run suite init.\n' \
+				"$tool" >&2
 			exit 127
 		fi
 	done
