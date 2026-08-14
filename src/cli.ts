@@ -2,14 +2,15 @@
 /**
  * suite — command-line tool for wiring a Claude Code runtime to Startup Suite.
  *
- * Stage 1 wires the verb dispatch only; each verb is a stub that names the
- * stage which implements it. Argument passthrough for `suite claude` is
- * deliberately total: the wrapper parses nothing beyond the verb.
+ * Argument passthrough for `suite claude` is deliberately total: the wrapper
+ * parses nothing beyond the verb, so a user flag can never be eaten by us.
  */
 import { VERSION } from "./version.ts";
 import { row, nextCommand } from "./ui.ts";
 import { liveDeps, runInit } from "./commands/init.ts";
 import { liveClaudeDeps, runClaude } from "./commands/claude.ts";
+import { liveDoctorDeps, runDoctor } from "./commands/doctor.ts";
+import { runStatus } from "./commands/status.ts";
 import { ttyPrompter } from "./secrets.ts";
 
 export type Verb = "init" | "claude" | "claude new" | "doctor" | "status";
@@ -34,11 +35,6 @@ export function parse(argv: string[]): Dispatch {
   }
   return { verb: head as Verb, args: rest };
 }
-
-const STUBS: Record<Exclude<Verb, "init" | "claude" | "claude new">, string> = {
-  doctor: "suite doctor is implemented in stage 6.",
-  status: "suite status is implemented in stage 6.",
-};
 
 /**
  * The only options `suite init` parses. Everything else the CLI takes is a
@@ -94,8 +90,8 @@ export async function run(argv: string[]): Promise<number> {
     const { args } = parse(argv);
     return runClaude(await liveClaudeDeps(), { userArgs: args, force: verb === "claude new" });
   }
-  console.log(STUBS[verb as Exclude<Verb, "init" | "claude" | "claude new">]);
-  return 0;
+  if (verb === "doctor") return runDoctor(await liveDoctorDeps());
+  return runStatus(await liveDoctorDeps());
 }
 
 if (import.meta.main) {
