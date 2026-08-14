@@ -17,6 +17,7 @@ import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildLeanBin, leanPath, LEAN_TOOLS, EXCLUDED_TOOLS, MissingHostToolError } from "./tool-free-path";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TEMPLATE = join(REPO_ROOT, "bin", "suite.template");
@@ -36,6 +37,8 @@ interface Sandbox {
   suite: string;
   bunInstall: string;
   stubBin: string;
+  /** A curated dir of only the tools the launcher needs -- see tool-free-path.ts. */
+  leanBin: string;
   installedBun: string;
 }
 
@@ -48,6 +51,7 @@ function makeSandbox(): Sandbox {
   mkdirSync(libDir, { recursive: true });
   mkdirSync(binDir, { recursive: true });
   mkdirSync(stubBin, { recursive: true });
+  const leanBin = buildLeanBin(join(home, "lean-bin"));
 
   const rendered = readFileSync(TEMPLATE, "utf8")
     .replaceAll("@SUITE_LIB_DIR@", libDir)
@@ -57,7 +61,7 @@ function makeSandbox(): Sandbox {
   chmodSync(suite, 0o755);
 
   const bunInstall = join(home, "bun-home");
-  return { home, suite, bunInstall, stubBin, installedBun: join(bunInstall, "bin", "bun") };
+  return { home, suite, bunInstall, stubBin, leanBin, installedBun: join(bunInstall, "bin", "bun") };
 }
 
 /**
@@ -101,6 +105,7 @@ function runSuite(
   sandbox: Sandbox,
   args: string[],
   stdin = "",
+  { lean = false } = {},
 ): { status: number; stdout: string; stderr: string } {
   const result = spawnSync(sandbox.suite, args, {
     input: stdin,
@@ -108,7 +113,7 @@ function runSuite(
     env: {
       // Deliberately minimal, and deliberately WITHOUT bun: the stub dir plus
       // the system directories bash and the coreutils live in.
-      PATH: `${sandbox.stubBin}:/usr/bin:/bin`,
+      PATH: lean ? leanPath(sandbox) : `${sandbox.stubBin}:/usr/bin:/bin`,
       HOME: sandbox.home,
       BUN_INSTALL: sandbox.bunInstall,
     },
@@ -125,7 +130,7 @@ describe("suite launcher with bun absent", () => {
     const sandbox = makeSandbox();
     const probe = spawnSync("sh", ["-c", "command -v bun"], {
       encoding: "utf8",
-      env: { PATH: `${sandbox.stubBin}:/usr/bin:/bin`, HOME: sandbox.home },
+      env: { PATH: leanPath(sandbox), HOME: sandbox.home },
     });
     expect(probe.status).not.toBe(0);
     expect((probe.stdout ?? "").trim()).toBe("");
@@ -201,5 +206,63 @@ describe("suite launcher with bun absent", () => {
     // eslint-disable-next-line no-control-regex
     expect(source).toMatch(/^[\x00-\x7F]*$/);
     expect(source).not.toMatch(/(?:^|[;&|]\s*|\bthen\s+|\bdo\s+|\bexec\s+)sudo\s/m);
+  });
+});
+
+/**
+ * The fixture's own anti-vacuity check. Every guard test built on top of the
+ * lean PATH is only as good as this: if the dir silently lost a tool, or
+ * silently kept one it was meant to exclude, those tests would pass without
+ * testing anything.
+ */
+describe("the lean PATH fixture", () => {
+  const underLeanPath = (script: string, sandbox: Sandbox) =>
+    spawnSync("/bin/sh", ["-c", script], {
+      encoding: "utf8",
+      env: { PATH: leanPath(sandbox), HOME: sandbox.home },
+    });
+
+  test("the tools whose absence is under test are genuinely unreachable", () => {
+    const sandbox = makeSandbox();
+    for (const tool of EXCLUDED_TOOLS) {
+      const probe = underLeanPath(`command -v ${tool}`, sandbox);
+      expect({ tool, status: probe.status, stdout: (probe.stdout ?? "").trim() }).toEqual({
+        tool,
+        status: 1,
+        stdout: "",
+      });
+    }
+  });
+
+  test("but the dir is lean, not broken: the needed tools all resolve and run", () => {
+    const sandbox = makeSandbox();
+    for (const tool of LEAN_TOOLS) {
+      const probe = underLeanPath(`command -v ${tool}`, sandbox);
+      expect({ tool, status: probe.status }).toEqual({ tool, status: 0 });
+      expect((probe.stdout ?? "").trim()).toBe(join(sandbox.leanBin, tool));
+    }
+    const work = underLeanPath('d=$(mktemp -d) && printf ok >"$d/f" && cat "$d/f" && rm -rf "$d"', sandbox);
+    expect(work.status).toBe(0);
+    expect((work.stdout ?? "").trim()).toBe("ok");
+  });
+
+  test("a host missing a required tool throws a named error, not a half-populated dir", () => {
+    const dir = join(workRoot, "lean-impossible");
+    const absent = "suite-cli-tool-no-host-has-xyz";
+    // `sh` resolves and is linked first, so the dir is provably mid-build when
+    // the missing tool is reached -- exactly the half-populated state that must
+    // surface as a throw rather than as a usable-looking dir.
+    let thrown: unknown;
+    try {
+      buildLeanBin(dir, { tools: ["sh", absent, "cat"] });
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(MissingHostToolError);
+    expect((thrown as MissingHostToolError).tool).toBe(absent);
+    expect((thrown as Error).message).toContain(absent);
+    expect(existsSync(join(dir, "sh"))).toBe(true);
+    expect(existsSync(join(dir, absent))).toBe(false);
+    expect(existsSync(join(dir, "cat"))).toBe(false);
   });
 });
