@@ -38,6 +38,45 @@ export function parse(argv: string[]): Dispatch {
 }
 
 /**
+ * The ONE option `suite claude` owns: `--session NAME`.
+ *
+ * Passthrough is otherwise still total. This is the case the `--` terminator
+ * was written for in advance — "a user who writes `suite claude -- --resume`
+ * must get the same result once the wrapper grows an option". So the scan
+ * STOPS at the first `--`: after it, `--session` is Claude's argument and is
+ * left alone, exactly as it was before the wrapper owned the name.
+ *
+ * WHY IT IS A FLAG AND NOT A CONFIG KEY: asking for a second agent HERE, now,
+ * is a different request from changing the naming rule for every future run —
+ * see `sessionNameFromConfig`. It was already honoured all the way down; it
+ * had simply never been parsed, so `suite claude --session x` sent the flag to
+ * Claude, which has no such option. The README documented it regardless.
+ *
+ * Returns the name plus the arguments with the pair removed, because a flag we
+ * consumed must not ALSO reach Claude.
+ */
+export function parseClaudeOptions(args: string[]): { session?: string; rest: string[] } {
+  const rest: string[] = [];
+  let session: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--") {
+      // Everything from here is Claude's, terminator included.
+      rest.push(...args.slice(i));
+      break;
+    }
+    const next = args[i + 1];
+    if (arg === "--session" && next !== undefined) {
+      session = next;
+      i++;
+      continue;
+    }
+    if (arg !== undefined) rest.push(arg);
+  }
+  return session === undefined ? { rest } : { session, rest };
+}
+
+/**
  * The only options `suite init` parses. Everything else the CLI takes is a
  * verb, deliberately: an option surface is a thing to keep compatible forever.
  */
@@ -87,10 +126,15 @@ export async function run(argv: string[]): Promise<number> {
     return exitCode;
   }
   if (verb === "claude" || verb === "claude new") {
-    // Everything after the verb is Claude's, verbatim: the wrapper reads no
-    // options of its own here, so a user flag can never be eaten by us.
+    // Everything after the verb is Claude's, verbatim, EXCEPT `--session NAME`
+    // before a `--`. That one flag is ours; see parseClaudeOptions.
     const { args } = parse(argv);
-    return runClaude(await liveClaudeDeps(), { userArgs: args, force: verb === "claude new" });
+    const { session, rest } = parseClaudeOptions(args);
+    return runClaude(await liveClaudeDeps(), {
+      userArgs: rest,
+      force: verb === "claude new",
+      explicitSession: session,
+    });
   }
   if (verb === "update") return runUpdate(liveUpdateDeps());
   if (verb === "doctor") return runDoctor(await liveDoctorDeps());

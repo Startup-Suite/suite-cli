@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { parse, run, usage } from "../src/cli.ts";
+import { parse, parseClaudeOptions, run, usage } from "../src/cli.ts";
+import { emptyConfig } from "../src/config.ts";
+import { sessionNameFromConfig } from "../src/tmux.ts";
 import { row, nextCommand, colorEnabled, LABEL_WIDTH } from "../src/ui.ts";
 
 describe("verb dispatch", () => {
@@ -52,5 +54,58 @@ describe("output primitives", () => {
     expect(colorEnabled({ NO_COLOR: "1" }, true)).toBe(false);
     expect(colorEnabled({}, true)).toBe(true);
     expect(colorEnabled({}, false)).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* `--session NAME` — the one option `suite claude` owns                      */
+/* ------------------------------------------------------------------------- */
+
+describe("suite claude --session", () => {
+  test("the name is captured AND removed from what reaches Claude", () => {
+    // Both halves matter: a flag we consumed must not also be forwarded, or
+    // Claude sees an option it does not have.
+    expect(parseClaudeOptions(["--session", "brosnan"])).toEqual({ session: "brosnan", rest: [] });
+    expect(parseClaudeOptions(["--session", "moore", "--resume"])).toEqual({
+      session: "moore",
+      rest: ["--resume"],
+    });
+  });
+
+  test("CONTROL: without the flag, every argument still passes through untouched", () => {
+    // Kills a parser that ate arguments unconditionally.
+    expect(parseClaudeOptions(["--resume", "-p", "hello world"])).toEqual({
+      rest: ["--resume", "-p", "hello world"],
+    });
+    expect(parseClaudeOptions([])).toEqual({ rest: [] });
+  });
+
+  test("after `--` it is CLAUDE's flag, untouched — the terminator's whole purpose", () => {
+    // The module said in advance that `suite claude -- --resume` must keep
+    // working once the wrapper grew an option. This is that promise, tested.
+    expect(parseClaudeOptions(["--", "--session", "theirs"])).toEqual({
+      rest: ["--", "--session", "theirs"],
+    });
+    // Ours before the terminator, theirs after, in the same command line.
+    expect(parseClaudeOptions(["--session", "ours", "--", "--session", "theirs"])).toEqual({
+      session: "ours",
+      rest: ["--", "--session", "theirs"],
+    });
+  });
+
+  test("a dangling --session with no value is passed through, not swallowed", () => {
+    // Eating it would leave the user staring at a flag that vanished.
+    expect(parseClaudeOptions(["--session"])).toEqual({ rest: ["--session"] });
+  });
+
+  test("two agents in ONE directory get different session names", () => {
+    // The reason the flag exists. Same cwd, same config, different names.
+    const config = { ...emptyConfig(), runtimeId: "one-box" };
+    const a = sessionNameFromConfig(config, "/tmp/shared", "brosnan");
+    const b = sessionNameFromConfig(config, "/tmp/shared", "moore");
+    expect(a).not.toBe(b);
+    // CONTROL: with no override they collide — which is the default rule
+    // working as designed, and why the override is needed at all.
+    expect(sessionNameFromConfig(config, "/tmp/shared")).toBe(sessionNameFromConfig(config, "/tmp/shared"));
   });
 });

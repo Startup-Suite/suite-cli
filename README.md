@@ -97,7 +97,7 @@ again from the same place and you are back in the same session.
 | `suite claude [...]` | Runs Claude Code in the persistent session for this directory; re-attaches when one is already live. Every argument passes through verbatim |
 | `suite claude new [...]` | **The force-new verb.** Creates a second session even when one exists, under the next free name (`…-2`) |
 | `suite claude -p '…'` | One-shot, non-interactive: **bypasses tmux entirely** and execs Claude directly |
-| `suite claude --session NAME` | Per-invocation override of the derived session name. Not persisted |
+| `suite claude --session NAME` | Per-invocation override of the derived session name. The one option the wrapper owns; not persisted |
 | `suite claude -- …` | `--` terminates wrapper options; everything after it is Claude's, including the literal word `new` |
 | `suite update` | Re-runs the installer to replace this install with the latest published CLI |
 | `suite doctor` | Diagnoses a broken setup — one runnable remedy per failure, and a stale session is never reported green |
@@ -399,6 +399,29 @@ flags a wrapper might want to own. Nothing goes near a shell, so `$HOME`,
 quotes and spaces are literal bytes. Tests assert the exact delivered argv for
 each of those cases. `suite claude -- new` is how you send the literal word
 `new` to Claude.
+
+### Two agents on one machine
+
+Two runtimes on the same box, each wanting its own persistent session, is what
+`--session` is for:
+
+```
+suite claude --session brosnan
+suite claude --session moore
+```
+
+Each name resolves to its own tmux session, from the same directory, and each
+re-attaches to its own agent on the next run. It is the **one** option the
+wrapper parses; everything else still passes through verbatim, and after a `--`
+even `--session` belongs to Claude again.
+
+`sessionNaming: "runtime"` in `config.json` looks like the answer and usually is
+not. It names the session after the runtime id — but the runtime id comes from
+`config.json`, and agents sharing a `HOME` share that file. Two agents under one
+account would therefore resolve to the **same** session and silently attach to
+each other: a collision that looks exactly like a successful re-attach. It is
+the right rule only when a box runs one agent, or when each agent has its own
+`XDG_CONFIG_HOME`.
 
 ### The first-run notice
 
