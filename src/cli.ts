@@ -8,6 +8,8 @@
  */
 import { VERSION } from "./version.ts";
 import { row, nextCommand } from "./ui.ts";
+import { liveDeps, runInit } from "./commands/init.ts";
+import { ttyPrompter } from "./secrets.ts";
 
 export type Verb = "init" | "claude" | "claude new" | "doctor" | "status";
 
@@ -32,13 +34,26 @@ export function parse(argv: string[]): Dispatch {
   return { verb: head as Verb, args: rest };
 }
 
-const STUBS: Record<Verb, string> = {
-  init: "suite init is implemented in stage 3.",
+const STUBS: Record<Exclude<Verb, "init">, string> = {
   claude: "suite claude is implemented in stage 5.",
   "claude new": "suite claude new is implemented in stage 5.",
   doctor: "suite doctor is implemented in stage 6.",
   status: "suite status is implemented in stage 6.",
 };
+
+/**
+ * The only options `suite init` parses. Everything else the CLI takes is a
+ * verb, deliberately: an option surface is a thing to keep compatible forever.
+ */
+export function parseInitOptions(args: string[]): { checkout?: string; tokenFromEnv?: string } {
+  const out: { checkout?: string; tokenFromEnv?: string } = {};
+  for (let i = 0; i < args.length; i++) {
+    const next = args[i + 1];
+    if (args[i] === "--checkout" && next !== undefined) out.checkout = next;
+    if (args[i] === "--token-from-env" && next !== undefined) out.tokenFromEnv = next;
+  }
+  return out;
+}
 
 export function usage(): string {
   return [
@@ -55,7 +70,7 @@ export function usage(): string {
   ].join("\n");
 }
 
-export function run(argv: string[]): number {
+export async function run(argv: string[]): Promise<number> {
   if (argv[0] === "--version" || argv[0] === "-V") {
     console.log(VERSION);
     return 0;
@@ -70,10 +85,14 @@ export function run(argv: string[]): number {
     console.error("run: suite --help");
     return 2;
   }
-  console.log(STUBS[verb]);
+  if (verb === "init") {
+    const { exitCode } = await runInit(liveDeps(ttyPrompter()), parseInitOptions(argv.slice(1)));
+    return exitCode;
+  }
+  console.log(STUBS[verb as Exclude<Verb, "init">]);
   return 0;
 }
 
 if (import.meta.main) {
-  process.exit(run(process.argv.slice(2)));
+  process.exit(await run(process.argv.slice(2)));
 }

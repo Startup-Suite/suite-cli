@@ -68,6 +68,37 @@ repository, `suite` asks `git check-ignore` and **refuses** — non-zero exit, a
 message naming the path — unless the path is ignored. Refusal rather than a
 warning, because a warned-then-written credential file is a committed one.
 
+## MCP registration
+
+`suite init` writes both MCP entries with `claude mcp add` rather than editing
+`.mcp.json` by hand — the file format is Claude Code's to change, and only
+`claude mcp add` decides scope. **The scope default is `local`**, so `-s user`
+is passed explicitly on every invocation; omitting it silently scopes the entry
+to one directory.
+
+Being written is not being connected, so `init` finishes by health-checking
+with `claude mcp list` and requires both `suite-channel` and `startup-suite` to
+report connected. A status line it cannot parse is a **failure that prints the
+raw line**, never a green result on an assumption.
+
+### `${ENV_VAR}` interpolation — measured, not guessed
+
+Tested against Claude Code 2.1.228 with a stub stdio server that recorded its
+own environment:
+
+* `claude mcp add x -e K='${V}'` stores the **literal** `${V}` in the config.
+* If `V` **is** set when `claude` launches, the server receives the **expanded**
+  value. Interpolation is real, and it happens at spawn time.
+* If `V` is **not** set, the server receives the literal string `${V}` — not an
+  empty value, and not an error.
+
+That last case decides the default. An env reference that quietly hands
+`${SUITE_TOKEN}` to the channel as a bearer token produces a session that
+authenticates with garbage and names no cause. So the **default is an inline
+value at user scope**, and the reference form is opt-in for operators keeping
+secrets in a manager: `suite init --token-from-env SUITE_TOKEN`, which then
+requires that variable to be exported wherever `claude` is launched.
+
 ## Language
 
 TypeScript on [bun](https://bun.sh). `bun` is already a hard dependency of the

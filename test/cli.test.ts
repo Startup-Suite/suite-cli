@@ -21,14 +21,14 @@ describe("verb dispatch", () => {
     expect(parse(["claude", ...args]).args).toEqual(args);
   });
 
-  test("an unknown command exits non-zero", () => {
+  test("an unknown command exits non-zero", async () => {
     expect(parse(["nope"]).verb).toBe(null);
-    expect(run(["nope"])).toBe(2);
+    expect(await run(["nope"])).toBe(2);
   });
 
-  test("--version and --help exit 0", () => {
-    expect(run(["--version"])).toBe(0);
-    expect(run(["--help"])).toBe(0);
+  test("--version and --help exit 0", async () => {
+    expect(await run(["--version"])).toBe(0);
+    expect(await run(["--help"])).toBe(0);
   });
 });
 
