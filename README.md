@@ -99,6 +99,7 @@ again from the same place and you are back in the same session.
 | `suite claude -p '…'` | One-shot, non-interactive: **bypasses tmux entirely** and execs Claude directly |
 | `suite claude --session NAME` | Per-invocation override of the derived session name. Not persisted |
 | `suite claude -- …` | `--` terminates wrapper options; everything after it is Claude's, including the literal word `new` |
+| `suite update` | Re-runs the installer to replace this install with the latest published CLI |
 | `suite doctor` | Diagnoses a broken setup — one runnable remedy per failure, and a stale session is never reported green |
 | `suite status` | Shows which runtime this box is federated as, and the state and age of each session |
 | `suite --version`, `suite --help` | Version, and the verb list |
@@ -310,6 +311,39 @@ terminal, which from Suite's side is indistinguishable from an agent that is
 merely slow. `suite init` also offers to install tmux, and `suite doctor` fails
 the tmux check with a runnable remedy, so a box in this state announces itself
 three separate times.
+
+## `suite update`
+
+`suite update` replaces this install with the latest published CLI. It does that
+by **re-running `install.sh`** — the same script the cold-start
+`curl … | sh` runs — rather than fetching and unpacking a tarball itself. One
+install path, not two: a second mechanism is a second thing to keep true, and
+the half that drifts is always the one nobody runs on a fresh machine. Staging
+before the move, never leaving a partial file at the destination, no sudo, and
+naming the version it is about to replace are all inherited rather than
+reimplemented.
+
+It prints the installer URL **before** it fetches anything — the same
+`NOTHING SILENT` rule the `claude` wrapper carries. A command that pipes a
+remote script into a shell should say so first.
+
+The installer's own `replace 0.1.0 with 0.2.0? [y/N]` prompt is **not**
+auto-answered. That prompt exists to stop a silent overwrite, and an update that
+answers it for you defeats it; the installer inherits your terminal and you
+answer it directly.
+
+`SUITE_CLI_REF` selects a branch, tag or commit instead of `main`. Both halves —
+the URL the installer is fetched from *and* the ref exported into its
+environment — come from that one value. This matters more than it looks:
+`install.sh` **defaults `SUITE_CLI_REF` to `main` and infers nothing from the
+URL it was downloaded from**, so fetching a tag's installer without exporting
+the ref installs `main` and prints a perfectly successful-looking install of the
+wrong thing. A ref containing anything other than letters, digits, `.`, `_`,
+`-`, `/` is refused by name rather than quoted and hoped for.
+
+Update needs `curl` or `wget`, plus `tar` and `sh`. A missing one is named up
+front, before the announcement, rather than surfacing as broken-pipe noise three
+commands later.
 
 ## `suite claude`
 
