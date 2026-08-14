@@ -142,24 +142,83 @@ export function parseHeaderLine(line: string): { name: string; value: string } |
  */
 export function ttyPrompter(): Prompter {
   const write = (s: string) => process.stdout.write(s);
+  const stdin = process.stdin;
+
+  /**
+   * ONE reader for the life of the process, and it is never left.
+   *
+   * `process.stdin` is process-global and single-use. Leaving a `for await`
+   * over it via `return` calls the iterator's `return()`, which DESTROYS the
+   * stream; every later read then rejects immediately with `ABORT_ERR`. That
+   * is invisible in any test that asks one question — and `suite init` asks at
+   * least three — so the iterator is created once, held here, and pulled from
+   * one line at a time.
+   *
+   * Bytes that arrive after a newline are kept in `buffered` for the NEXT
+   * call. A terminal sends one line per chunk; a pipe happily delivers
+   * "aaa\nbbb\nccc\n" as a single write, and dropping the tail of that chunk
+   * would silently lose the answers to the following two questions.
+   */
+  let iterator: AsyncIterator<string | Uint8Array> | null = null;
+  let buffered = "";
+  let ended = false;
+
+  const nextChunk = async (): Promise<string | null> => {
+    if (ended) return null;
+    if (iterator === null) iterator = stdin[Symbol.asyncIterator]() as AsyncIterator<string | Uint8Array>;
+    const step = await iterator.next();
+    if (step.done === true) {
+      ended = true;
+      return null;
+    }
+    const value = step.value;
+    return typeof value === "string" ? value : new TextDecoder().decode(value);
+  };
+
+  /** Apply the line-editing control characters to a run of input. */
+  const edit = (text: string): string => {
+    let out = "";
+    for (const ch of text) {
+      if (ch === "\x03") throw new Error("interrupted");
+      if (ch === "\x7f" || ch === "\b") {
+        out = out.slice(0, -1);
+        continue;
+      }
+      out += ch;
+    }
+    return out;
+  };
+
+  /** A complete line from the buffer, or null when one has not arrived yet. */
+  const takeBufferedLine = (): string | null => {
+    for (let i = 0; i < buffered.length; i++) {
+      const ch = buffered[i];
+      if (ch === "\n" || ch === "\r") {
+        const line = buffered.slice(0, i);
+        buffered = buffered.slice(i + 1);
+        // A CRLF pair is one terminator, not one line plus an empty one.
+        if (ch === "\r" && buffered.startsWith("\n")) buffered = buffered.slice(1);
+        return edit(line);
+      }
+    }
+    return null;
+  };
+
   const readLine = async (echo: boolean): Promise<string> => {
-    const stdin = process.stdin;
     const raw = !echo && stdin.isTTY === true;
     if (raw) stdin.setRawMode(true);
-    let buf = "";
     try {
-      for await (const chunk of stdin) {
-        const text = typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-        for (const ch of text) {
-          if (ch === "\n" || ch === "\r") return buf;
-          if (ch === "\x03") throw new Error("interrupted");
-          if (ch === "\x7f" || ch === "\b") {
-            buf = buf.slice(0, -1);
-            continue;
-          }
-          buf += ch;
+      for (;;) {
+        const line = takeBufferedLine();
+        if (line !== null) return line;
+        const chunk = await nextChunk();
+        if (chunk === null) {
+          // EOF: whatever is left is the last, unterminated line.
+          const rest = buffered;
+          buffered = "";
+          return edit(rest);
         }
-        if (!raw) return buf;
+        buffered += chunk;
       }
     } finally {
       if (raw) {
@@ -167,7 +226,6 @@ export function ttyPrompter(): Prompter {
         write("\n");
       }
     }
-    return buf;
   };
   return {
     async ask(question) {

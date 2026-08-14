@@ -15,10 +15,97 @@ case "${1:-}" in
 	;;
 esac
 
+# ---------------------------------------------------------------- bun ------
+# `suite init` is the one verb whose whole job is to set a cold machine up, and
+# the CLI it lives in is written in TypeScript. Refusing to run it because bun
+# is missing makes its own bun-detect-and-offer path unreachable on exactly the
+# machine state it exists for -- and `suite init` is the next command install.sh
+# prints. So when bun is absent AND the verb is `init`, this POSIX bootstrap
+# makes the same offer in shell, then re-execs the real CLI.
+#
+# No sudo, ever: the bun.sh installer writes to $BUN_INSTALL (default ~/.bun),
+# which the user owns. The install is OFFERED, never silent.
+bun_bin_dir() {
+	printf '%s/bin' "${BUN_INSTALL:-$HOME/.bun}"
+}
+
+# Reads one line, preferring the controlling terminal: stdin may be a pipe.
+suite_ask() {
+	_reply=""
+	if [ -r /dev/tty ] && [ -t 0 ]; then
+		IFS= read -r _reply </dev/tty || _reply=""
+	else
+		IFS= read -r _reply || _reply=""
+	fi
+	printf '%s' "$_reply"
+}
+
+bootstrap_bun() {
+	printf 'suite: bun is not installed, and suite init needs it.\n' >&2
+	printf 'install bun now with the official installer from https://bun.sh? [y/N] ' >&2
+	reply="$(suite_ask)"
+	printf '\n' >&2
+	case "$reply" in
+	y | Y | yes | YES | Yes) : ;;
+	*)
+		printf 'suite: not installing bun. Install it from https://bun.sh, then re-run suite init.\n' >&2
+		exit 1
+		;;
+	esac
+
+	for tool in curl bash; do
+		if ! command -v "$tool" >/dev/null 2>&1; then
+			printf 'suite: %s is needed to install bun, and is not on PATH.\n' "$tool" >&2
+			exit 127
+		fi
+	done
+
+	# Downloaded to a file and then run, rather than piped straight into bash:
+	# in POSIX sh a pipeline reports only the LAST command's status, so
+	# `curl ... | bash` exits 0 when the download fails and bash reads nothing.
+	installer="$(mktemp "${TMPDIR:-/tmp}/suite-bun-install.XXXXXX")" ||
+		{
+			printf 'suite: could not create a temporary file for the bun installer.\n' >&2
+			exit 1
+		}
+	# Installs under $BUN_INSTALL (default ~/.bun), which the user owns. Never sudo.
+	if ! curl -fsSL https://bun.sh/install -o "$installer" || ! bash "$installer"; then
+		rm -f "$installer"
+		printf 'suite: installing bun failed. See https://bun.sh for manual instructions.\n' >&2
+		exit 1
+	fi
+	rm -f "$installer"
+
+	PATH="$(bun_bin_dir):$PATH"
+	export PATH
+	if ! command -v bun >/dev/null 2>&1; then
+		printf 'suite: bun was installed but is still not on PATH. Add %s to PATH and re-run.\n' \
+			"$(bun_bin_dir)" >&2
+		exit 127
+	fi
+	printf 'suite: bun installed.\n' >&2
+}
+
 if ! command -v bun >/dev/null 2>&1; then
-	printf 'suite: bun is not installed or not on PATH.\n' >&2
-	printf 'suite needs bun to run. Install it from https://bun.sh, then re-run this command.\n' >&2
-	exit 127
+	# A previous bootstrap may already have put bun in its default location
+	# without the user's PATH catching up yet.
+	if [ -x "$(bun_bin_dir)/bun" ]; then
+		PATH="$(bun_bin_dir):$PATH"
+		export PATH
+	fi
+fi
+
+if ! command -v bun >/dev/null 2>&1; then
+	case "${1:-}" in
+	init)
+		bootstrap_bun
+		;;
+	*)
+		printf 'suite: bun is not installed or not on PATH.\n' >&2
+		printf 'suite needs bun to run. Install it from https://bun.sh, then re-run this command.\n' >&2
+		exit 127
+		;;
+	esac
 fi
 
 exec bun "$SUITE_LIB_DIR/src/cli.ts" "$@"

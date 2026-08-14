@@ -153,3 +153,61 @@ describe("secrets never reach a command line", () => {
     expect(result.exitCode).toBe(0);
   });
 });
+
+/* ------------------------------------------------------------------------- */
+/* ttyPrompter — sequential reads off the process-global stdin                */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * These run the prompter in a CHILD process because that is the only place the
+ * defect exists: `process.stdin` is process-global and single-use, and the
+ * previous implementation destroyed it by leaving a `for await` via `return`.
+ *
+ * Both tests ask THREE questions. One question always worked, which is why the
+ * defect shipped; two is the minimum that can detect it and three is what
+ * `suite init` actually needs (suite url, runtime id, token).
+ */
+const PROMPTER_FIXTURE = new URL("./prompter-fixture.ts", import.meta.url).pathname;
+
+async function drivePrompter(writes: string[]): Promise<{ exitCode: number; stdout: string }> {
+  const proc = Bun.spawn(["bun", PROMPTER_FIXTURE], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  for (const chunk of writes) {
+    proc.stdin.write(chunk);
+    proc.stdin.flush();
+    await Bun.sleep(60);
+  }
+  proc.stdin.end();
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (stderr.trim() !== "") throw new Error(`prompter fixture wrote to stderr: ${stderr}`);
+  return { exitCode, stdout };
+}
+
+function answers(stdout: string): string[] {
+  // The prompt text shares the line with the answer that follows it, so match
+  // rather than anchoring at the start of the line.
+  return [...stdout.matchAll(/answer:(.*)/g)].map((m) => m[1] ?? "");
+}
+
+describe("ttyPrompter reads more than once", () => {
+  test("three questions asked one at a time all get their own answer", async () => {
+    const { exitCode, stdout } = await drivePrompter(["aaa\n", "bbb\n", "ccc\n"]);
+    expect(stdout).not.toContain("error:");
+    expect(answers(stdout)).toEqual(["aaa", "bbb", "ccc"]);
+    expect(exitCode).toBe(0);
+  }, 20_000);
+
+  test("lines delivered in ONE chunk are buffered, not discarded", async () => {
+    const { exitCode, stdout } = await drivePrompter(["aaa\nbbb\nccc\n"]);
+    expect(stdout).not.toContain("error:");
+    expect(answers(stdout)).toEqual(["aaa", "bbb", "ccc"]);
+    expect(exitCode).toBe(0);
+  }, 20_000);
+});
