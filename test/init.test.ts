@@ -23,6 +23,13 @@ import {
   type InitDeps,
 } from "../src/commands/init.ts";
 import { createStore, spawnWithSecrets, type Prompter } from "../src/secrets.ts";
+import {
+  STUBBED_NOT_PROVEN,
+  cleanupCleanEnvs,
+  createCleanEnv,
+  stubsFor,
+  type CleanEnv,
+} from "./clean-env/fixture.ts";
 
 /**
  * EVERY VALUE HERE IS INVENTED. The repository is public, and a fixture is the
@@ -43,40 +50,21 @@ const HEADER_VALUE = "gateway_fixture_0000";
  * ON THIS BOX bun, tmux, the plugin checkout and both MCP entries already
  * exist, so an `init` run here would report success without executing a single
  * install path — a test that proves only that init can do nothing. So every
- * behavioural test below runs against a scratch HOME/XDG with a PATH holding
- * NOTHING but the stubs it explicitly asks for.
+ * behavioural test below runs on a scratch machine from
+ * `test/clean-env/fixture.ts`: its own HOME/XDG dirs and a PATH holding NOTHING
+ * but the stubs it explicitly asks for.
  *
- * HONEST LIMIT: the stubs stand in for a real `git clone` over the network and
- * a real `bun install`. This fixture proves that init TAKES the clone path and
- * invokes bun install with the right cwd; it cannot prove a cold-start install
- * on a machine that never had bun. Stage 7's container harness is where that
- * claim gets tested.
+ * The fixture is SHARED with the doctor suite rather than hand-rolled twice —
+ * two copies of "what a machine without bun looks like" drift, and the copy
+ * that drifts is the one that stops testing anything.
+ *
+ * HONEST LIMIT (see {@link STUBBED_NOT_PROVEN}): the stubs stand in for a real
+ * network `git clone` and a real `bun install`. These tests prove init TAKES
+ * the clone path and invokes bun install with the right cwd and arguments; they
+ * CANNOT prove a cold-start install on a machine that never had bun, nor a real
+ * clone. That needs a container or a genuinely fresh machine.
  */
-interface Fixture {
-  root: string;
-  bin: string;
-  home: string;
-  env: Record<string, string | undefined>;
-  log(): string[];
-  checkout: string;
-}
-
-const roots: string[] = [];
-
-function stub(bin: string, name: string, body: string): void {
-  const path = resolve(bin, name);
-  writeFileSync(
-    path,
-    `#!/bin/sh\n` +
-      // The CLI's PATH is scrubbed on purpose; the stub still needs coreutils
-      // to impersonate the tool it stands in for.
-      `PATH=/bin:/usr/bin:$PATH\n` +
-      `{ printf '%s' "${name}"; for a in "$@"; do printf '\\t%s' "$a"; done; printf '\\n'; } >> "$STUB_LOG"\n` +
-      `${body}\n`,
-    { mode: 0o755 },
-  );
-  chmodSync(path, 0o755);
-}
+type Fixture = CleanEnv;
 
 interface FixtureOptions {
   /** Which stubs exist on PATH. Anything absent is absent for real. */
@@ -89,64 +77,20 @@ interface FixtureOptions {
 
 function makeFixture(options: FixtureOptions = {}): Fixture {
   const tools = options.tools ?? ["git", "bun", "claude", "tmux", "brew"];
-  const root = resolve(tmpdir(), `suite-init-${Math.random().toString(36).slice(2)}`);
-  roots.push(root);
-  const bin = resolve(root, "bin");
-  const home = resolve(root, "home");
-  mkdirSync(bin, { recursive: true });
-  mkdirSync(home, { recursive: true });
-  const log = resolve(root, "invocations.log");
-  writeFileSync(log, "");
-
-  const connected =
+  const mcpList =
     options.mcpList ??
     `${CHANNEL_SERVER}: bun /somewhere/src/index.ts - ✔ Connected\n` +
       `${TOOLS_SERVER}: https://suite.example.invalid/mcp (HTTP) - ✔ Connected\n`;
-  writeFileSync(resolve(root, "mcp-list.txt"), connected);
 
-  const bodies: Record<string, string> = {
-    // Stands in for a network clone: creates the checkout the real one would.
-    git:
-      `if [ "$1" = "clone" ]; then mkdir -p "$3/.git" "$3/src"; : > "$3/src/index.ts"; exit 0; fi\n` +
-      `if [ "$1" = "pull" ]; then\n` +
-      `  if [ -n "$STUB_PULL_FAILS" ]; then echo "fatal: Not possible to fast-forward, aborting." >&2; exit 128; fi\n` +
-      `  exit 0\nfi\nexit 0`,
-    bun:
-      `if [ "$1" = "--version" ]; then echo "1.2.4"; exit 0; fi\n` +
-      `if [ "$1" = "install" ]; then echo "4 packages installed [12.00ms]"; exit 0; fi\nexit 0`,
-    claude: `if [ "$1" = "mcp" ] && [ "$2" = "list" ]; then cat "$STUB_MCP_LIST"; fi\nexit 0`,
-    tmux: `if [ "$1" = "-V" ]; then echo "tmux 3.5a"; exit 0; fi\nexit 0`,
-    brew: `exit 0`,
-    "apt-get": `exit 0`,
-  };
-  for (const t of tools) stub(bin, t, bodies[t] ?? "exit 0");
-
-  const env: Record<string, string | undefined> = {
-    PATH: bin,
-    HOME: home,
-    XDG_CONFIG_HOME: resolve(home, ".config"),
-    XDG_DATA_HOME: resolve(home, ".local/share"),
-    STUB_LOG: log,
-    STUB_MCP_LIST: resolve(root, "mcp-list.txt"),
-    ...(options.pullFails === true ? { STUB_PULL_FAILS: "1" } : {}),
-  };
-
-  return {
-    root,
-    bin,
-    home,
-    env,
-    checkout: resolve(home, ".local/share/suite/claude-code-suite-channel"),
-    log: () =>
-      readFileSync(log, "utf8")
-        .split("\n")
-        .filter((l) => l !== ""),
-  };
+  const fx = createCleanEnv({ label: "init", bodies: stubsFor(tools) });
+  const listFile = resolve(fx.root, "mcp-list.txt");
+  writeFileSync(listFile, mcpList);
+  fx.env.STUB_MCP_LIST = listFile;
+  if (options.pullFails === true) fx.env.STUB_PULL_FAILS = "1";
+  return fx;
 }
 
-afterEach(() => {
-  for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
-});
+afterEach(cleanupCleanEnvs);
 
 function scriptedPrompter(answers: string[]): Prompter & { asked: string[]; said: string[] } {
   const queue = [...answers];
@@ -204,6 +148,22 @@ function invocation(fixture: Fixture, prefix: string[]): string[] | null {
 /* ------------------------------------------------------------------------- */
 
 describe("init on a machine where nothing is installed", () => {
+  /**
+   * The marker test. It exists so that a reader who greps for
+   * STUBBED_NOT_PROVEN finds a failing-if-removed statement of what the green
+   * results below do NOT establish, rather than a comment that can rot.
+   */
+  test(`${STUBBED_NOT_PROVEN}: git and bun here are shell stubs, so no real clone or install is proven`, async () => {
+    const fx = makeFixture();
+    for (const tool of ["git", "bun"]) {
+      const text = await Bun.file(resolve(fx.bin, tool)).text();
+      expect(text.startsWith("#!/bin/sh")).toBe(true);
+    }
+    // And the scrubbed PATH really is scrubbed: the code under test cannot
+    // reach the machine's own git or bun and quietly do the real thing.
+    expect(fx.env.PATH).toBe(fx.bin);
+  });
+
   test("takes the clone path, runs bun install, and registers both entries at user scope", async () => {
     const fx = makeFixture();
     const prompter = scriptedPrompter(credentialAnswers());

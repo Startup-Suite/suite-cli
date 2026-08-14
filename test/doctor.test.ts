@@ -28,6 +28,7 @@ import {
 import { CHANNEL_SERVER, TOOLS_SERVER } from "../src/commands/init.ts";
 import { emptyConfig, type SuiteConfig } from "../src/config.ts";
 import { killSessionArgv, liveTmuxDeps, newSessionArgv, sessionNameFor } from "../src/tmux.ts";
+import { cleanupCleanEnvs, createCleanEnv } from "./clean-env/fixture.ts";
 
 /**
  * EVERY VALUE HERE IS INVENTED. This repository is public, and a fixture is the
@@ -507,42 +508,28 @@ describe("colour and glyphs", () => {
 /* End to end through the real binary, off a TTY                              */
 /* ------------------------------------------------------------------------- */
 
-const roots: string[] = [];
-
-function stubBin(bodies: Record<string, string>): string {
-  const root = mkdtempSync(resolve(tmpdir(), "suite-doctor-"));
-  roots.push(root);
-  const bin = resolve(root, "bin");
-  mkdirSync(bin, { recursive: true });
-  for (const [name, body] of Object.entries(bodies)) {
-    const path = resolve(bin, name);
-    writeFileSync(path, `#!/bin/sh\nPATH=/bin:/usr/bin:$PATH\n${body}\n`, { mode: 0o755 });
-    chmodSync(path, 0o755);
-  }
-  return root;
-}
-
-afterEach(() => {
-  for (const r of roots.splice(0)) rmSync(r, { recursive: true, force: true });
-});
+/**
+ * The SAME clean-environment fixture the init suite uses
+ * (`test/clean-env/fixture.ts`): scratch HOME/XDG dirs and a PATH of stubs
+ * only. `doctor` must report a machine where the plugin is NOT installed, and
+ * on this box it is — so a run against the real environment would exercise
+ * none of the failure rendering this stage exists for.
+ */
+afterEach(cleanupCleanEnvs);
 
 describe("piped to a file", () => {
   test("`suite doctor > report.txt` contains zero escape bytes", async () => {
     // A whole-binary run: stdout is a pipe, which is what makes the assertion
     // about the SHIPPED entry point rather than about a hand-built option map.
-    const root = stubBin({
-      claude: `if [ "$1" = "--version" ]; then echo "${OLD_VERSION}"; exit 0; fi\nexit 1`,
+    const fx = createCleanEnv({
+      label: "doctor",
+      bodies: { claude: `if [ "$1" = "--version" ]; then echo "${OLD_VERSION}"; exit 0; fi\nexit 1` },
+      env: { LANG: "en_US.UTF-8" },
     });
     // The CLI's own PATH stays scrubbed to the stubs; the interpreter is named
     // by absolute path so finding it is not itself a PATH lookup.
     const proc = Bun.spawn([process.execPath, resolve(import.meta.dir, "..", "src", "cli.ts"), "doctor"], {
-      env: {
-        PATH: resolve(root, "bin"),
-        HOME: root,
-        XDG_CONFIG_HOME: resolve(root, ".config"),
-        XDG_DATA_HOME: resolve(root, ".local/share"),
-        LANG: "en_US.UTF-8",
-      },
+      env: fx.env as Record<string, string>,
       stdout: "pipe",
       stderr: "pipe",
     });

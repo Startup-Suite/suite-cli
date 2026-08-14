@@ -26,25 +26,57 @@ The installer never uses `sudo`. It installs to `$XDG_BIN_HOME`, or
 `PATH`, and prints the exact `export PATH=` line to add. If a `suite` is
 already installed it names the version it would replace and asks first.
 
-Then:
+## Wire this machine up
 
 ```sh
 suite init
 ```
 
+`init` detects `bun` and `tmux` (offering to install either, never unasked),
+clones the channel plugin, asks for your credentials, and registers both MCP
+entries — then health-checks that they actually **connect**, because written is
+not connected.
+
+## Run an agent
+
+```sh
+suite claude
+```
+
+That is the whole daily loop. Claude Code runs inside a `tmux` session named
+for this directory, so **closing the terminal does not kill the agent**; run it
+again from the same place and you are back in the same session.
+
 ## Commands
 
 | Command | What it does |
 | --- | --- |
-| `suite init` | Detects `bun` and `tmux`, installs the channel plugin, collects credentials, registers the MCP entries |
-| `suite claude [...]` | Runs Claude Code in a persistent session; re-attaches to an existing one |
-| `suite claude new [...]` | Forces a new session even when one exists |
-| `suite doctor` | Diagnoses a broken setup, one runnable remedy per failure |
-| `suite status` | Shows which runtime this box is federated as, and the state of each session |
+| `suite init` | Detects `bun` and `tmux`, installs the channel plugin, collects credentials, registers both MCP entries and verifies they connect |
+| `suite claude [...]` | Runs Claude Code in the persistent session for this directory; re-attaches when one is already live. Every argument passes through verbatim |
+| `suite claude new [...]` | **The force-new verb.** Creates a second session even when one exists, under the next free name (`…-2`) |
+| `suite claude -p '…'` | One-shot, non-interactive: **bypasses tmux entirely** and execs Claude directly |
+| `suite claude --session NAME` | Per-invocation override of the derived session name. Not persisted |
+| `suite claude -- …` | `--` terminates wrapper options; everything after it is Claude's, including the literal word `new` |
+| `suite doctor` | Diagnoses a broken setup — one runnable remedy per failure, and a stale session is never reported green |
+| `suite status` | Shows which runtime this box is federated as, and the state and age of each session |
+| `suite --version`, `suite --help` | Version, and the verb list |
 
-Stage 1 ships the installer and the verb dispatch; the verbs themselves are
-stubs until the later stages land. This README is a placeholder and is
-rewritten in full, with every design decision justified, in stage 7.
+## Five decisions, stated rather than guessed
+
+These are the questions the design had to answer, each answered here rather
+than left to be inferred from behaviour:
+
+1. [**How a session is named and scoped**](#session-naming--per-working-directory)
+   — per working directory, derived not remembered.
+2. [**What "already exists" means, and what happens to a stale
+   session**](#what-already-exists-means) — three states, and a stale one is
+   recycled out loud.
+3. [**`$TMUX`: what happens when you run it from inside tmux**](#inside-tmux)
+   — `switch-client`, never a nested session.
+4. [**Whether `-p` bypasses tmux**](#-p-bypasses-tmux--a-decision-not-an-accident)
+   — it does, entirely.
+5. [**What happens when tmux is absent**](#when-tmux-is-absent) — a direct run
+   with a loud warning. **Never a silent fallback.**
 
 ## Credentials and config
 
@@ -105,6 +137,32 @@ Names are sanitised to `[A-Za-z0-9_-]`. tmux addresses panes as
 ambiguous. Sanitising cannot merge two projects, because the discriminating
 half of the name is a hash of the *unsanitised* path.
 
+### What "already exists" means
+
+<a id="what-already-exists-means"></a>
+
+"A session already exists" is **not** the question `tmux has-session` answers.
+It answers "is there a session with this name", which stays true long after the
+agent inside it has died. `suite` treats a session as existing-and-usable only
+when an **agent process is running inside it** — anything else is a name, not an
+agent.
+
+So `suite claude` resolves to exactly one of three outcomes:
+
+| Detected | What `suite claude` does |
+| --- | --- |
+| **live** | Attaches. Same agent, same history, nothing restarted |
+| **stale** | **Names it on stdout, kills that one session by name, starts a fresh agent.** Never a silent attach |
+| **none** | Creates the session detached, then attaches |
+
+**A stale session is recycled, not adopted and not ignored.** Adopting it
+presents a dead agent as a healthy one: you get a shell prompt, Suite gets
+nothing, and nothing anywhere says why. Ignoring it and picking a different
+name breaks the one property the naming rule exists to provide — one context,
+one session. The kill is `tmux kill-session -t <name>`, scoped to that single
+name; `kill-server` is never used anywhere in this tool, because it would take
+down every other agent on the box.
+
 ### Three states, not two
 
 `suite` reports **live**, **stale**, or **none** for a session:
@@ -148,15 +206,36 @@ Claude through the MCP config written at `suite init` time. The composed argv is
 checked against the credential store before it is run, and `send-keys` is never
 used — typing a secret into a live shell would add its history to the exposure.
 
-### Inside tmux, and without tmux
+### Inside tmux — `$TMUX` is set
 
-Run from inside tmux, `suite` uses `switch-client` rather than attaching; it
-never nests a session inside itself, and where switching is not possible it
-refuses with the command to run instead.
+<a id="inside-tmux"></a>
 
-If tmux is not installed, `suite` can still run the agent directly — **with a
-warning**, never silently. A silent fallback would reproduce the exact failure
-persistence exists to prevent.
+Running `suite claude` from inside a tmux pane must not put tmux inside tmux.
+`suite` reads `$TMUX`, and when it is set it **switches the current client** to
+the target session (`tmux switch-client -t <name>`) instead of attaching. A
+nested attach produces a session you cannot detach from without thinking about
+which prefix key you are talking to, and it is the shape people accidentally
+create when a wrapper ignores the variable.
+
+Where switching is not possible, `suite` **refuses with a non-zero exit and
+names the command to run instead**. It never quietly produces a nested session:
+the two failure modes here are "nothing happens" and "something confusing
+happens", and a refusal that says what to do is neither.
+
+### When tmux is absent
+
+<a id="when-tmux-is-absent"></a>
+
+`suite` runs the agent **directly**, and prints a warning on stderr saying, in
+words, that the session will die with this terminal and naming the install
+command for this platform.
+
+**The fallback is never silent.** A silent one would reproduce exactly the
+failure this feature exists to prevent — an agent that vanishes with its
+terminal, which from Suite's side is indistinguishable from an agent that is
+merely slow. `suite init` also offers to install tmux, and `suite doctor` fails
+the tmux check with a runnable remedy, so a box in this state announces itself
+three separate times.
 
 ## `suite claude`
 
@@ -260,7 +339,73 @@ bun run lint      # shellcheck install.sh bin/suite.template
 bun run typecheck # tsc --noEmit
 ```
 
-CI runs the same three on macOS and Linux.
+CI runs the same three on **macOS and Linux**, and **installs a real `tmux` on
+both** rather than stubbing it. A stubbed tmux cannot prove that a process
+outlived its parent, so a runner without one would skip the only tests that
+matter and still go green. Absence of tmux is therefore a test **failure**, not
+a skip.
+
+### The two harnesses
+
+**`test/clean-env/fixture.ts` — a scratch machine.** Each test gets its own
+`HOME`, `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and a `PATH` containing nothing but
+the stubs it asked for. On any real box `bun`, `tmux`, the plugin and both MCP
+entries already exist, so `init` and `doctor` would pass there without
+executing a single install path or rendering a single failure. The `init` and
+`doctor` suites share this one fixture: two hand-rolled copies of "a machine
+without bun" drift, and the copy that drifts is the one that stops testing
+anything.
+
+**`test/persistence/parent-severing.test.ts` — the persistence proof.** The
+claim is not that a session exists; it is that **the agent survives the
+terminal that started it**. So the test starts an agent through the shipped CLI
+**from a child shell**, records the pid of the process inside the pane,
+**kills that parent shell** (SIGHUP, as a closing terminal delivers, then
+SIGKILL as a backstop), and then from a **new shell** asserts the *same pid* is
+still running and that `suite claude` re-attaches to the same session. It also
+asserts the parent really died, and finishes by killing the agent to prove the
+liveness probe can report death at all.
+
+`Ctrl-b d` is deliberately *not* what is tested: a detach is a cooperative
+gesture from a process that is still running, which is the opposite of the
+event being claimed. Starting and re-attaching within one shell proves nothing
+either.
+
+Hygiene, because this runs on shared machines: a private `$TMUX_TMPDIR` so no
+session belonging to anyone else is even visible; only sessions the harness
+created are killed, by name, one at a time; **never `kill-server` and never a
+pattern kill**; and every signal goes to a numeric pid the harness itself
+spawned, re-checked with `ps -p` immediately before the signal.
+
+### What the tests do not prove
+
+Read this before citing a green suite as evidence of a cold start:
+
+* A scratch `HOME` **cannot prove a real `bun` install** on a machine that never
+  had bun. The `bun` on the fixture's `PATH` is a shell script that prints a
+  version.
+* A scratch `HOME` **cannot prove a real network clone** of the channel plugin,
+  or a real dependency resolution. The `git` stub creates the directory a clone
+  would have left behind.
+
+What those tests do prove is that the code **takes** the clone and install
+paths, in order, with the right arguments, cwd and scope, on a machine where
+the tool is genuinely absent. A real cold start needs a container or a
+genuinely fresh machine and is out of scope for a unit suite. The tests that
+depend on a stub for something real are marked in-source with
+`STUBBED_NOT_PROVEN` — grep for it.
+
+The persistence test has its own honest limit: the agent is a long-lived stub
+named `claude`, not Claude Code, so it needs no credentials and runs in
+seconds. What is under test there is the **process topology** — whether the
+pane process outlives the shell that launched it — which does not depend on
+what the pane process is.
+
+### Typography
+
+Where this README is rendered on a hosted page, code is set in **JetBrains
+Mono**, the same face the CLI's own output is designed against, so the page you
+read and the terminal you paste into look like one product rather than two.
 
 Every example value in this repository is invented —
 `https://suite.example.invalid`,
