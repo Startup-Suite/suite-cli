@@ -16,6 +16,12 @@ import {
   parseAuthStatus,
   parseClaudeVersion,
   parseMcpEntryPath,
+  parseMcpHeaderValue,
+  parseMcpHttpUrl,
+  bearerOf,
+  classifyProbe,
+  suiteHostOf,
+  tokenFingerprint,
   renderCheck,
   renderReport,
   runChecks,
@@ -592,6 +598,134 @@ describe("parsers", () => {
     expect(mcpEntryHasToken(mcpGetOutput(PLUGIN_PATH, ""))).toBe(false);
     expect(mcpEntryHasToken("no token line here")).toBe(false);
     expect(typeof mcpEntryHasToken(mcpGetOutput())).toBe("boolean");
+  });
+
+  test("the http entry's URL is read from a URL line, never from a command line", () => {
+    const entry = [
+      "startup-suite:",
+      "  Type: http",
+      "  URL: https://example-suite.invalid/mcp",
+      "  Headers:",
+      "    Authorization: Bearer tok_fixture_alpha",
+    ].join("\n");
+    expect(parseMcpHttpUrl(entry)).toBe("https://example-suite.invalid/mcp");
+    // A stdio entry has no URL, and its Command line must not be mined for one.
+    expect(parseMcpHttpUrl("  Command: /opt/example/bin/bun\n  Args: /opt/example/src/index.ts")).toBeNull();
+    expect(parseMcpHttpUrl("Endpoint = http://example-suite.invalid:4000/mcp")).toBe(
+      "http://example-suite.invalid:4000/mcp",
+    );
+    // Never guessed: a relative or schemeless value is null, i.e. a failure.
+    expect(parseMcpHttpUrl("  URL: /mcp")).toBeNull();
+    expect(parseMcpHttpUrl("nothing readable here")).toBeNull();
+  });
+
+  test("one header's value is lifted, case-insensitively, and Bearer stripped", () => {
+    const entry = [
+      "  Type: http",
+      "  URL: https://example-suite.invalid/mcp",
+      "  Headers:",
+      "    Authorization: Bearer tok_fixture_alpha",
+      "    X-Fixture-Trace: trace-fixture-1",
+    ].join("\n");
+    expect(parseMcpHeaderValue(entry, "authorization")).toBe("Bearer tok_fixture_alpha");
+    expect(parseMcpHeaderValue(entry, "X-Fixture-Trace")).toBe("trace-fixture-1");
+    expect(parseMcpHeaderValue(entry, "X-Absent")).toBeNull();
+    expect(parseMcpHeaderValue("  Authorization:   \n", "Authorization")).toBeNull();
+    expect(parseMcpHeaderValue(`-H 'Authorization: Bearer tok_fixture_beta'`, "Authorization")).toBe(
+      "Bearer tok_fixture_beta",
+    );
+
+    expect(bearerOf("Bearer tok_fixture_alpha")).toBe("tok_fixture_alpha");
+    expect(bearerOf("bearer tok_fixture_alpha")).toBe("tok_fixture_alpha");
+    expect(bearerOf("tok_fixture_alpha")).toBeNull();
+    expect(bearerOf("Bearer   ")).toBeNull();
+  });
+
+  test("the fingerprint compares secrets without carrying any of one", () => {
+    const alpha = "tok_fixture_alpha";
+    const beta = "tok_fixture_beta";
+
+    expect(tokenFingerprint(alpha)).toBe(tokenFingerprint(alpha));
+    expect(tokenFingerprint(alpha)).not.toBe(tokenFingerprint(beta));
+    expect(tokenFingerprint(alpha)).toHaveLength(8);
+    expect(tokenFingerprint(alpha)).toMatch(/^[0-9a-f]{8}$/);
+
+    // ANTI-LEAK: no 4-character run of the input survives into the output, so a
+    // future "just truncate the token" regression fails here instead of
+    // shipping a printed prefix of a live credential.
+    const fp = tokenFingerprint(alpha);
+    for (let i = 0; i + 4 <= alpha.length; i++) {
+      expect(fp.includes(alpha.slice(i, i + 4))).toBe(false);
+    }
+  });
+
+  test("the websocket entry and the https entry resolve to the same host", () => {
+    expect(suiteHostOf("wss://example-suite.invalid/socket")).toBe("example-suite.invalid");
+    expect(suiteHostOf("https://example-suite.invalid/mcp")).toBe("example-suite.invalid");
+    expect(suiteHostOf("wss://example-suite.invalid/socket")).toBe(
+      suiteHostOf("https://example-suite.invalid/mcp"),
+    );
+    expect(suiteHostOf("HTTPS://EXAMPLE-SUITE.INVALID/mcp")).toBe("example-suite.invalid");
+    // `URL` semantics for the port, and nothing beyond them.
+    expect(suiteHostOf("http://example-suite.invalid:4000/mcp")).toBe("example-suite.invalid:4000");
+    expect(suiteHostOf("not a url")).toBeNull();
+    expect(suiteHostOf("")).toBeNull();
+  });
+
+  test("a 401 from the application and a 401 from the gateway are different verdicts", () => {
+    // THE SAME-STATUS PAIR. A classifier tested only on distinct status codes
+    // proves nothing about the distinction this tool exists for.
+    const rpcError = {
+      status: 401,
+      body: JSON.stringify({ code: -32000, message: "unauthorized" }),
+      contentType: "application/json",
+    };
+    const htmlChallenge = {
+      status: 401,
+      body: "<!DOCTYPE html><html><body>sign in</body></html>",
+      contentType: "text/html; charset=utf-8",
+    };
+    expect(classifyProbe(rpcError)).toBe("rejected");
+    expect(classifyProbe(htmlChallenge)).toBe("gateway-challenge");
+    expect(classifyProbe(rpcError)).not.toBe(classifyProbe(htmlChallenge));
+  });
+
+  test("each probe verdict has a case, including an HTML 200 and a toolless 200", () => {
+    expect(
+      classifyProbe({
+        status: 200,
+        body: JSON.stringify({ result: { tools: [{ name: "task_get" }] } }),
+        contentType: "application/json",
+      }),
+    ).toBe("ok");
+
+    // An access proxy answers a credential-less request with a login PAGE, and
+    // it may do so with a 200. HTML is the signal, not the status.
+    expect(
+      classifyProbe({ status: 200, body: "<html><body>sign in</body></html>", contentType: "" }),
+    ).toBe("gateway-challenge");
+
+    // A 200 with no tools is the incident's invisible symptom: healthy-looking
+    // and exposing nothing. It is NOT ok.
+    expect(
+      classifyProbe({
+        status: 200,
+        body: JSON.stringify({ result: { tools: [] } }),
+        contentType: "application/json",
+      }),
+    ).toBe("unreadable");
+    expect(classifyProbe({ status: 200, body: "not json", contentType: "text/plain" })).toBe("unreadable");
+    expect(classifyProbe({ status: 403, body: "opaque denial", contentType: "text/plain" })).toBe("unreadable");
+    expect(classifyProbe({ status: 500, body: "", contentType: "" })).toBe("unreadable");
+
+    // A 403 carrying the JSON-RPC error shape is still an application refusal.
+    expect(
+      classifyProbe({
+        status: 403,
+        body: JSON.stringify({ error: { code: -32000, message: "unauthorized" } }),
+        contentType: "application/json",
+      }),
+    ).toBe("rejected");
   });
 
   test("the exit code is 1 if and only if something failed", () => {

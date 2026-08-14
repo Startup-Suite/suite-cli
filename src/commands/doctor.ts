@@ -248,6 +248,187 @@ export function mcpEntryHasToken(output: string): boolean {
   return false;
 }
 
+/**
+ * The HTTP endpoint recorded in the tools MCP entry, out of
+ * `claude mcp get <name>`.
+ *
+ * That entry is registered by `toolsAddArgs` as `-t http <url> -H '…'`, so the
+ * URL is printed on a `URL:`/`Type:` style line and NEVER on a `Command:` line
+ * — a stdio entry has a command, an http entry has a URL, and reading one for
+ * the other is how a check reports on an endpoint nobody talks to.
+ *
+ * Read tolerantly, because the exact label wording is Claude Code's to change,
+ * but never guessed: null when the output carries no absolute `http(s)://`
+ * URL. Null is rendered by the caller as a FAILURE, never as a pass — the same
+ * rule {@link parseMcpEntryPath} states, for the same reason.
+ */
+export function parseMcpHttpUrl(output: string): string | null {
+  for (const line of output.split("\n")) {
+    const trimmed = line.trim();
+    if (/^(command|args?)\s*:/i.test(trimmed)) continue;
+    const m = /(https?:\/\/[^\s"'<>]+)/i.exec(trimmed);
+    if (m?.[1] !== undefined) return m[1].replace(/[),.;]+$/, "");
+  }
+  return null;
+}
+
+/**
+ * One `-H` header's value out of `claude mcp get <name>` — used for
+ * `Authorization`.
+ *
+ * THIS IS THE ONE FUNCTION IN THIS FILE THAT RETURNS A SECRET. Every other
+ * reader here returns a verdict (a boolean, an enum, a fingerprint) precisely
+ * so that it cannot leak; this one cannot do its job that way, so the
+ * restriction lives in the callers instead and is written down here:
+ *
+ *   Its ONLY permitted callers are (a) the probe request builder, which puts
+ *   the value straight into an outbound header, and (b) {@link tokenFingerprint}.
+ *   Its return value MUST NEVER reach a `value`, `detail`, `consequence` or
+ *   `remedy` field of a {@link CheckResult}, and must never be logged.
+ *
+ * Null when the header is absent or its value is empty.
+ */
+export function parseMcpHeaderValue(output: string, headerName: string): string | null {
+  const wanted = headerName.trim().toLowerCase();
+  for (const raw of output.split("\n")) {
+    // Tolerate the surrounding shapes: a bare `Name: value` line, a
+    // `Headers:` block entry, and a quoted `-H 'Name: value'` argv echo.
+    const line = raw.trim().replace(/^-H\s+/, "").replace(/^["']|["']$/g, "").trim();
+    const m = /^([A-Za-z0-9-]+)\s*:\s*(.*)$/.exec(line);
+    if (m === null) continue;
+    if ((m[1] ?? "").toLowerCase() !== wanted) continue;
+    const value = (m[2] ?? "").trim().replace(/^["']|["']$/g, "").trim();
+    if (value !== "") return value;
+  }
+  return null;
+}
+
+/** The credential out of an `Authorization` header value, or null. */
+export function bearerOf(header: string): string | null {
+  const m = /^bearer\s+(.+)$/i.exec(header.trim());
+  const token = m?.[1]?.trim();
+  return token === undefined || token === "" ? null : token;
+}
+
+/**
+ * A stable, NON-REVERSIBLE fingerprint of a secret, for equality comparison
+ * only.
+ *
+ * The channel entry and the tools entry are supposed to carry the same token;
+ * saying "they differ" requires comparing them, and comparing them must not
+ * require either one to exist anywhere a human or a log can see it. sha256,
+ * hex, first 8 characters — enough to distinguish two tokens, not enough to
+ * be anything else.
+ *
+ * NEVER RENDERED. It is not a "safe prefix of the token" and must never become
+ * one: a truncation of the input would leak the input's first characters, which
+ * is why the tests assert the output shares no 4-character run with the input.
+ */
+export function tokenFingerprint(secret: string): string {
+  return new Bun.CryptoHasher("sha256").update(secret).digest("hex").slice(0, 8);
+}
+
+/**
+ * The lowercased host of a URL — no scheme, no path, no port cleverness beyond
+ * what `URL` itself does.
+ *
+ * The channel entry records a WEBSOCKET url (`SUITE_URL=wss://…/socket`) and
+ * the tools entry an HTTPS one (`https://…/mcp`). They point at the same Suite
+ * or the setup is split-brained, and only the host can say so, so this must
+ * return the same answer for both schemes. Null on unparseable input.
+ */
+export function suiteHostOf(url: string): string | null {
+  try {
+    return new URL(url.trim()).host.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What a probe of the tools endpoint actually established.
+ *
+ * `ok` — the bearer authenticates AND the server listed tools.
+ * `rejected` — the APPLICATION rejected the credential.
+ * `gateway-challenge` — a fronting access proxy answered instead; the
+ *   application never saw the request.
+ * `unreachable` — no response at all (thrown fetch/DNS/TLS/timeout error);
+ *   produced by the caller, not by {@link classifyProbe}.
+ * `unreadable` — a response we cannot turn into either verdict.
+ */
+export type ProbeVerdict = "ok" | "rejected" | "gateway-challenge" | "unreachable" | "unreadable";
+
+export interface ProbeResult {
+  status: number;
+  body: string;
+  contentType: string;
+}
+
+/**
+ * Classify a probe response. THE LOAD-BEARING DISTINCTION OF THIS TOOL.
+ *
+ * "The endpoint is reachable" and "my bearer authenticates" are different
+ * claims and only the second one matters, so the two ways a request fails to
+ * be authorised are kept apart:
+ *
+ *  - A well-formed JSON-RPC error under a 401/403, JSON, no HTML, PROVES the
+ *    request reached the application: the application read the credential and
+ *    refused it. (Verified shape from the incident: `{"code":-32000,
+ *    "message":"unauthorized"}` under a 401.) That is `rejected`.
+ *  - An HTML body — at ANY status, 200 included — is an identity-aware access
+ *    proxy answering a credential-less request with a login page. JSON-RPC is
+ *    never HTML. That is `gateway-challenge`.
+ *
+ * WHY THE SPLIT EXISTS: a 401 that is really an application rejection must NOT
+ * be attributed to the fronting access proxy. That misattribution sends someone
+ * to rotate infrastructure credentials that were never involved, while the
+ * actual wrong bearer stays wrong and the symptom does not move. The two
+ * verdicts therefore get OPPOSITE remedy lines.
+ *
+ * `ok` requires a 2xx AND a non-empty `result.tools` array. A 200 carrying no
+ * tools is NOT ok — that is exactly the incident's invisible symptom, a
+ * connection that reports healthy and exposes nothing — so it is `unreadable`.
+ */
+export function classifyProbe(result: ProbeResult): ProbeVerdict {
+  const body = result.body ?? "";
+  const contentType = (result.contentType ?? "").toLowerCase();
+  const head = body.trimStart().slice(0, 64).toLowerCase();
+
+  if (contentType.includes("text/html") || head.startsWith("<!doctype") || head.startsWith("<html")) {
+    return "gateway-challenge";
+  }
+
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    parsed = null;
+  }
+
+  if (result.status === 401 || result.status === 403) {
+    return isJsonRpcError(parsed) ? "rejected" : "unreadable";
+  }
+
+  if (result.status >= 200 && result.status < 300) {
+    const tools = (parsed as { result?: { tools?: unknown } } | null)?.result?.tools;
+    if (Array.isArray(tools) && tools.length > 0) return "ok";
+    return "unreadable";
+  }
+
+  return "unreadable";
+}
+
+/** JSON-RPC-shaped error: an error object, or a bare `{code, message}`. */
+function isJsonRpcError(parsed: unknown): boolean {
+  if (parsed === null || typeof parsed !== "object") return false;
+  const obj = parsed as Record<string, unknown>;
+  const err = (typeof obj.error === "object" && obj.error !== null ? obj.error : obj) as Record<
+    string,
+    unknown
+  >;
+  return typeof err.code === "number" || typeof err.message === "string";
+}
+
 export function pathResolves(path: string): boolean {
   try {
     statSync(path);
