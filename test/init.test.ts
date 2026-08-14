@@ -333,15 +333,50 @@ describe("parseServerStatus", () => {
     expect(parseServerStatus(line, "suite-channel").state).toBe("connected");
   });
 
-  test("reads failure, pending approval and absence as not-green", () => {
+  test("reads failure and absence as not-green", () => {
     expect(parseServerStatus("suite-channel: x - ✘ Failed to connect", "suite-channel").state).toBe(
       "not-connected",
     );
+    expect(parseServerStatus("other: x - ✔ Connected", "suite-channel").state).toBe("missing");
+  });
+
+  /**
+   * PENDING IS ITS OWN STATE — neither `connected` nor `not-connected`.
+   *
+   * `⏸ Pending approval` says this project has not approved a user-scope
+   * server; it says nothing about whether that server works, and on a real box
+   * both Suite servers reported pending while the channel was delivering
+   * messages. It used to fall into the not-connected alternation, which made
+   * `suite doctor` print a failure for a working channel.
+   */
+  test("pending approval is its own state, not connected and not a failure", () => {
     expect(
       parseServerStatus("startup-suite: x - ⏸ Pending approval (run `claude` to approve)", "startup-suite")
         .state,
-    ).toBe("not-connected");
-    expect(parseServerStatus("other: x - ✔ Connected", "suite-channel").state).toBe("missing");
+    ).toBe("pending");
+    // The word alone is enough; the glyph is Claude Code's to change.
+    expect(parseServerStatus("suite-channel: x - Pending approval", "suite-channel").state).toBe("pending");
+    // Still not green — the original claim, kept.
+    expect(parseServerStatus("suite-channel: x - ⏸ Pending approval", "suite-channel").state).not.toBe(
+      "connected",
+    );
+  });
+
+  test("connectionReport does not call a pending server a hard failure", () => {
+    const report = connectionReport([
+      { name: "suite-channel", state: "connected", raw: "" },
+      { name: "startup-suite", state: "pending", raw: "" },
+    ]);
+    expect(report.ok).toBe(true);
+    const text = report.lines.join("\n");
+    expect(text).toContain("pending approval");
+    expect(text).toContain("run claude once in this project to approve");
+    expect(text).not.toContain("not connected");
+    // Anti-vacuity: a real not-connected server on the same shape IS still red,
+    // so `ok` did not simply stop being reachable.
+    expect(
+      connectionReport([{ name: "startup-suite", state: "not-connected", raw: "" }]).ok,
+    ).toBe(false);
   });
 
   test("an unrecognised status is unparseable, never assumed connected", () => {

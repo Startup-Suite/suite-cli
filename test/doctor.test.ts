@@ -18,6 +18,7 @@ import {
   parseMcpEntryPath,
   parseMcpHeaderValue,
   parseMcpHttpUrl,
+  mcpEntryEnvValue,
   bearerOf,
   classifyProbe,
   suiteHostOf,
@@ -103,7 +104,13 @@ interface FakeOptions {
 
 const PLUGIN_PATH = "/opt/example/claude-code-suite-channel/src/index.ts";
 
-function mcpGetOutput(path = PLUGIN_PATH, token = "tok_fixture_0000"): string {
+/**
+ * The channel entry. Its token defaults to {@link TOOLS_TOKEN} — the SAME
+ * credential the tools entry carries — because that is the healthy shape: one
+ * runtime credential serving both servers. A fixture whose two entries
+ * disagreed would make the all-healthy anchor below red.
+ */
+function mcpGetOutput(path = PLUGIN_PATH, token = TOOLS_TOKEN): string {
   return [
     `${CHANNEL_SERVER}:`,
     "  Scope: User config",
@@ -151,10 +158,10 @@ const REJECTED_BODY = JSON.stringify({
   error: { code: -32000, message: "unauthorized" },
 });
 
-function mcpListOutput(channel = "✔ Connected"): string {
+function mcpListOutput(channel = "✔ Connected", tools = "✔ Connected"): string {
   return [
     `${CHANNEL_SERVER}: bun ${PLUGIN_PATH} - ${channel}`,
-    `${TOOLS_SERVER}: ${SUITE_URL}/mcp (HTTP) - ✔ Connected`,
+    `${TOOLS_SERVER}: ${SUITE_URL}/mcp (HTTP) - ${tools}`,
     "",
   ].join("\n");
 }
@@ -251,17 +258,17 @@ async function report(options: FakeOptions = {}): Promise<{ text: string; code: 
 /* ------------------------------------------------------------------------- */
 
 describe("an all-healthy machine", () => {
-  test("passes all nine checks and exits 0", async () => {
+  test("passes all ten checks and exits 0", async () => {
     const { text, code, checks } = await report();
-    expect(checks).toHaveLength(9);
-    expect(checks.filter((c) => c.status === "pass")).toHaveLength(9);
+    expect(checks).toHaveLength(10);
+    expect(checks.filter((c) => c.status === "pass")).toHaveLength(10);
     expect(code).toBe(0);
-    expect(text).toContain("9 checks passed.");
+    expect(text).toContain("10 checks passed.");
     expect(text).not.toContain("✘");
     expect(text).not.toContain("⋯");
   });
 
-  test("the nine checks are listed in dependency order", async () => {
+  test("the ten checks are listed in dependency order", async () => {
     const { checks } = await report();
     expect(checks.map((c) => c.id)).toEqual([
       "claude",
@@ -270,6 +277,7 @@ describe("an all-healthy machine", () => {
       "tmux",
       "plugin",
       "credentials",
+      "tokens",
       "channel",
       "tools",
       "session",
@@ -390,11 +398,24 @@ describe("each check fires on a broken input", () => {
     expect(text).toContain("→ claude mcp list");
   });
 
-  test("7b. `⏸ Pending approval` is NOT read as connected", async () => {
-    // The established trap: a parser looking only for `✘` calls this green.
-    const { code, checks } = await report({ mcpList: mcpListOutput("⏸ Pending approval") });
-    expect(byId(checks, "channel").status).toBe("fail");
-    expect(code).toBe(1);
+  test("7b. `⏸ Pending approval` is read as NEITHER connected NOR failed", async () => {
+    const { text, code, checks } = await report({ mcpList: mcpListOutput("⏸ Pending approval") });
+    const check = byId(checks, "channel");
+
+    // THE ORIGINAL CLAIM, KEPT: a parser looking only for `✘` calls this green,
+    // and it must not. Pending is not a connection.
+    expect(check.status).not.toBe("pass");
+
+    // AND THE OTHER HALF. `⏸ Pending approval` is a project-approval state, not
+    // a connectivity verdict — measured on a real box, both Suite servers
+    // reported pending while the channel was demonstrably delivering messages.
+    // Printing `✘` there is a failure reported for something that works.
+    expect(check.status).toBe("skip");
+    expect(text).toContain("skipped — awaiting project approval");
+    expect(text).toContain("run claude once in this project to approve");
+    // The exit code follows from the tier — but assert it, because "skip is
+    // exempt" is a property of exitCodeFor that a future edit could lose.
+    expect(code).toBe(0);
   });
 
   test("7c. a status we cannot read at all is a failure, never a pass", async () => {
@@ -432,17 +453,19 @@ describe("a broken upstream check skips its dependants rather than reddening the
     expect(text).toContain("skipped — needs a working plugin path");
     // Exactly one failure, not a wall of red pointing at one real cause.
     expect(checks.filter((c) => c.status === "fail")).toHaveLength(1);
-    expect(text).toContain("1 of 9 failed.");
+    expect(text).toContain("1 of 10 failed.");
   });
 
   test("no claude at all skips everything that needs it, and still exits 1", async () => {
     const { text, code, checks } = await report({ tools: ["bun", "tmux"] });
     expect(byId(checks, "claude").status).toBe("fail");
     expect(
-      ["auth", "plugin", "credentials", "channel", "tools"].map((id) => byId(checks, id as CheckId).status),
-    ).toEqual(["skip", "skip", "skip", "skip", "skip"]);
+      ["auth", "plugin", "credentials", "tokens", "channel", "tools"].map((id) =>
+        byId(checks, id as CheckId).status,
+      ),
+    ).toEqual(["skip", "skip", "skip", "skip", "skip", "skip"]);
     expect(code).toBe(1);
-    expect(text).toContain("1 of 9 failed.");
+    expect(text).toContain("1 of 10 failed.");
   });
 });
 
@@ -474,6 +497,8 @@ describe("the report obeys the design rules", () => {
       { exists: () => false },
       { mcpGetExit: 1, mcpGet: "" },
       { mcpGet: mcpGetOutput(PLUGIN_PATH, "") },
+      // Same host, disagreeing credentials — the token-match failure.
+      { mcpGet: mcpGetOutput(PLUGIN_PATH, "tok_fixture_disagreeing_zzq9") },
       { mcpList: mcpListOutput("✘ Failed to connect") },
       { mcpList: "" },
       { sessionState: "stale" },
@@ -524,7 +549,7 @@ describe("the report obeys the design rules", () => {
   test("(d) the closing line is a count and an instruction, not a paragraph", async () => {
     const { text } = await report({ auth: APIKEY_AUTH, exists: () => false });
     const last = text.trimEnd().split("\n").pop() ?? "";
-    expect(last).toContain("2 of 9 failed.");
+    expect(last).toContain("2 of 10 failed.");
     expect(last).toContain("Fix the first one, run suite doctor again.");
     expect(last.split(".").filter((s) => s.trim() !== "")).toHaveLength(2);
   });
@@ -1090,6 +1115,166 @@ describe("the tools api check", () => {
     expect(toolCount(toolsListBody(["a", "b"]))).toBe(2);
     expect(toolCount(REJECTED_BODY)).toBeNull();
     expect(toolCount("not json")).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* The token-consistency check: BOTH sides, one assertion each                */
+/* ------------------------------------------------------------------------- */
+
+describe("the token match check", () => {
+  /** A channel entry whose SUITE_URL host is settable, so hosts can differ. */
+  function channelEntry(token: string, host = "suite.example.invalid"): string {
+    return [
+      `${CHANNEL_SERVER}:`,
+      "  Scope: User config",
+      "  Type: stdio",
+      "  Command: bun",
+      `  Args: ${PLUGIN_PATH}`,
+      "  Environment:",
+      `    SUITE_URL=wss://${host}/runtime/ws`,
+      `    SUITE_RUNTIME_ID=${RUNTIME_ID}`,
+      `    SUITE_TOKEN=${token}`,
+      "",
+    ].join("\n");
+  }
+
+  const OTHER_TOKEN = "tok_fixture_disagreeing_zzq9";
+
+  /**
+   * SIDE ONE: it fires. Same host, two different credentials — the shape the
+   * real incident had, and the shape no other surface reports at all.
+   */
+  test("same host + different credentials is a failure naming BOTH entries", async () => {
+    const { text, code, checks } = await report({ mcpGet: channelEntry(OTHER_TOKEN) });
+    const check = byId(checks, "tokens");
+    expect(check.status).toBe("fail");
+    expect(code).toBe(1);
+    expect(text).toContain("entries disagree");
+    // BOTH entries are named, because "one of these two is wrong" is the whole
+    // verdict and a message naming one of them points the reader at a coin flip.
+    expect(text).toContain(CHANNEL_SERVER);
+    expect(text).toContain(TOOLS_SERVER);
+    // The consequence is the invisible symptom, not the mismatch restated.
+    expect(text).toContain("registers and exposes nothing");
+    expect(text).toContain("→ suite init");
+  });
+
+  /**
+   * SIDE TWO: it is SILENT on the healthy shape. A check tested only on its
+   * failure is indistinguishable from one that always fires — and this one runs
+   * on every invocation of a tool whose value is that green means green.
+   */
+  test("same host + identical credentials is silent", async () => {
+    const { text, checks } = await report();
+    const check = byId(checks, "tokens");
+    expect(check.status).toBe("pass");
+    expect(check.status === "pass" && check.value).toBe("both entries agree");
+    expect(text).not.toContain("✘");
+  });
+
+  /** NEVER any part of either value, on either side. Presence-only, as shipped. */
+  test("no part of either credential appears in the report, agreeing or not", async () => {
+    for (const options of [{}, { mcpGet: channelEntry(OTHER_TOKEN) }]) {
+      const { text } = await report(options);
+      for (const secret of [TOOLS_TOKEN, OTHER_TOKEN]) {
+        // The same sweep the credentials check is held to: no prefix of any
+        // length, and not the tail either. A partial echo is still an echo.
+        expect(text).not.toContain(secret);
+        for (let n = 4; n <= secret.length; n++) expect(text).not.toContain(secret.slice(0, n));
+        expect(text).not.toContain(secret.slice(-4));
+      }
+    }
+  });
+
+  /**
+   * DIFFERENT HOSTS IS A SKIP, DELIBERATELY. Two Suite deployments on one box
+   * is a legitimate configuration and two credentials is then correct, so this
+   * check says nothing rather than inventing a verdict. Note the tokens here
+   * ALSO differ — the same input that fails above — so what is being tested is
+   * the host, not the token.
+   */
+  test("different hosts is ⋯ skipped with the reason named, never a failure", async () => {
+    const { text, code, checks } = await report({
+      mcpGet: channelEntry(OTHER_TOKEN, "other-suite.example.invalid"),
+    });
+    const check = byId(checks, "tokens");
+    expect(check.status).toBe("skip");
+    expect(check.status === "skip" && check.reason).toBe("the entries point at different suites");
+    expect(text).toContain("skipped — the entries point at different suites");
+    expect(code).toBe(0);
+  });
+
+  test("an unreadable entry or an unreadable token is ⋯, with its own reason", async () => {
+    const noToken = await report({ mcpGet: channelEntry("") });
+    const a = byId(noToken.checks, "tokens");
+    expect(a.status).toBe("skip");
+    expect(a.status === "skip" && a.reason).toBe(`no SUITE_TOKEN on the ${CHANNEL_SERVER} entry`);
+
+    const noBearer = await report({ toolsGet: toolsGetOutput().replace(/Authorization:.*/, "") });
+    const b = byId(noBearer.checks, "tokens");
+    expect(b.status).toBe("skip");
+    expect(b.status === "skip" && b.reason).toBe(`no bearer on the ${TOOLS_SERVER} entry`);
+
+    const noEntry = await report({ toolsGetExit: 1, toolsGet: "" });
+    const c = byId(noEntry.checks, "tokens");
+    expect(c.status).toBe("skip");
+    expect(c.status === "skip" && c.reason).toBe(`${TOOLS_SERVER} is not registered`);
+  });
+
+  test("the env reader lifts a value by name and never guesses one", () => {
+    expect(mcpEntryEnvValue(channelEntry("tok_fixture_env"), "SUITE_TOKEN")).toBe("tok_fixture_env");
+    expect(mcpEntryEnvValue(channelEntry("tok_fixture_env"), "SUITE_URL")).toBe(
+      "wss://suite.example.invalid/runtime/ws",
+    );
+    expect(mcpEntryEnvValue(channelEntry(""), "SUITE_TOKEN")).toBeNull();
+    expect(mcpEntryEnvValue(channelEntry("x"), "SUITE_ABSENT")).toBeNull();
+    // A header line is not an environment line, however much `Name: value`
+    // resembles `NAME=value`.
+    expect(mcpEntryEnvValue(toolsGetOutput(), "Authorization")).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* Pending approval: neither red nor green                                    */
+/* ------------------------------------------------------------------------- */
+
+describe("a server that is PENDING APPROVAL and WORKING", () => {
+  /**
+   * THE ANTI-VACUITY FIXTURE FOR THE WHOLE TIER, and the state a real box was
+   * measured in: `claude mcp list` reports `⏸ Pending approval` for BOTH Suite
+   * servers while the tools endpoint answers a real `tools/list` and the channel
+   * delivers messages. A doctor that reads pending as a failure prints red for a
+   * machine that works, which is the misdiagnosis this tier exists to end.
+   */
+  const PENDING_AND_WORKING: FakeOptions = {
+    mcpList: mcpListOutput("⏸ Pending approval", "⏸ Pending approval"),
+  };
+
+  test("the channel line is ⋯, the tools check still passes, and the exit code is 0", async () => {
+    const { text, code, checks } = await report(PENDING_AND_WORKING);
+
+    expect(byId(checks, "channel").status).toBe("skip");
+    expect(text).toContain("skipped — awaiting project approval");
+
+    // The probe is what actually establishes health, and it is untouched by the
+    // approval state: pending said nothing about whether the server works.
+    const tools = byId(checks, "tools");
+    expect(tools.status).toBe("pass");
+    expect(text).toContain("3 tools");
+
+    // Nothing red anywhere, and the process says so.
+    expect(checks.filter((c) => c.status === "fail")).toHaveLength(0);
+    expect(text).not.toContain("✘");
+    expect(code).toBe(0);
+  });
+
+  test("a genuinely failed channel on the same fixture is still red", async () => {
+    // Anti-vacuity for the test above: the pending tier did not simply stop the
+    // channel check from ever reddening.
+    const { code, checks } = await report({ mcpList: mcpListOutput("✘ Failed to connect") });
+    expect(byId(checks, "channel").status).toBe("fail");
+    expect(code).toBe(1);
   });
 });
 

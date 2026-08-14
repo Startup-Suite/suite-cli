@@ -44,6 +44,7 @@ import { emptyConfig, readConfig, type SuiteConfig } from "../config.ts";
 import { configPath } from "../paths.ts";
 import {
   CHANNEL_SERVER,
+  PENDING_APPROVAL_REMEDY,
   TOOLS_SERVER,
   parseServerStatus,
   whichBin,
@@ -115,6 +116,7 @@ export const CHECK_IDS = [
   "tmux",
   "plugin",
   "credentials",
+  "tokens",
   "channel",
   "tools",
   "session",
@@ -247,6 +249,35 @@ export function mcpEntryHasToken(output: string): boolean {
     if (value !== "" && value !== "${}") return true;
   }
   return false;
+}
+
+/**
+ * One `Environment:` value off a stdio MCP entry, by variable name.
+ *
+ * THIS RETURNS RAW VALUES, AND ONE OF THEM IS A SECRET (`SUITE_TOKEN`). It sits
+ * under the same restriction {@link parseMcpHeaderValue} states: its return
+ * value MUST NEVER reach a `value`, `detail`, `consequence` or `remedy` field of
+ * a {@link CheckResult}, and must never be logged. Its permitted callers are
+ * {@link tokenFingerprint} and {@link suiteHostOf} — both of which answer a
+ * question about the value without carrying any of it.
+ *
+ * {@link mcpEntryHasToken} stays the reader for the PRESENCE question, because a
+ * function that cannot return the secret cannot leak it; this one exists only
+ * because comparing two credentials requires reading both.
+ *
+ * Null when the variable is absent or its value is empty.
+ */
+export function mcpEntryEnvValue(output: string, name: string): string | null {
+  const wanted = name.trim();
+  for (const raw of output.split("\n")) {
+    const line = raw.trim();
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (m === null) continue;
+    if (m[1] !== wanted) continue;
+    const value = (m[2] ?? "").trim().replace(/^["']|["']$/g, "").trim();
+    if (value !== "" && value !== "${}") return value;
+  }
+  return null;
 }
 
 /**
@@ -722,15 +753,22 @@ export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
   const entry = claudePath === null ? null : await deps.run([claudePath, "mcp", "get", CHANNEL_SERVER]);
   checks.push(pluginCheck(deps, claudePath, entry));
 
-  // 6-7. Credentials and the channel's health ----------------------------
+  // 6-8. Credentials, their AGREEMENT, and the channel's health -----------
   const pluginOk = checks[checks.length - 1]?.status === "pass";
   checks.push(credentialsCheck(deps, claudePath, entry, pluginOk));
+
+  // The tools entry is fetched ONCE, here, and shared with the tools check
+  // below: the token comparison and the probe read the same entry, so they can
+  // never disagree about what is registered.
+  const toolsEntry = claudePath === null ? null : await deps.run([claudePath, "mcp", "get", TOOLS_SERVER]);
+  checks.push(tokensCheck(claudePath, entry, toolsEntry));
+
   checks.push(await channelCheck(deps, claudePath, pluginOk));
 
-  // 8. The tools endpoint — an AUTHENTICATED call, not a reachability ping ---
-  checks.push(await toolsCheck(deps, claudePath));
+  // 9. The tools endpoint — an AUTHENTICATED call, not a reachability ping ---
+  checks.push(await toolsCheck(deps, claudePath, toolsEntry));
 
-  // 9. Session health, via stage 4's three-way detection ------------------
+  // 10. Session health, via stage 4's three-way detection -----------------
   checks.push(await sessionCheck(deps, tmuxPath));
 
   return checks;
@@ -908,6 +946,92 @@ function credentialsCheck(
   };
 }
 
+/**
+ * DO THE TWO ENTRIES CARRY THE SAME CREDENTIAL?
+ *
+ * ONE RUNTIME CREDENTIAL NORMALLY SERVES BOTH SERVERS. The channel entry keeps
+ * it in `SUITE_TOKEN`, the tools entry in an `Authorization: Bearer` header, and
+ * when the two disagree on one Suite host at least one of them is wrong — which
+ * produces a server that REGISTERS AND EXPOSES NOTHING.
+ *
+ * WHY SO CHEAP A CHECK EARNS ITS LINE: the broken configuration LOOKS PLAUSIBLE.
+ * Two servers, two credentials, both entries present, nothing visibly wrong on
+ * any surface a human can see. That is precisely why the real failure survived
+ * an evening. Failures that announce themselves do not need a doctor.
+ *
+ * COMPARED BY FINGERPRINT, never by value, and the verdict names only the two
+ * ENTRIES — never any part of either credential. The shipped convention for a
+ * credential is presence-only (see {@link credentialsCheck}, which renders
+ * `set`), and this check does not weaken it.
+ *
+ * DIFFERENT HOSTS IS A SKIP, NOT A FAILURE. Two Suite deployments on one box —
+ * a production federation and a local one — is a legitimate configuration, and
+ * two credentials for two hosts is then exactly right. This check has nothing to
+ * say about it, so it says nothing rather than inventing a verdict. Same for an
+ * entry or a token we could not read: `⋯` with the reason named.
+ */
+function tokensCheck(
+  claudePath: string | null,
+  channelEntry: RunResult | null,
+  toolsEntry: RunResult | null,
+): CheckResult {
+  const id = "tokens";
+  const label = "token match";
+  if (claudePath === null || channelEntry === null || toolsEntry === null) {
+    return { id, label, status: "skip", reason: "needs the claude cli" };
+  }
+  if (channelEntry.exitCode !== 0) {
+    return { id, label, status: "skip", reason: `${CHANNEL_SERVER} is not registered` };
+  }
+  if (toolsEntry.exitCode !== 0) {
+    return { id, label, status: "skip", reason: `${TOOLS_SERVER} is not registered` };
+  }
+
+  const channelOut = `${channelEntry.stdout}\n${channelEntry.stderr}`;
+  const toolsOut = `${toolsEntry.stdout}\n${toolsEntry.stderr}`;
+
+  const channelToken = mcpEntryEnvValue(channelOut, "SUITE_TOKEN");
+  if (channelToken === null) {
+    return { id, label, status: "skip", reason: `no SUITE_TOKEN on the ${CHANNEL_SERVER} entry` };
+  }
+  const authorization = parseMcpHeaderValue(toolsOut, "Authorization");
+  const toolsToken = authorization === null ? null : bearerOf(authorization);
+  if (toolsToken === null) {
+    return { id, label, status: "skip", reason: `no bearer on the ${TOOLS_SERVER} entry` };
+  }
+
+  const channelUrl = mcpEntryEnvValue(channelOut, "SUITE_URL");
+  const toolsUrl = parseMcpHttpUrl(toolsOut);
+  const channelHost = channelUrl === null ? null : suiteHostOf(channelUrl);
+  const toolsHost = toolsUrl === null ? null : suiteHostOf(toolsUrl);
+  if (channelHost === null || toolsHost === null) {
+    return { id, label, status: "skip", reason: "could not read both entry urls" };
+  }
+  if (channelHost !== toolsHost) {
+    // Legitimate: two Suites. Nothing to compare, so nothing is claimed.
+    return { id, label, status: "skip", reason: "the entries point at different suites" };
+  }
+
+  if (tokenFingerprint(channelToken) !== tokenFingerprint(toolsToken)) {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "entries disagree",
+      detail: channelHost,
+      consequence: [
+        // Two lines, per rule (b). The first says WHAT is wrong and why that is
+        // a verdict rather than an observation.
+        `The ${CHANNEL_SERVER} and ${TOOLS_SERVER} entries carry different credentials for one Suite host, and one runtime credential normally serves both, so at least one of the two is wrong.`,
+        // The second says why nothing else will tell you.
+        "The wrong one produces a server that registers and exposes nothing at all: no error, no missing entry, just silence — which is why this configuration looks plausible from every surface you can see.",
+      ],
+      remedy: "suite init",
+    };
+  }
+  return { id, label, status: "pass", value: "both entries agree", detail: channelHost };
+}
+
 async function channelCheck(
   deps: DoctorDeps,
   claudePath: string | null,
@@ -922,6 +1046,21 @@ async function channelCheck(
   const status = await channelStatus(deps, claudePath);
   if (status.state === "connected") {
     return { id: "channel", label: "channel", status: "pass", value: "connected" };
+  }
+  if (status.state === "pending") {
+    // NEITHER RED NOR GREEN, rule (c). `⏸ Pending approval` is a statement
+    // about this PROJECT's approval of a user-scope server, not about the
+    // channel's health — a pending channel is routinely delivering messages —
+    // so calling it a failure prints red for something that works, and calling
+    // it connected asserts something we did not observe.
+    return {
+      id: "channel",
+      label: "channel",
+      status: "skip",
+      // The remedy rides in the reason: `Skipped` carries no `remedy` field on
+      // purpose, because rule (b)'s single `→` belongs to failures only.
+      reason: `awaiting project approval; ${PENDING_APPROVAL_REMEDY}`,
+    };
   }
   if (status.state === "missing") {
     return {
@@ -1001,13 +1140,16 @@ export async function toolsStatus(deps: DoctorDeps, claudePath: string): Promise
  * which is in-process `fetch`. Never a spawned command: an argv is world-
  * readable through `ps`.
  */
-async function toolsCheck(deps: DoctorDeps, claudePath: string | null): Promise<CheckResult> {
+async function toolsCheck(
+  deps: DoctorDeps,
+  claudePath: string | null,
+  entry: RunResult | null,
+): Promise<CheckResult> {
   const id = "tools";
   const label = "tools api";
-  if (claudePath === null) {
+  if (claudePath === null || entry === null) {
     return { id, label, status: "skip", reason: "needs the claude cli" };
   }
-  const entry = await deps.run([claudePath, "mcp", "get", TOOLS_SERVER]);
   const output = `${entry.stdout}\n${entry.stderr}`;
   if (entry.exitCode !== 0) {
     return {
