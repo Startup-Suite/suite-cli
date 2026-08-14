@@ -68,6 +68,96 @@ repository, `suite` asks `git check-ignore` and **refuses** — non-zero exit, a
 message naming the path — unless the path is ignored. Refusal rather than a
 warning, because a warned-then-written credential file is a committed one.
 
+## Persistent sessions
+
+Agents run inside `tmux`, so closing the terminal does not kill the agent. An
+agent that dies with its terminal stops mid-task, and from Suite's side that is
+indistinguishable from an agent that is merely slow.
+
+**The backend is tmux specifically.** There is no multiplexer abstraction and
+no `screen`/`zellij` backend: a second implementation is what would earn an
+interface, and one implementation behind one is just indirection.
+
+### Session naming — per working directory
+
+The session name is `suite-<directory name>-<8 hex of sha256 of the absolute
+path>`, e.g. `suite-ledger-3f2a91c0`. Two requirements decide this:
+
+* **`suite claude` twice from the same place must find the same session.** The
+  name is a pure function of the resolved absolute path, so nothing has to be
+  remembered, looked up, or kept in sync with a state file that can drift.
+* **Two projects must not collide.** The digest is of the absolute path, so
+  `~/a/ledger` and `~/b/ledger` share the readable half and differ in the half
+  that identifies them.
+
+The two alternatives were rejected on that second requirement.
+**Per runtime id** gives one box one session, so the second project silently
+attaches to the first project's agent — a collision that presents as a
+successful re-attach. It is still available as `sessionNaming: "runtime"` in
+the config, because it is the right rule for a box that genuinely runs one
+agent. **An explicit name only** would be correct but requires the user to
+remember it, and a forgotten name means a second agent rather than an error.
+`--session NAME` therefore exists as a per-invocation override for the user who
+wants two agents in one directory, and is not persisted.
+
+Names are sanitised to `[A-Za-z0-9_-]`. tmux addresses panes as
+`session:window.pane`, so a `.` or `:` in a session name makes `-t <name>`
+ambiguous. Sanitising cannot merge two projects, because the discriminating
+half of the name is a hash of the *unsanitised* path.
+
+### Three states, not two
+
+`suite` reports **live**, **stale**, or **none** for a session:
+
+| State | Meaning |
+| --- | --- |
+| `live` | The session exists and an agent process is running inside it |
+| `stale` | The session exists and its shell is alive, but the agent is gone |
+| `none` | No session by that name |
+
+**`tmux has-session` cannot tell live from stale**, and that is the whole
+problem. A tmux session routinely outlives the process it was created for: the
+agent exits, the pane's shell remains, and `has-session` answers yes forever.
+Attaching to that corpse is worse than starting fresh, because it looks like a
+live agent — you see a prompt, Suite sees nothing, and nothing says why.
+
+So detection lists panes (`tmux list-panes -a -F` with `#{pane_pid}` and
+`#{pane_current_command}`) and **walks the pane's process descendants**. The
+agent is normally a *child* of the pane's shell, so checking the pane command
+alone would call every live session stale. Both the executable name and the
+words of the command line are matched, because Claude Code appears as
+`comm=claude` when installed as a binary and as `node …/claude` when installed
+as a JS entrypoint.
+
+### Quoting
+
+Arguments are handed to `tmux new-session -d -s <name> <cmd> <arg>…` as
+**separate argv elements**, never folded into one shell string — folding means
+re-quoting for a shell that then re-splits, which is exactly how an argument
+containing a space or a quote gets corrupted. The composition is a pure
+function, tested against arguments containing spaces, single and double quotes,
+`$VAR`, a leading `-`, backslashes and embedded newlines, and separately round
+tripped through a real tmux to prove the process in the pane receives them byte
+for byte. One audited single-quote escaper exists for the display-only case.
+
+### No secret is ever a tmux argument
+
+A command line is world-readable through `ps`, and a `tmux new-session` command
+line stays in the process table for the life of the agent. Credentials reach
+Claude through the MCP config written at `suite init` time. The composed argv is
+checked against the credential store before it is run, and `send-keys` is never
+used — typing a secret into a live shell would add its history to the exposure.
+
+### Inside tmux, and without tmux
+
+Run from inside tmux, `suite` uses `switch-client` rather than attaching; it
+never nests a session inside itself, and where switching is not possible it
+refuses with the command to run instead.
+
+If tmux is not installed, `suite` can still run the agent directly — **with a
+warning**, never silently. A silent fallback would reproduce the exact failure
+persistence exists to prevent.
+
 ## MCP registration
 
 `suite init` writes both MCP entries with `claude mcp add` rather than editing

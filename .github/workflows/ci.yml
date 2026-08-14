@@ -32,6 +32,17 @@ jobs:
       - name: POSIX syntax check
         run: sh -n install.sh
 
+      # The tmux integration tests are the only evidence that a session
+      # survives a closed terminal. A runner without tmux would SKIP them and
+      # still go green, so tmux is installed rather than assumed.
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y tmux
+
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
