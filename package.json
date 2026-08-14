@@ -1,0 +1,20 @@
+{
+  "name": "suite-cli",
+  "version": "0.1.0",
+  "description": "Command-line tool for wiring a Claude Code runtime to Startup Suite",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "suite": "./src/cli.ts"
+  },
+  "scripts": {
+    "test": "bun test",
+    "lint": "shellcheck install.sh bin/suite.template",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  }
+}

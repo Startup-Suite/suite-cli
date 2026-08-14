@@ -1,0 +1,24 @@
+#!/bin/sh
+# Rendered by install.sh: @SUITE_LIB_DIR@ and @SUITE_VERSION@ are substituted
+# at install time. POSIX sh, because this file must answer --version even on a
+# machine where bun is not installed yet.
+set -eu
+
+SUITE_LIB_DIR="@SUITE_LIB_DIR@"
+SUITE_VERSION="@SUITE_VERSION@"
+export SUITE_LIB_DIR SUITE_VERSION
+
+case "${1:-}" in
+--version | -V)
+	printf '%s\n' "$SUITE_VERSION"
+	exit 0
+	;;
+esac
+
+if ! command -v bun >/dev/null 2>&1; then
+	printf 'suite: bun is not installed or not on PATH.\n' >&2
+	printf 'suite needs bun to run. Install it from https://bun.sh, then re-run this command.\n' >&2
+	exit 127
+fi
+
+exec bun "$SUITE_LIB_DIR/src/cli.ts" "$@"
