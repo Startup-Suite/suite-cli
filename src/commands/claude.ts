@@ -166,6 +166,46 @@ export async function ensureAgent(deps: ClaudeDeps): Promise<number | null> {
 export const DEV_CHANNEL_ARGS = ["--dangerously-load-development-channels", "server:suite-channel"] as const;
 
 /**
+ * The Suite participation flags.
+ *
+ * WHY. A Suite runtime is an agent nobody is sitting in front of. Without
+ * `--dangerously-skip-permissions` it stops on the first tool-call prompt and
+ * waits for a human who is not there — the task looks hung when it is only
+ * asking. Without `--continue` every launch is a cold session, so re-attaching
+ * to a runtime loses everything it knew. Both are what the live runtimes are
+ * already invoked with by hand; this makes the wrapper produce that argv
+ * instead of requiring everyone to remember it.
+ *
+ * VERIFIED, not assumed: `--continue` in a directory with NO prior conversation
+ * does not error — it simply starts a fresh session (checked against Claude
+ * Code 2.1.232 on 2026-08-14, `claude --continue -p …` in an empty directory,
+ * which answered normally). So it is safe to inject unconditionally and needs
+ * no "does a session exist" probe.
+ *
+ * `--resume` is the one conflict: it and `--continue` both choose a session, so
+ * a user who names one must not be handed the other. See {@link agentArgv}.
+ */
+export const CONTINUE_ARG = "--continue";
+export const SKIP_PERMISSIONS_ARG = "--dangerously-skip-permissions";
+
+/** Arguments that already choose a session, so `--continue` must stand down. */
+const SESSION_SELECTORS = new Set([CONTINUE_ARG, "-c", "--resume", "-r", "--from-pr", "--teleport"]);
+
+/**
+ * Which Suite flags still need injecting, given what the user already passed.
+ *
+ * Exported so the decision is asserted directly rather than through a launch:
+ * a test can pin "user said --resume ⇒ no --continue" without composing tmux.
+ */
+export function suiteArgs(userArgs: string[]): string[] {
+  const args = stripTerminator(userArgs);
+  const out: string[] = [];
+  if (!args.some((a) => a === SKIP_PERMISSIONS_ARG)) out.push(SKIP_PERMISSIONS_ARG);
+  if (!args.some((a) => SESSION_SELECTORS.has(a))) out.push(CONTINUE_ARG);
+  return out;
+}
+
+/**
  * Drop the single leading `--`, if present.
  *
  * `--` terminates wrapper options. The wrapper HAS no options today, which is
@@ -186,7 +226,7 @@ export function stripTerminator(args: string[]): string[] {
  * so that a user argument can never be absorbed as its value.
  */
 export function agentArgv(userArgs: string[]): string[] {
-  return [AGENT, ...DEV_CHANNEL_ARGS, ...stripTerminator(userArgs)];
+  return [AGENT, ...DEV_CHANNEL_ARGS, ...suiteArgs(userArgs), ...stripTerminator(userArgs)];
 }
 
 /**
@@ -227,7 +267,7 @@ export function isNonInteractive(userArgs: string[]): boolean {
  * reserved for this notice and is used nowhere else in `suite claude`.
  */
 export const NOTICE_BODY =
-  "loading a development channel plugin that is not yet on Anthropic's allowlist, via --dangerously-load-development-channels.";
+  "loading a development channel plugin that is not yet on Anthropic's allowlist, via --dangerously-load-development-channels, and running with --dangerously-skip-permissions so an unattended Suite runtime does not stop on a tool-call prompt nobody is there to answer.";
 
 const YELLOW = "[33m";
 const RESET = "[0m";
