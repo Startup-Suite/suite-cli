@@ -641,6 +641,15 @@ export interface DoctorDeps {
 
 const CLAUDE = "claude";
 
+/**
+ * Where a user without Claude Code is sent.
+ *
+ * Exported because `src/commands/claude.ts` offers the install on the launch
+ * path and must name the SAME page. Two literals of one URL drift; one
+ * constant cannot.
+ */
+export const CLAUDE_CODE_URL = "https://claude.com/product/claude-code";
+
 export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
   const checks: CheckResult[] = [];
 
@@ -656,7 +665,7 @@ export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
         "Nothing else in this tool can run: the channel, the MCP entries and",
         "every session are all things Claude Code owns.",
       ],
-      remedy: "https://claude.com/product/claude-code",
+      remedy: CLAUDE_CODE_URL,
     });
   } else {
     const r = await deps.run([claudePath, "--version"]);

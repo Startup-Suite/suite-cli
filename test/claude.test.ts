@@ -21,8 +21,14 @@ import {
   stripTerminator,
   uniqueSessionName,
   writeState,
+  claudeInstallPlan,
+  ensureAgent,
+  missingClaudeInstallTools,
+  MISSING_AGENT_EXIT,
   type ClaudeDeps,
 } from "../src/commands/claude.ts";
+import { CLAUDE_CODE_URL } from "../src/commands/doctor.ts";
+import type { Prompter } from "../src/secrets.ts";
 import { sessionNameFromConfig } from "../src/tmux.ts";
 
 /* ------------------------------------------------------------------------- */
@@ -297,18 +303,37 @@ interface Recorder {
   ran: string[][];
 }
 
-function recorder(over: Partial<ClaudeDeps> = {}, run?: (argv: string[]) => Promise<RunResult>): Recorder {
+/** A prompter that answers every question the same way and records them. */
+function fakePrompter(answer: string, asked: string[] = []): Prompter {
+  return {
+    ask: async (q) => {
+      asked.push(q);
+      return answer;
+    },
+    askSecret: async () => "",
+    say: () => {},
+  };
+}
+
+function recorder(
+  over: Partial<ClaudeDeps> = {},
+  run?: (argv: string[]) => Promise<RunResult>,
+  which?: (name: string) => string | null,
+): Recorder {
   const out: string[] = [];
   const err: string[] = [];
   const execed: string[][] = [];
   const ran: string[][] = [];
   const deps: ClaudeDeps = {
     tmux: fakeTmux({
+      which: which ?? (() => "/usr/bin/tmux"),
       run: async (argv) => {
         ran.push(argv);
         return run !== undefined ? run(argv) : { exitCode: 0, stdout: "", stderr: "" };
       },
     }),
+    platform: "darwin",
+    prompter: fakePrompter("n"),
     env: {},
     cwd: "/projects/ledger",
     store: createStore(),
@@ -396,6 +421,152 @@ describe("runClaude", () => {
     );
     expect(plan.enter?.kind).toBe("switch");
     expect(NESTED_REFUSAL_EXIT).not.toBe(0);
+  });
+
+  /* --------------------------------------------------------------------- */
+  /* Installing Claude Code on demand                                        */
+  /* --------------------------------------------------------------------- */
+
+  const INSTALL_ARGV = ["sh", "-c", "curl -fsSL https://claude.ai/install.sh | bash"];
+
+  /** `which` where claude is absent until `installed` flips, everything else present. */
+  function whichWithout(state: { installed: boolean }) {
+    return (name: string) => (name === AGENT && !state.installed ? null : `/usr/bin/${name}`);
+  }
+
+  test("(i) claude ABSENT + accept: it installs, then execs the UNCHANGED agent argv", async () => {
+    const state = { installed: false };
+    const r = recorder(
+      { prompter: fakePrompter("y") },
+      async (argv) => {
+        // The install is the thing that makes claude appear.
+        if (argv[0] === "sh") state.installed = true;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      whichWithout(state),
+    );
+
+    const code = await runClaude(r.deps, { userArgs: ["--resume"], force: false });
+
+    expect(r.ran[0]).toEqual(INSTALL_ARGV);
+    // Passthrough and the injected flag are byte-identical to the no-install run.
+    const created = r.ran.find((a) => a[1] === "new-session") ?? [];
+    expect(created.slice(-3)).toEqual([...DEV_CHANNEL_ARGS, "--resume"]);
+    expect(r.execed[0]?.slice(0, 2)).toEqual(["tmux", "attach-session"]);
+    expect(code).toBe(0);
+  });
+
+  test("(ii) claude ABSENT + decline: non-zero, nothing run, nothing exec'd, and it says so", async () => {
+    const asked: string[] = [];
+    const state = { installed: false };
+    const r = recorder({ prompter: fakePrompter("n", asked) }, undefined, whichWithout(state));
+
+    const code = await runClaude(r.deps, { userArgs: ["--resume"], force: false });
+
+    expect(code).toBe(MISSING_AGENT_EXIT);
+    expect(code).not.toBe(0);
+    expect(r.ran).toEqual([]);
+    expect(r.execed).toEqual([]);
+    expect(asked.length).toBe(1);
+    const said = [...r.out, ...r.err].join("\n");
+    expect(said).toContain(AGENT);
+    expect(said).toContain(CLAUDE_CODE_URL);
+    // The user is told the login is still theirs — before and after declining.
+    expect(said).toContain("log in");
+  });
+
+  test("(iii) claude PRESENT: no offer, no install, byte-identical to today", async () => {
+    const asked: string[] = [];
+    const present = recorder({ prompter: fakePrompter("y", asked) });
+    const code = await runClaude(present.deps, { userArgs: ["--resume"], force: false });
+
+    expect(code).toBe(0);
+    expect(asked).toEqual([]);
+    expect(present.ran.some((a) => a[0] === "sh")).toBe(false);
+    // Not merely "no install": no offer TEXT at all. An unconditional guard
+    // that printed the offer and then found claude anyway would fail here.
+    const said = [...present.out, ...present.err].join("\n");
+    expect(said).not.toContain(CLAUDE_CODE_URL);
+    expect(said).not.toContain("is not on PATH");
+    expect(present.execed[0]?.slice(0, 2)).toEqual(["tmux", "attach-session"]);
+  });
+
+  test("(iv) claude absent + -p one-shot: the same gate applies on the direct path", async () => {
+    const state = { installed: false };
+    const r = recorder({ prompter: fakePrompter("n") }, undefined, whichWithout(state));
+
+    const code = await runClaude(r.deps, { userArgs: ["-p", "hello world"], force: false });
+    expect(code).toBe(MISSING_AGENT_EXIT);
+    expect(r.execed).toEqual([]);
+    expect(r.ran).toEqual([]);
+
+    // …and accepting on the -p path execs the direct argv, unchanged.
+    const yes = { installed: false };
+    const ok = recorder(
+      { prompter: fakePrompter("y") },
+      async (argv) => {
+        if (argv[0] === "sh") yes.installed = true;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+      whichWithout(yes),
+    );
+    expect(await runClaude(ok.deps, { userArgs: ["-p", "hello world"], force: false })).toBe(0);
+    expect(ok.ran).toEqual([INSTALL_ARGV]);
+    expect(ok.execed).toEqual([[...HEAD, "-p", "hello world"]]);
+  });
+
+  test("(v) a failed install and an unusable platform both stop, non-zero", async () => {
+    const state = { installed: false };
+    const failed = recorder(
+      { prompter: fakePrompter("y") },
+      async () => ({ exitCode: 1, stdout: "", stderr: "network unreachable" }),
+      whichWithout(state),
+    );
+    expect(await runClaude(failed.deps, { userArgs: [], force: false })).toBe(MISSING_AGENT_EXIT);
+    expect(failed.execed).toEqual([]);
+    expect(failed.err.join("\n")).toContain("network unreachable");
+
+    // win32 has no plan we trust: refuse, never prompt.
+    const asked: string[] = [];
+    const win = recorder(
+      { platform: "win32", prompter: fakePrompter("y", asked) },
+      undefined,
+      whichWithout({ installed: false }),
+    );
+    expect(await runClaude(win.deps, { userArgs: [], force: false })).toBe(MISSING_AGENT_EXIT);
+    expect(asked).toEqual([]);
+    expect(claudeInstallPlan({ platform: "win32" })).toBeNull();
+  });
+
+  test("(vi) the installer's own preconditions are named rather than left to curl", async () => {
+    const noCurl = recorder({ prompter: fakePrompter("y") }, undefined, (name) =>
+      name === AGENT || name === "curl" ? null : `/usr/bin/${name}`,
+    );
+    expect(await runClaude(noCurl.deps, { userArgs: [], force: false })).toBe(MISSING_AGENT_EXIT);
+    expect(noCurl.ran).toEqual([]);
+    expect(noCurl.err.join("\n")).toContain("curl");
+
+    expect(missingClaudeInstallTools({ tmux: fakeTmux() })).toEqual([]);
+    expect(missingClaudeInstallTools({ tmux: fakeTmux({ which: () => null }) })).toEqual(["curl", "bash"]);
+  });
+
+  test("(vii) an installer that exits 0 but leaves no claude on PATH still stops", async () => {
+    // The RE-DETECT is the point: a green exit code is the installer's opinion,
+    // `which` is the fact. Without the re-detect this run would exec a binary
+    // that is not there. (Added after a mutation probe removing the re-detect
+    // survived every other assertion in this file.)
+    const r = recorder({ prompter: fakePrompter("y") }, undefined, (name) =>
+      name === AGENT ? null : `/usr/bin/${name}`,
+    );
+    expect(await runClaude(r.deps, { userArgs: [], force: false })).toBe(MISSING_AGENT_EXIT);
+    expect(r.ran).toEqual([INSTALL_ARGV]);
+    expect(r.execed).toEqual([]);
+    expect(r.err.join("\n")).toContain("still not on PATH");
+  });
+
+  test("ensureAgent returns null — carry on — when the agent is already there", async () => {
+    const r = recorder();
+    expect(await ensureAgent(r.deps)).toBeNull();
   });
 
   test("listSessionNames is empty when tmux is absent", async () => {

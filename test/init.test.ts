@@ -235,6 +235,78 @@ describe("init on a machine where nothing is installed", () => {
     expect(invocation(fx, ["brew", "install", "bun"])).toBeNull();
   });
 
+  /**
+   * THE bun.sh FALLBACK NEEDS unzip.
+   *
+   * `bunInstallPlan` prefers the distro package and only falls back to
+   * `curl -fsSL https://bun.sh/install | bash`, which unpacks a ZIP. The
+   * launcher already refuses without unzip; these three pin the same
+   * precondition on the TypeScript entrypoint, and — critically — pin that it
+   * does NOT fire on the package-manager route, which needs no unzip.
+   *
+   * PATH here is CONSTRUCTED, never inherited: the fixture's PATH holds only
+   * the stubs each test names, so "unzip is absent" is a property of the test,
+   * not of the box it runs on. `run` is a recorder rather than the real
+   * spawner so that a green test never downloads anything.
+   */
+  function runRecorder(): { calls: string[][]; run: InitDeps["run"] } {
+    const calls: string[][] = [];
+    return {
+      calls,
+      run: async (argv) => {
+        calls.push(argv);
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    };
+  }
+
+  /** No bun, no package manager, and on linux — so the plan is the fallback. */
+  function fallbackDeps(tools: string[], recorder: { run: InitDeps["run"] }) {
+    const fx = makeFixture({ tools });
+    expect(bunInstallPlan({ platform: "linux", env: fx.env })?.manager).toBe("bun.sh");
+    return makeDeps(fx, scriptedPrompter(["y", ...credentialAnswers()]), {
+      platform: "linux",
+      run: recorder.run,
+    });
+  }
+
+  const BUN_SH_ARGV = ["sh", "-c", "curl -fsSL https://bun.sh/install | bash"];
+
+  test("refuses the bun.sh install when unzip is absent, without running it", async () => {
+    const recorder = runRecorder();
+    const deps = fallbackDeps(["git", "claude", "tmux", "curl", "bash"], recorder);
+
+    await expect(runInit(deps)).rejects.toThrow(/unzip/);
+    // Nothing half-installed: the installer was never started at all.
+    expect(recorder.calls.some((argv) => argv.join(" ") === BUN_SH_ARGV.join(" "))).toBe(false);
+  });
+
+  test("runs the bun.sh install when unzip is present", async () => {
+    const recorder = runRecorder();
+    const deps = fallbackDeps(["git", "claude", "tmux", "curl", "bash", "unzip"], recorder);
+
+    // bun never appears on PATH, so the re-check after the install still fails
+    // — which proves the installer was reached rather than refused.
+    await expect(runInit(deps)).rejects.toThrow(/still not on PATH/);
+    expect(recorder.calls.some((argv) => argv.join(" ") === BUN_SH_ARGV.join(" "))).toBe(true);
+  });
+
+  test("does not fire on the package-manager route, which needs no unzip", async () => {
+    const recorder = runRecorder();
+    const fx = makeFixture({ tools: ["git", "claude", "tmux", "apt-get"] });
+    expect(whichBin("unzip", fx.env)).toBeNull();
+    const deps = makeDeps(fx, scriptedPrompter(["y", ...credentialAnswers()]), {
+      platform: "linux",
+      run: recorder.run,
+    });
+
+    // `apt-get install -y bun` unpacks a distro package; a guard that fired
+    // here would refuse an install that works. This is the assertion that an
+    // unconditional guard fails.
+    await expect(runInit(deps)).rejects.toThrow(/still not on PATH/);
+    expect(recorder.calls.some((argv) => argv.join(" ") === "apt-get install -y bun")).toBe(true);
+  });
+
   test("prompts for tmux, and a declined tmux warns loudly without failing init", async () => {
     const fx = makeFixture({ tools: ["git", "bun", "claude", "brew"] });
     const prompter = scriptedPrompter(["n", ...credentialAnswers()]);

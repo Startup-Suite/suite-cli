@@ -27,7 +27,9 @@ import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { readConfig, emptyConfig, type SuiteConfig } from "../config.ts";
 import { statePath } from "../paths.ts";
-import { createStore, type CredentialStore } from "../secrets.ts";
+import { createStore, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
+import { confirm, type InstallPlan } from "./init.ts";
+import { CLAUDE_CODE_URL } from "./doctor.ts";
 import { colorEnabled } from "../ui.ts";
 import {
   attachArgv,
@@ -49,6 +51,116 @@ import {
 /* ------------------------------------------------------------------------- */
 
 export const AGENT = "claude";
+
+/**
+ * How this machine installs Claude Code, or null when we have no path we trust.
+ *
+ * MECHANISM, verified against https://code.claude.com/docs/en/setup on
+ * 2026-08-14 (docs.claude.com redirects there): the recommended install for
+ * macOS, Linux and WSL is `curl -fsSL https://claude.ai/install.sh | bash`,
+ * which puts a launcher at `~/.local/bin/claude` with versions under
+ * `~/.local/share/claude/versions/`. It is USER-OWNED and needs no sudo.
+ *
+ * DECISION — the native installer, not brew and not npm. Homebrew
+ * (`brew install --cask claude-code`) and npm
+ * (`npm install -g @anthropic-ai/claude-code`) both exist and both work, but
+ * each covers only part of our audience and each adds a second thing that can
+ * be missing. One mechanism spans macOS and Linux, so one is what we offer.
+ * `sudo npm install -g` is not offered at all: the docs warn against it.
+ *
+ * Windows returns null — the Windows install is a different script
+ * (`install.ps1` / `install.cmd`) run from a different shell, and guessing
+ * which one the user is sitting in is how you print a command that cannot run.
+ */
+export function claudeInstallPlan(deps: Pick<ClaudeDeps, "platform">): InstallPlan | null {
+  if (deps.platform !== "darwin" && deps.platform !== "linux") return null;
+  return { manager: "claude.ai", argv: ["sh", "-c", "curl -fsSL https://claude.ai/install.sh | bash"] };
+}
+
+/**
+ * What the installer itself needs. It fetches with curl and runs under bash;
+ * on a box missing either, curl's own error is not the whole story, so we name
+ * the missing tool and refuse rather than letting a pipe fail obscurely. Same
+ * posture as the bun offer's precondition check in `init.ts`.
+ */
+export const CLAUDE_INSTALL_REQUIRED_TOOLS = ["curl", "bash"] as const;
+
+export function missingClaudeInstallTools(deps: Pick<ClaudeDeps, "tmux">): string[] {
+  return CLAUDE_INSTALL_REQUIRED_TOOLS.filter((tool) => deps.tmux.which(tool) === null);
+}
+
+/** Exit code when the agent is missing and was not installed. Non-zero, always. */
+export const MISSING_AGENT_EXIT = 4;
+
+/**
+ * The offer, printed BEFORE the question — so a user who declines has already
+ * read it.
+ *
+ * LOGIN IS NOT OURS. We install a binary; we never touch anybody's
+ * authentication. Saying so at the moment of the offer is the difference
+ * between a tool that set you up and a tool that left you at a login screen
+ * you did not expect.
+ */
+export function installOfferLines(plan: InstallPlan): string[] {
+  return [
+    `${AGENT} is not on PATH. ${CLAUDE_CODE_URL}`,
+    `  suite can install it with the ${plan.manager} installer (no sudo; it lands in ~/.local/bin).`,
+    `  you will still have to log in yourself: running ${AGENT} opens the browser login.`,
+  ];
+}
+
+/** Said when the agent is still missing — refused, unavailable, or failed. */
+export function missingAgentMessage(detail: string): string {
+  return `${AGENT} is not installed: ${detail}. see ${CLAUDE_CODE_URL} — and note that logging in stays your step.`;
+}
+
+/**
+ * Detect the agent; when it is absent, offer, install, and RE-DETECT.
+ *
+ * Returns null to mean "carry on" and an exit code to mean "stop". Nothing is
+ * half-done: either `claude` answers `which` at the end of this function, or
+ * the caller returns non-zero having said which thing is missing. This mirrors
+ * the bun offer in `runInit` deliberately — a second style of asking would be a
+ * second style to get wrong.
+ *
+ * NOTE it is called once, before EITHER exec path. The `-p` caller is a script
+ * and reaches the direct exec without touching tmux; it must hit the same gate.
+ */
+export async function ensureAgent(deps: ClaudeDeps): Promise<number | null> {
+  if (deps.tmux.which(AGENT) !== null) return null;
+
+  const plan = claudeInstallPlan(deps);
+  if (plan === null) {
+    deps.err(missingAgentMessage(`no install path I know of for ${deps.platform}`));
+    return MISSING_AGENT_EXIT;
+  }
+
+  const missing = missingClaudeInstallTools(deps);
+  if (missing.length > 0) {
+    // Refuse BEFORE the prompt: offering an install we already know cannot run
+    // buys the user a download failure instead of an answer.
+    deps.err(missingAgentMessage(`the ${plan.manager} installer needs ${missing.join(" and ")}, not on PATH`));
+    return MISSING_AGENT_EXIT;
+  }
+
+  for (const line of installOfferLines(plan)) deps.out(line);
+  if (!(await confirm(deps.prompter, `install ${AGENT} with the ${plan.manager} installer?`))) {
+    deps.err(missingAgentMessage("declined"));
+    return MISSING_AGENT_EXIT;
+  }
+
+  const r = await deps.tmux.run(plan.argv);
+  if (r.exitCode !== 0) {
+    deps.err(missingAgentMessage(`the ${plan.manager} installer failed: ${(r.stderr || r.stdout).trim()}`));
+    return MISSING_AGENT_EXIT;
+  }
+
+  if (deps.tmux.which(AGENT) === null) {
+    deps.err(missingAgentMessage("the installer reported success but it is still not on PATH"));
+    return MISSING_AGENT_EXIT;
+  }
+  return null;
+}
 
 /** The injected flag, as separate argv elements. Removed once allowlisted. */
 export const DEV_CHANNEL_ARGS = ["--dangerously-load-development-channels", "server:suite-channel"] as const;
@@ -290,6 +402,10 @@ export interface ClaudeDeps {
   config: SuiteConfig;
   statePath: string;
   color: boolean;
+  /** `process.platform`, so {@link claudeInstallPlan} is decided not sniffed. */
+  platform: string;
+  /** Used ONLY by the install offer. Claude Code's own login is never prompted here. */
+  prompter: Prompter;
   out(line: string): void;
   err(line: string): void;
   /**
@@ -324,6 +440,11 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     for (const line of noticeLines(deps.color)) deps.out(line);
     await writeState(deps.statePath, { noticeSeen: true });
   }
+
+  // The agent must exist before EITHER path execs it. Placed here, above the
+  // -p branch, so the scripted caller and the tmux caller get one gate.
+  const missing = await ensureAgent(deps);
+  if (missing !== null) return missing;
 
   // A non-interactive call touches tmux NOT AT ALL — not even to detect state.
   // Probing a server it will never use is latency a scripted caller pays for
@@ -377,10 +498,15 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
 /* Live dependencies                                                          */
 /* ------------------------------------------------------------------------- */
 
-export async function liveClaudeDeps(env: Record<string, string | undefined> = process.env): Promise<ClaudeDeps> {
+export async function liveClaudeDeps(
+  env: Record<string, string | undefined> = process.env,
+  prompter: Prompter = ttyPrompter(),
+): Promise<ClaudeDeps> {
   const config = (await readConfig({ env })) ?? emptyConfig();
   return {
     tmux: liveTmuxDeps(env),
+    platform: process.platform,
+    prompter,
     env,
     cwd: process.cwd(),
     store: createStore(),

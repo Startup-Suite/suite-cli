@@ -15,6 +15,48 @@ terminal that started them goes away.
 macOS and Linux. **Windows is not supported** — the installer refuses it by
 name rather than failing obscurely.
 
+## Before you start
+
+<a id="before-you-start"></a>
+
+`suite` never runs a package manager and never uses `sudo`, so these are
+**checked and named**, never installed for you. Install any that are missing
+with your own package manager first:
+
+* `git` — clones the Suite channel plugin during `suite init`.
+* `curl` — fetches this installer, and the bun installer if you take that route.
+* `ca-certificates` — without trusted roots every one of those fetches fails at
+  TLS rather than at a prompt.
+* `tar` — unpacks what the installer downloads.
+* `unzip` — what **bun's official installer**
+  (`curl -fsSL https://bun.sh/install | bash`) needs: it downloads a zip release
+  and unpacks it. `suite` **checks for `unzip` and will not install it** — that
+  would mean a package manager, which means root, and this tool has no `sudo`
+  path at all. Without it you get a named refusal (`unzip is needed to install
+  bun, and is not on PATH`) before anything is downloaded, not a half-written
+  bun. If your distro packages `bun` directly, `suite init` takes that route
+  instead and needs no `unzip`.
+
+### Claude Code is installed on demand, not up front
+
+<a id="claude-on-demand"></a>
+
+**Claude Code is not a prerequisite.** Nothing above installs it and `suite
+init` does not ask about it. The first time you launch an agent with `suite
+claude`, if `claude` is not on `PATH`, `suite` says so, **offers to install it**
+with the official installer (`curl -fsSL https://claude.ai/install.sh | bash`,
+which lands a launcher in `~/.local/bin` and needs no `sudo`), and — once it is
+in place — carries straight on into the run you asked for.
+
+**Declining installs nothing and exits non-zero.** So do an unknown platform, a
+missing `curl` or `bash`, a failing installer, and an installer that claims
+success without leaving a binary: each prints what is missing and stops. There
+is no half-installed state to clean up.
+
+**Logging in is still your step.** `suite` installs a binary and never touches
+your Anthropic credentials — running `claude` opens the browser login, and the
+offer says so before you answer it.
+
 ## Install
 
 ```sh
@@ -419,6 +461,11 @@ Read this before citing a green suite as evidence of a cold start:
 * A scratch `HOME` **cannot prove a real network clone** of the channel plugin,
   or a real dependency resolution. The `git` stub creates the directory a clone
   would have left behind.
+* A scratch `HOME` **cannot prove `unzip`- or `claude`-absence** either. Both
+  are decided by a `PATH` lookup, and the fixture's `PATH` is curated: it proves
+  the guard fires for a tool the fixture withheld, not that the tool is absent
+  from the machine. **Only a container (or a genuinely fresh box) can prove
+  that** — which is how the missing-`unzip` bug was found in the first place.
 
 What those tests do prove is that the code **takes** the clone and install
 paths, in order, with the right arguments, cwd and scope, on a machine where
