@@ -285,9 +285,13 @@ describe("the lean PATH fixture", () => {
     const sandbox = makeSandbox();
     for (const tool of EXCLUDED_TOOLS) {
       const probe = underLeanPath(`command -v ${tool}`, sandbox);
-      expect({ tool, status: probe.status, stdout: (probe.stdout ?? "").trim() }).toEqual({
+      // `command -v` on a missing tool exits 1 under bash and 127 under dash
+      // (/bin/sh on Debian/Ubuntu, which is what CI runs). Pin "not found",
+      // not a specific code — the positive control below is what keeps this
+      // from being vacuous: LEAN_TOOLS must still exit 0.
+      expect({ tool, found: probe.status === 0, stdout: (probe.stdout ?? "").trim() }).toEqual({
         tool,
-        status: 1,
+        found: false,
         stdout: "",
       });
     }
