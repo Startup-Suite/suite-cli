@@ -61,6 +61,38 @@ again from the same place and you are back in the same session.
 | `suite status` | Shows which runtime this box is federated as, and the state and age of each session |
 | `suite --version`, `suite --help` | Version, and the verb list |
 
+### What `suite doctor` checks that nothing else does
+
+Most of a broken setup announces itself. Two states do not, and both are why
+this command exists.
+
+**Registered, reachable and authenticated are three different claims.** An MCP
+entry can be registered, its endpoint can answer, and its credential can still
+be refused — and from the Claude side that last one is *invisible*: the server
+loads, `claude mcp list` shows it, and it simply exposes no tools. It presents
+as silence, not as an error. So `tools api` makes a real authenticated
+`tools/list` call and asserts a non-empty tool list. It also keeps apart the two
+ways that call can fail, because they need opposite fixes: a JSON-RPC refusal
+from Suite itself is the *credential*, while an HTML login page from something
+in front of Suite means the request never reached the application at all and the
+credential was never evaluated.
+
+**Both entries should carry one credential.** `suite-channel` keeps it in
+`SUITE_TOKEN`, `startup-suite` in an `Authorization: Bearer` header. When both
+point at the same Suite host and the two values differ, at least one is wrong —
+and the wrong one produces a server that registers and exposes nothing. The
+`token match` check compares them by non-reversible fingerprint, so neither
+value is ever read out, and it names only the two entries. When the entries
+point at *different* hosts — say `suite.example.invalid` and
+`suite.localhost.invalid`, two deployments on one box — two credentials is the
+correct configuration, so the check reports `⋯ skipped` rather than inventing a
+verdict.
+
+One state is deliberately neither: `⏸ Pending approval` in `claude mcp list` is
+a *project-approval* state, not a connectivity verdict. A pending server is
+routinely delivering messages, so doctor reports it as `⋯ skipped — awaiting
+project approval` and does not fail the run on that account.
+
 ## Five decisions, stated rather than guessed
 
 These are the questions the design had to answer, each answered here rather

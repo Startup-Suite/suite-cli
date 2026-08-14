@@ -369,7 +369,24 @@ export function toolsAddArgs(
 /* Connection verification                                                    */
 /* ------------------------------------------------------------------------- */
 
-export type ServerState = "connected" | "not-connected" | "unparseable" | "missing";
+/**
+ * `pending` IS ITS OWN TIER, deliberately, and is NEITHER green nor red.
+ *
+ * `⏸ Pending approval` in `claude mcp list` is a PROJECT-APPROVAL state, not a
+ * connectivity verdict: it says this project has not yet approved a user-scope
+ * server, and says NOTHING about whether that server works. Measured on a real
+ * box, BOTH Suite servers reported pending while the channel was demonstrably
+ * delivering messages.
+ *
+ * It used to fall into the `not-connected` alternation below, which made
+ * `suite doctor` print a failure for a channel that was working. Calling it
+ * connected would be the opposite lie. So it is neither: a third state, which
+ * the callers render as `⋯ skipped` and which does not set an exit code.
+ */
+export type ServerState = "connected" | "pending" | "not-connected" | "unparseable" | "missing";
+
+/** What clears a `pending` server. Shared so init and doctor say one thing. */
+export const PENDING_APPROVAL_REMEDY = "run claude once in this project to approve";
 
 export interface ServerStatus {
   name: string;
@@ -396,7 +413,12 @@ export function parseServerStatus(listOutput: string, name: string): ServerStatu
     if (/[✔✓]/.test(status) && /connected/i.test(status)) {
       return { name, state: "connected", raw: trimmed };
     }
-    if (/[✘✗x×]/i.test(status) || /fail|refus|error|timeout|pending|disconnect/i.test(status)) {
+    // Matched BEFORE the not-connected alternation, and removed from it: a
+    // pending server is an unapproved one, not a broken one. See ServerState.
+    if (/⏸/.test(status) || /pending/i.test(status)) {
+      return { name, state: "pending", raw: trimmed };
+    }
+    if (/[✘✗x×]/i.test(status) || /fail|refus|error|timeout|disconnect/i.test(status)) {
       return { name, state: "not-connected", raw: trimmed };
     }
     return { name, state: "unparseable", raw: trimmed };
@@ -416,6 +438,12 @@ export function connectionReport(statuses: ServerStatus[]): { ok: boolean; lines
   for (const s of statuses) {
     if (s.state === "connected") {
       lines.push(row(s.name, "connected"));
+      continue;
+    }
+    if (s.state === "pending") {
+      // NOT a hard failure: the entry is written and may already be working.
+      // `suite init` did its job; what is outstanding is a project approval.
+      lines.push(row(s.name, "pending approval", PENDING_APPROVAL_REMEDY));
       continue;
     }
     ok = false;

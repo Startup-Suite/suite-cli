@@ -44,6 +44,7 @@ import { emptyConfig, readConfig, type SuiteConfig } from "../config.ts";
 import { configPath } from "../paths.ts";
 import {
   CHANNEL_SERVER,
+  PENDING_APPROVAL_REMEDY,
   TOOLS_SERVER,
   parseServerStatus,
   whichBin,
@@ -115,7 +116,9 @@ export const CHECK_IDS = [
   "tmux",
   "plugin",
   "credentials",
+  "tokens",
   "channel",
+  "tools",
   "session",
 ] as const;
 
@@ -248,6 +251,283 @@ export function mcpEntryHasToken(output: string): boolean {
   return false;
 }
 
+/**
+ * One `Environment:` value off a stdio MCP entry, by variable name.
+ *
+ * THIS RETURNS RAW VALUES, AND ONE OF THEM IS A SECRET (`SUITE_TOKEN`). It sits
+ * under the same restriction {@link parseMcpHeaderValue} states: its return
+ * value MUST NEVER reach a `value`, `detail`, `consequence` or `remedy` field of
+ * a {@link CheckResult}, and must never be logged. Its permitted callers are
+ * {@link tokenFingerprint} and {@link suiteHostOf} — both of which answer a
+ * question about the value without carrying any of it.
+ *
+ * {@link mcpEntryHasToken} stays the reader for the PRESENCE question, because a
+ * function that cannot return the secret cannot leak it; this one exists only
+ * because comparing two credentials requires reading both.
+ *
+ * Null when the variable is absent or its value is empty.
+ */
+export function mcpEntryEnvValue(output: string, name: string): string | null {
+  const wanted = name.trim();
+  for (const raw of output.split("\n")) {
+    const line = raw.trim();
+    const m = /^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/.exec(line);
+    if (m === null) continue;
+    if (m[1] !== wanted) continue;
+    const value = (m[2] ?? "").trim().replace(/^["']|["']$/g, "").trim();
+    if (value !== "" && value !== "${}") return value;
+  }
+  return null;
+}
+
+/**
+ * The HTTP endpoint recorded in the tools MCP entry, out of
+ * `claude mcp get <name>`.
+ *
+ * That entry is registered by `toolsAddArgs` as `-t http <url> -H '…'`, so the
+ * URL is printed on a `URL:`/`Type:` style line and NEVER on a `Command:` line
+ * — a stdio entry has a command, an http entry has a URL, and reading one for
+ * the other is how a check reports on an endpoint nobody talks to.
+ *
+ * Read tolerantly, because the exact label wording is Claude Code's to change,
+ * but never guessed: null when the output carries no absolute `http(s)://`
+ * URL. Null is rendered by the caller as a FAILURE, never as a pass — the same
+ * rule {@link parseMcpEntryPath} states, for the same reason.
+ */
+export function parseMcpHttpUrl(output: string): string | null {
+  for (const line of output.split("\n")) {
+    const trimmed = line.trim();
+    if (/^(command|args?)\s*:/i.test(trimmed)) continue;
+    const m = /(https?:\/\/[^\s"'<>]+)/i.exec(trimmed);
+    if (m?.[1] !== undefined) return m[1].replace(/[),.;]+$/, "");
+  }
+  return null;
+}
+
+/**
+ * One `-H` header's value out of `claude mcp get <name>` — used for
+ * `Authorization`.
+ *
+ * THIS IS THE ONE FUNCTION IN THIS FILE THAT RETURNS A SECRET. Every other
+ * reader here returns a verdict (a boolean, an enum, a fingerprint) precisely
+ * so that it cannot leak; this one cannot do its job that way, so the
+ * restriction lives in the callers instead and is written down here:
+ *
+ *   Its ONLY permitted callers are (a) the probe request builder, which puts
+ *   the value straight into an outbound header, and (b) {@link tokenFingerprint}.
+ *   Its return value MUST NEVER reach a `value`, `detail`, `consequence` or
+ *   `remedy` field of a {@link CheckResult}, and must never be logged.
+ *
+ * Null when the header is absent or its value is empty.
+ */
+export function parseMcpHeaderValue(output: string, headerName: string): string | null {
+  const wanted = headerName.trim().toLowerCase();
+  for (const raw of output.split("\n")) {
+    // Tolerate the surrounding shapes: a bare `Name: value` line, a
+    // `Headers:` block entry, and a quoted `-H 'Name: value'` argv echo.
+    const line = raw.trim().replace(/^-H\s+/, "").replace(/^["']|["']$/g, "").trim();
+    const m = /^([A-Za-z0-9-]+)\s*:\s*(.*)$/.exec(line);
+    if (m === null) continue;
+    if ((m[1] ?? "").toLowerCase() !== wanted) continue;
+    const value = (m[2] ?? "").trim().replace(/^["']|["']$/g, "").trim();
+    if (value !== "") return value;
+  }
+  return null;
+}
+
+/**
+ * EVERY header recorded on an MCP entry, by name.
+ *
+ * Lifted GENERICALLY — whatever the operator registered — and never against a
+ * hardcoded list. The `Authorization` header is ours, but a Suite behind an
+ * identity-aware access proxy carries additional operator-specific headers whose
+ * names are that operator's business; a probe that replayed only the ones we
+ * happened to think of would be answered by the gateway instead of by Suite and
+ * would then blame the wrong thing.
+ *
+ * Only lines inside a `Headers:` block and `-H '…'` argv echoes are read, so a
+ * `Type: http` or `URL: …` line can never be mistaken for a header. This
+ * RETURNS SECRETS (see {@link parseMcpHeaderValue}): its only permitted caller
+ * is the probe request builder, which puts the values straight into an outbound
+ * request.
+ */
+export function parseMcpHeaders(output: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  let inBlock = false;
+  for (const raw of output.split("\n")) {
+    const trimmed = raw.trim();
+    if (trimmed === "") {
+      inBlock = false;
+      continue;
+    }
+    // A bare `Name:` line opens a section; only the headers section counts, and
+    // any other section (`Environment:`) closes it.
+    if (/^[A-Za-z][A-Za-z0-9 _-]*:\s*$/.test(trimmed)) {
+      inBlock = /^headers?\s*:\s*$/i.test(trimmed);
+      continue;
+    }
+    const isFlag = /^-H\s+/.test(trimmed);
+    if (!isFlag && !inBlock) continue;
+    const line = trimmed.replace(/^-H\s+/, "").replace(/^["']|["']$/g, "").trim();
+    const m = /^([A-Za-z0-9-]+)\s*:\s*(.*)$/.exec(line);
+    if (m === null) continue;
+    const name = m[1] ?? "";
+    const value = (m[2] ?? "").trim().replace(/^["']|["']$/g, "").trim();
+    if (value !== "") headers[name] = value;
+  }
+  return headers;
+}
+
+/** The credential out of an `Authorization` header value, or null. */
+export function bearerOf(header: string): string | null {
+  const m = /^bearer\s+(.+)$/i.exec(header.trim());
+  const token = m?.[1]?.trim();
+  return token === undefined || token === "" ? null : token;
+}
+
+/**
+ * A stable, NON-REVERSIBLE fingerprint of a secret, for equality comparison
+ * only.
+ *
+ * The channel entry and the tools entry are supposed to carry the same token;
+ * saying "they differ" requires comparing them, and comparing them must not
+ * require either one to exist anywhere a human or a log can see it. sha256,
+ * hex, first 8 characters — enough to distinguish two tokens, not enough to
+ * be anything else.
+ *
+ * NEVER RENDERED. It is not a "safe prefix of the token" and must never become
+ * one: a truncation of the input would leak the input's first characters, which
+ * is why the tests assert the output shares no 4-character run with the input.
+ */
+export function tokenFingerprint(secret: string): string {
+  return new Bun.CryptoHasher("sha256").update(secret).digest("hex").slice(0, 8);
+}
+
+/**
+ * The lowercased host of a URL — no scheme, no path, no port cleverness beyond
+ * what `URL` itself does.
+ *
+ * The channel entry records a WEBSOCKET url (`SUITE_URL=wss://…/socket`) and
+ * the tools entry an HTTPS one (`https://…/mcp`). They point at the same Suite
+ * or the setup is split-brained, and only the host can say so, so this must
+ * return the same answer for both schemes. Null on unparseable input.
+ */
+export function suiteHostOf(url: string): string | null {
+  try {
+    return new URL(url.trim()).host.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * What a probe of the tools endpoint actually established.
+ *
+ * `ok` — the bearer authenticates AND the server listed tools.
+ * `rejected` — the APPLICATION rejected the credential.
+ * `gateway-challenge` — a fronting access proxy answered instead; the
+ *   application never saw the request.
+ * `unreachable` — no response at all (thrown fetch/DNS/TLS/timeout error);
+ *   produced by the caller, not by {@link classifyProbe}.
+ * `unreadable` — a response we cannot turn into either verdict.
+ */
+export type ProbeVerdict = "ok" | "rejected" | "gateway-challenge" | "unreachable" | "unreadable";
+
+export interface ProbeResult {
+  status: number;
+  body: string;
+  contentType: string;
+}
+
+/** One outbound probe request: a URL and the headers lifted off the entry. */
+export interface ProbeRequest {
+  url: string;
+  headers: Record<string, string>;
+}
+
+/** The JSON-RPC call the probe makes. `tools/list` — the thing that was empty. */
+export const TOOLS_LIST_BODY = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  method: "tools/list",
+  params: {},
+});
+
+/** How many tools a successful `tools/list` returned, or null. */
+export function toolCount(body: string): number | null {
+  try {
+    const tools = (JSON.parse(body) as { result?: { tools?: unknown } } | null)?.result?.tools;
+    return Array.isArray(tools) ? tools.length : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Classify a probe response. THE LOAD-BEARING DISTINCTION OF THIS TOOL.
+ *
+ * "The endpoint is reachable" and "my bearer authenticates" are different
+ * claims and only the second one matters, so the two ways a request fails to
+ * be authorised are kept apart:
+ *
+ *  - A well-formed JSON-RPC error under a 401/403, JSON, no HTML, PROVES the
+ *    request reached the application: the application read the credential and
+ *    refused it. (Verified shape from the incident: `{"code":-32000,
+ *    "message":"unauthorized"}` under a 401.) That is `rejected`.
+ *  - An HTML body — at ANY status, 200 included — is an identity-aware access
+ *    proxy answering a credential-less request with a login page. JSON-RPC is
+ *    never HTML. That is `gateway-challenge`.
+ *
+ * WHY THE SPLIT EXISTS: a 401 that is really an application rejection must NOT
+ * be attributed to the fronting access proxy. That misattribution sends someone
+ * to rotate infrastructure credentials that were never involved, while the
+ * actual wrong bearer stays wrong and the symptom does not move. The two
+ * verdicts therefore get OPPOSITE remedy lines.
+ *
+ * `ok` requires a 2xx AND a non-empty `result.tools` array. A 200 carrying no
+ * tools is NOT ok — that is exactly the incident's invisible symptom, a
+ * connection that reports healthy and exposes nothing — so it is `unreadable`.
+ */
+export function classifyProbe(result: ProbeResult): ProbeVerdict {
+  const body = result.body ?? "";
+  const contentType = (result.contentType ?? "").toLowerCase();
+  const head = body.trimStart().slice(0, 64).toLowerCase();
+
+  if (contentType.includes("text/html") || head.startsWith("<!doctype") || head.startsWith("<html")) {
+    return "gateway-challenge";
+  }
+
+  let parsed: unknown = null;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    parsed = null;
+  }
+
+  if (result.status === 401 || result.status === 403) {
+    return isJsonRpcError(parsed) ? "rejected" : "unreadable";
+  }
+
+  if (result.status >= 200 && result.status < 300) {
+    const tools = (parsed as { result?: { tools?: unknown } } | null)?.result?.tools;
+    if (Array.isArray(tools) && tools.length > 0) return "ok";
+    return "unreadable";
+  }
+
+  return "unreadable";
+}
+
+/** JSON-RPC-shaped error: an error object, or a bare `{code, message}`. */
+function isJsonRpcError(parsed: unknown): boolean {
+  if (parsed === null || typeof parsed !== "object") return false;
+  const obj = parsed as Record<string, unknown>;
+  const err = (typeof obj.error === "object" && obj.error !== null ? obj.error : obj) as Record<
+    string,
+    unknown
+  >;
+  return typeof err.code === "number" || typeof err.message === "string";
+}
+
 export function pathResolves(path: string): boolean {
   try {
     statSync(path);
@@ -335,6 +615,15 @@ export interface DoctorDeps {
   cwd: string;
   /** Run a child process and collect its output. */
   run(argv: string[]): Promise<RunResult>;
+  /**
+   * Make ONE authenticated HTTP request and return what came back.
+   *
+   * IN-PROCESS `fetch`, NEVER A SPAWNED `curl`. {@link DoctorDeps.run} puts its
+   * argv on a command line, and a command line on this box is readable by every
+   * other process through `ps`; the bearer must therefore never appear in one.
+   * A test asserts that no argv `run` ever receives contains the token.
+   */
+  probe(request: ProbeRequest): Promise<ProbeResult>;
   which(name: string): string | null;
   /** Does this absolute path exist? Injected so a test needs no real checkout. */
   exists(path: string): boolean;
@@ -464,12 +753,22 @@ export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
   const entry = claudePath === null ? null : await deps.run([claudePath, "mcp", "get", CHANNEL_SERVER]);
   checks.push(pluginCheck(deps, claudePath, entry));
 
-  // 6-7. Credentials and the channel's health ----------------------------
+  // 6-8. Credentials, their AGREEMENT, and the channel's health -----------
   const pluginOk = checks[checks.length - 1]?.status === "pass";
   checks.push(credentialsCheck(deps, claudePath, entry, pluginOk));
+
+  // The tools entry is fetched ONCE, here, and shared with the tools check
+  // below: the token comparison and the probe read the same entry, so they can
+  // never disagree about what is registered.
+  const toolsEntry = claudePath === null ? null : await deps.run([claudePath, "mcp", "get", TOOLS_SERVER]);
+  checks.push(tokensCheck(claudePath, entry, toolsEntry));
+
   checks.push(await channelCheck(deps, claudePath, pluginOk));
 
-  // 8. Session health, via stage 4's three-way detection ------------------
+  // 9. The tools endpoint — an AUTHENTICATED call, not a reachability ping ---
+  checks.push(await toolsCheck(deps, claudePath, toolsEntry));
+
+  // 10. Session health, via stage 4's three-way detection -----------------
   checks.push(await sessionCheck(deps, tmuxPath));
 
   return checks;
@@ -647,6 +946,92 @@ function credentialsCheck(
   };
 }
 
+/**
+ * DO THE TWO ENTRIES CARRY THE SAME CREDENTIAL?
+ *
+ * ONE RUNTIME CREDENTIAL NORMALLY SERVES BOTH SERVERS. The channel entry keeps
+ * it in `SUITE_TOKEN`, the tools entry in an `Authorization: Bearer` header, and
+ * when the two disagree on one Suite host at least one of them is wrong — which
+ * produces a server that REGISTERS AND EXPOSES NOTHING.
+ *
+ * WHY SO CHEAP A CHECK EARNS ITS LINE: the broken configuration LOOKS PLAUSIBLE.
+ * Two servers, two credentials, both entries present, nothing visibly wrong on
+ * any surface a human can see. That is precisely why the real failure survived
+ * an evening. Failures that announce themselves do not need a doctor.
+ *
+ * COMPARED BY FINGERPRINT, never by value, and the verdict names only the two
+ * ENTRIES — never any part of either credential. The shipped convention for a
+ * credential is presence-only (see {@link credentialsCheck}, which renders
+ * `set`), and this check does not weaken it.
+ *
+ * DIFFERENT HOSTS IS A SKIP, NOT A FAILURE. Two Suite deployments on one box —
+ * a production federation and a local one — is a legitimate configuration, and
+ * two credentials for two hosts is then exactly right. This check has nothing to
+ * say about it, so it says nothing rather than inventing a verdict. Same for an
+ * entry or a token we could not read: `⋯` with the reason named.
+ */
+function tokensCheck(
+  claudePath: string | null,
+  channelEntry: RunResult | null,
+  toolsEntry: RunResult | null,
+): CheckResult {
+  const id = "tokens";
+  const label = "token match";
+  if (claudePath === null || channelEntry === null || toolsEntry === null) {
+    return { id, label, status: "skip", reason: "needs the claude cli" };
+  }
+  if (channelEntry.exitCode !== 0) {
+    return { id, label, status: "skip", reason: `${CHANNEL_SERVER} is not registered` };
+  }
+  if (toolsEntry.exitCode !== 0) {
+    return { id, label, status: "skip", reason: `${TOOLS_SERVER} is not registered` };
+  }
+
+  const channelOut = `${channelEntry.stdout}\n${channelEntry.stderr}`;
+  const toolsOut = `${toolsEntry.stdout}\n${toolsEntry.stderr}`;
+
+  const channelToken = mcpEntryEnvValue(channelOut, "SUITE_TOKEN");
+  if (channelToken === null) {
+    return { id, label, status: "skip", reason: `no SUITE_TOKEN on the ${CHANNEL_SERVER} entry` };
+  }
+  const authorization = parseMcpHeaderValue(toolsOut, "Authorization");
+  const toolsToken = authorization === null ? null : bearerOf(authorization);
+  if (toolsToken === null) {
+    return { id, label, status: "skip", reason: `no bearer on the ${TOOLS_SERVER} entry` };
+  }
+
+  const channelUrl = mcpEntryEnvValue(channelOut, "SUITE_URL");
+  const toolsUrl = parseMcpHttpUrl(toolsOut);
+  const channelHost = channelUrl === null ? null : suiteHostOf(channelUrl);
+  const toolsHost = toolsUrl === null ? null : suiteHostOf(toolsUrl);
+  if (channelHost === null || toolsHost === null) {
+    return { id, label, status: "skip", reason: "could not read both entry urls" };
+  }
+  if (channelHost !== toolsHost) {
+    // Legitimate: two Suites. Nothing to compare, so nothing is claimed.
+    return { id, label, status: "skip", reason: "the entries point at different suites" };
+  }
+
+  if (tokenFingerprint(channelToken) !== tokenFingerprint(toolsToken)) {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "entries disagree",
+      detail: channelHost,
+      consequence: [
+        // Two lines, per rule (b). The first says WHAT is wrong and why that is
+        // a verdict rather than an observation.
+        `The ${CHANNEL_SERVER} and ${TOOLS_SERVER} entries carry different credentials for one Suite host, and one runtime credential normally serves both, so at least one of the two is wrong.`,
+        // The second says why nothing else will tell you.
+        "The wrong one produces a server that registers and exposes nothing at all: no error, no missing entry, just silence — which is why this configuration looks plausible from every surface you can see.",
+      ],
+      remedy: "suite init",
+    };
+  }
+  return { id, label, status: "pass", value: "both entries agree", detail: channelHost };
+}
+
 async function channelCheck(
   deps: DoctorDeps,
   claudePath: string | null,
@@ -661,6 +1046,21 @@ async function channelCheck(
   const status = await channelStatus(deps, claudePath);
   if (status.state === "connected") {
     return { id: "channel", label: "channel", status: "pass", value: "connected" };
+  }
+  if (status.state === "pending") {
+    // NEITHER RED NOR GREEN, rule (c). `⏸ Pending approval` is a statement
+    // about this PROJECT's approval of a user-scope server, not about the
+    // channel's health — a pending channel is routinely delivering messages —
+    // so calling it a failure prints red for something that works, and calling
+    // it connected asserts something we did not observe.
+    return {
+      id: "channel",
+      label: "channel",
+      status: "skip",
+      // The remedy rides in the reason: `Skipped` carries no `remedy` field on
+      // purpose, because rule (b)'s single `→` belongs to failures only.
+      reason: `awaiting project approval; ${PENDING_APPROVAL_REMEDY}`,
+    };
   }
   if (status.state === "missing") {
     return {
@@ -719,6 +1119,145 @@ export async function channelStatus(deps: DoctorDeps, claudePath: string): Promi
 export async function toolsStatus(deps: DoctorDeps, claudePath: string): Promise<ServerStatus> {
   const r = await deps.run([claudePath, "mcp", "list"]);
   return parseServerStatus(`${r.stdout}\n${r.stderr}`, TOOLS_SERVER);
+}
+
+/**
+ * Does the tools MCP entry's credential ACTUALLY AUTHENTICATE?
+ *
+ * WHY THIS CHECK EXISTS. A 401 on the tools HTTP MCP entry is INVISIBLE FROM
+ * THE CLAUDE SIDE. The server registers, `claude mcp list` shows the entry as
+ * content, and it simply EXPOSES NO TOOLS. It presents as SILENCE, NOT AN
+ * ERROR — which is how a real runtime spent an evening receiving work it had no
+ * tool to answer with, while every surface it could see reported healthy.
+ *
+ * So this check makes an AUTHENTICATED CALL and asserts a successful tools
+ * response. "The endpoint is reachable" and "the entry is registered" are
+ * different and near-worthless claims: both are true in exactly the failure
+ * this exists to catch.
+ *
+ * The request is built here from the entry's own headers — every one of them,
+ * whatever the operator registered — and issued through {@link DoctorDeps.probe},
+ * which is in-process `fetch`. Never a spawned command: an argv is world-
+ * readable through `ps`.
+ */
+async function toolsCheck(
+  deps: DoctorDeps,
+  claudePath: string | null,
+  entry: RunResult | null,
+): Promise<CheckResult> {
+  const id = "tools";
+  const label = "tools api";
+  if (claudePath === null || entry === null) {
+    return { id, label, status: "skip", reason: "needs the claude cli" };
+  }
+  const output = `${entry.stdout}\n${entry.stderr}`;
+  if (entry.exitCode !== 0) {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "not registered",
+      consequence: [
+        `No ${TOOLS_SERVER} MCP entry exists, so this runtime has no Suite tools`,
+        "at all and cannot answer the work the channel delivers.",
+      ],
+      remedy: "suite init",
+    };
+  }
+  const url = parseMcpHttpUrl(output);
+  if (url === null) {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "entry unreadable",
+      detail: compact(output),
+      consequence: [
+        "We could not find the endpoint URL in the MCP entry, so we cannot tell",
+        "whether this runtime's credential is accepted by Suite.",
+      ],
+      remedy: "suite init",
+    };
+  }
+
+  // Headers verbatim off the entry — the secret goes straight into the request
+  // and is never held anywhere it could be rendered.
+  const headers = {
+    ...parseMcpHeaders(output),
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+  };
+
+  let result: ProbeResult | null = null;
+  try {
+    result = await deps.probe({ url, headers });
+  } catch {
+    result = null;
+  }
+  const verdict: ProbeVerdict = result === null ? "unreachable" : classifyProbe(result);
+
+  if (verdict === "ok") {
+    const count = toolCount(result?.body ?? "") ?? 0;
+    // The count is the proof the call succeeded, and it is not a secret.
+    return { id, label, status: "pass", value: "authenticated", detail: `${count} tools` };
+  }
+  if (verdict === "rejected") {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "credential rejected",
+      consequence: [
+        // Two lines, per rule (b). The first fixes BLAME — the request reached
+        // the application, so the gateway's credentials are not implicated.
+        "The request reached Suite and Suite refused the credential: the entry stays registered and reachable and exposes no Suite tools at all,",
+        // The second is the advice. An expired credential and one that was never
+        // valid present identically from here, so this points at re-entering the
+        // credential known to work rather than at minting a new one.
+        "so this runtime receives work it cannot answer and nothing anywhere prints an error. Re-enter the credential you know works — the same one normally serves both entries — rather than minting a new one.",
+      ],
+      remedy: "suite init",
+    };
+  }
+  if (verdict === "gateway-challenge") {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "blocked before Suite",
+      consequence: [
+        "The gateway in front of Suite answered instead, so the request never reached the application",
+        "and the credential was not even evaluated: what is wrong is the additional headers, not the token.",
+      ],
+      remedy: "suite init",
+    };
+  }
+  if (verdict === "unreachable") {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "unreachable",
+      detail: url,
+      consequence: [
+        "Nothing answered at all: the endpoint URL, DNS or this network is wrong, so no statement",
+        "about the credential can be made in either direction.",
+      ],
+      remedy: `claude mcp get ${TOOLS_SERVER}`,
+    };
+  }
+  return {
+    id,
+    label,
+    status: "fail",
+    value: "response unreadable",
+    detail: compact(`${result?.status ?? ""} ${result?.body ?? ""}`),
+    consequence: [
+      "We got a response we can read as neither a tool list nor a refusal, so the tools this runtime",
+      "actually has are unknown — and a 200 carrying no tools lands here and is never green.",
+    ],
+    remedy: `claude mcp get ${TOOLS_SERVER}`,
+  };
 }
 
 async function sessionCheck(deps: DoctorDeps, tmuxPath: string | null): Promise<CheckResult> {
@@ -793,6 +1332,21 @@ export async function liveDoctorDeps(
     utf8: utf8Enabled(env),
     out: (line) => console.log(line),
     run: (argv) => tmux.run(argv),
+    // In-process fetch, deliberately: a spawned curl would put the bearer on a
+    // command line, and a command line is readable by every process on the box.
+    probe: async ({ url, headers }) => {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: TOOLS_LIST_BODY,
+        signal: AbortSignal.timeout(5_000),
+      });
+      return {
+        status: response.status,
+        body: await response.text(),
+        contentType: response.headers.get("content-type") ?? "",
+      };
+    },
   };
 }
 

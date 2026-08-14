@@ -16,6 +16,15 @@ import {
   parseAuthStatus,
   parseClaudeVersion,
   parseMcpEntryPath,
+  parseMcpHeaderValue,
+  parseMcpHttpUrl,
+  mcpEntryEnvValue,
+  bearerOf,
+  classifyProbe,
+  suiteHostOf,
+  parseMcpHeaders,
+  toolCount,
+  tokenFingerprint,
   renderCheck,
   renderReport,
   runChecks,
@@ -24,6 +33,8 @@ import {
   type CheckId,
   type CheckResult,
   type DoctorDeps,
+  type ProbeRequest,
+  type ProbeResult,
 } from "../src/commands/doctor.ts";
 import { CHANNEL_SERVER, TOOLS_SERVER } from "../src/commands/init.ts";
 import { emptyConfig, type SuiteConfig } from "../src/config.ts";
@@ -76,6 +87,11 @@ interface FakeOptions {
   /** What `claude mcp get suite-channel` prints. */
   mcpGet?: string;
   mcpGetExit?: number;
+  /** What `claude mcp get <the tools server>` prints. */
+  toolsGet?: string;
+  toolsGetExit?: number;
+  /** What the authenticated tools probe answers, or a throw for unreachable. */
+  probe?: (request: ProbeRequest) => Promise<ProbeResult>;
   /** What `claude mcp list` prints. */
   mcpList?: string;
   env?: Record<string, string | undefined>;
@@ -88,7 +104,13 @@ interface FakeOptions {
 
 const PLUGIN_PATH = "/opt/example/claude-code-suite-channel/src/index.ts";
 
-function mcpGetOutput(path = PLUGIN_PATH, token = "tok_fixture_0000"): string {
+/**
+ * The channel entry. Its token defaults to {@link TOOLS_TOKEN} — the SAME
+ * credential the tools entry carries — because that is the healthy shape: one
+ * runtime credential serving both servers. A fixture whose two entries
+ * disagreed would make the all-healthy anchor below red.
+ */
+function mcpGetOutput(path = PLUGIN_PATH, token = TOOLS_TOKEN): string {
   return [
     `${CHANNEL_SERVER}:`,
     "  Scope: User config",
@@ -103,21 +125,57 @@ function mcpGetOutput(path = PLUGIN_PATH, token = "tok_fixture_0000"): string {
   ].join("\n");
 }
 
-function mcpListOutput(channel = "✔ Connected"): string {
+/**
+ * The OTHER entry, and a different shape entirely: the tools server is an HTTP
+ * entry with a URL and headers, not a stdio entry with a command and an env.
+ * The fake used to answer one output for every `mcp get`, which made it
+ * impossible for a test to distinguish reading the right entry from reading the
+ * wrong one.
+ */
+const TOOLS_TOKEN = "tok_fixture_alpha";
+
+function toolsGetOutput(url = `${SUITE_URL}/mcp`, token = TOOLS_TOKEN): string {
   return [
-    `${CHANNEL_SERVER}: bun ${PLUGIN_PATH} - ${channel}`,
-    `${TOOLS_SERVER}: ${SUITE_URL}/mcp (HTTP) - ✔ Connected`,
+    `${TOOLS_SERVER}:`,
+    "  Scope: User config",
+    "  Type: http",
+    `  URL: ${url}`,
+    "  Headers:",
+    `    Authorization: Bearer ${token}`,
+    "    X-Fixture-Gateway-Id: gateway-fixture-1",
     "",
   ].join("\n");
 }
 
-function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[] } {
+/** A healthy `tools/list` reply — three invented tool names. */
+function toolsListBody(names = ["suite_reply", "task_get", "memory_view"]): string {
+  return JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: names.map((name) => ({ name })) } });
+}
+
+const REJECTED_BODY = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  error: { code: -32000, message: "unauthorized" },
+});
+
+function mcpListOutput(channel = "✔ Connected", tools = "✔ Connected"): string {
+  return [
+    `${CHANNEL_SERVER}: bun ${PLUGIN_PATH} - ${channel}`,
+    `${TOOLS_SERVER}: ${SUITE_URL}/mcp (HTTP) - ${tools}`,
+    "",
+  ].join("\n");
+}
+
+function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[]; argvs: string[][] } {
   const tools = options.tools ?? ["claude", "bun", "tmux"];
   const lines: string[] = [];
+  /** Every argv the fake `run` saw — the material of the ps-leak guard. */
+  const argvs: string[][] = [];
   const sessionState = options.sessionState ?? "none";
   const has = (name: string) => tools.includes(name);
 
   const run = async (argv: string[]) => {
+    argvs.push([...argv]);
     const [bin, ...args] = argv;
     const name = (bin ?? "").split("/").pop() ?? "";
     const ok = { exitCode: 0, stdout: "", stderr: "" };
@@ -125,6 +183,16 @@ function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[] } {
       if (args[0] === "--version") return { ...ok, stdout: `${options.version ?? HEALTHY_VERSION}\n` };
       if (args[0] === "auth") return { ...ok, stdout: `${options.auth ?? HEALTHY_AUTH}\n` };
       if (args[0] === "mcp" && args[1] === "get") {
+        // NAME-AWARE: the two entries have different shapes and different
+        // failure modes, so one fixture output for both would let a check that
+        // read the wrong entry pass.
+        if (args[2] === TOOLS_SERVER) {
+          return {
+            exitCode: options.toolsGetExit ?? 0,
+            stdout: options.toolsGet ?? toolsGetOutput(),
+            stderr: "",
+          };
+        }
         return {
           exitCode: options.mcpGetExit ?? 0,
           stdout: options.mcpGet ?? mcpGetOutput(),
@@ -158,9 +226,13 @@ function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[] } {
     config: options.config === undefined ? config() : options.config,
     configFile: "/fixture/home/.config/suite/config.json",
     tmux: { env: {}, which: (name) => (has(name) ? `/fixture/bin/${name}` : null), run },
+    probe:
+      options.probe ??
+      (async () => ({ status: 200, body: toolsListBody(), contentType: "application/json" })),
     color: options.color ?? false,
     utf8: options.utf8 ?? true,
     lines,
+    argvs,
     out: (line) => void lines.push(line),
   };
 }
@@ -186,17 +258,17 @@ async function report(options: FakeOptions = {}): Promise<{ text: string; code: 
 /* ------------------------------------------------------------------------- */
 
 describe("an all-healthy machine", () => {
-  test("passes all eight checks and exits 0", async () => {
+  test("passes all ten checks and exits 0", async () => {
     const { text, code, checks } = await report();
-    expect(checks).toHaveLength(8);
-    expect(checks.filter((c) => c.status === "pass")).toHaveLength(8);
+    expect(checks).toHaveLength(10);
+    expect(checks.filter((c) => c.status === "pass")).toHaveLength(10);
     expect(code).toBe(0);
-    expect(text).toContain("8 checks passed.");
+    expect(text).toContain("10 checks passed.");
     expect(text).not.toContain("✘");
     expect(text).not.toContain("⋯");
   });
 
-  test("the eight checks are listed in dependency order", async () => {
+  test("the ten checks are listed in dependency order", async () => {
     const { checks } = await report();
     expect(checks.map((c) => c.id)).toEqual([
       "claude",
@@ -205,7 +277,9 @@ describe("an all-healthy machine", () => {
       "tmux",
       "plugin",
       "credentials",
+      "tokens",
       "channel",
+      "tools",
       "session",
     ]);
   });
@@ -324,11 +398,24 @@ describe("each check fires on a broken input", () => {
     expect(text).toContain("→ claude mcp list");
   });
 
-  test("7b. `⏸ Pending approval` is NOT read as connected", async () => {
-    // The established trap: a parser looking only for `✘` calls this green.
-    const { code, checks } = await report({ mcpList: mcpListOutput("⏸ Pending approval") });
-    expect(byId(checks, "channel").status).toBe("fail");
-    expect(code).toBe(1);
+  test("7b. `⏸ Pending approval` is read as NEITHER connected NOR failed", async () => {
+    const { text, code, checks } = await report({ mcpList: mcpListOutput("⏸ Pending approval") });
+    const check = byId(checks, "channel");
+
+    // THE ORIGINAL CLAIM, KEPT: a parser looking only for `✘` calls this green,
+    // and it must not. Pending is not a connection.
+    expect(check.status).not.toBe("pass");
+
+    // AND THE OTHER HALF. `⏸ Pending approval` is a project-approval state, not
+    // a connectivity verdict — measured on a real box, both Suite servers
+    // reported pending while the channel was demonstrably delivering messages.
+    // Printing `✘` there is a failure reported for something that works.
+    expect(check.status).toBe("skip");
+    expect(text).toContain("skipped — awaiting project approval");
+    expect(text).toContain("run claude once in this project to approve");
+    // The exit code follows from the tier — but assert it, because "skip is
+    // exempt" is a property of exitCodeFor that a future edit could lose.
+    expect(code).toBe(0);
   });
 
   test("7c. a status we cannot read at all is a failure, never a pass", async () => {
@@ -366,20 +453,19 @@ describe("a broken upstream check skips its dependants rather than reddening the
     expect(text).toContain("skipped — needs a working plugin path");
     // Exactly one failure, not a wall of red pointing at one real cause.
     expect(checks.filter((c) => c.status === "fail")).toHaveLength(1);
-    expect(text).toContain("1 of 8 failed.");
+    expect(text).toContain("1 of 10 failed.");
   });
 
   test("no claude at all skips everything that needs it, and still exits 1", async () => {
     const { text, code, checks } = await report({ tools: ["bun", "tmux"] });
     expect(byId(checks, "claude").status).toBe("fail");
-    expect(["auth", "plugin", "credentials", "channel"].map((id) => byId(checks, id as CheckId).status)).toEqual([
-      "skip",
-      "skip",
-      "skip",
-      "skip",
-    ]);
+    expect(
+      ["auth", "plugin", "credentials", "tokens", "channel", "tools"].map((id) =>
+        byId(checks, id as CheckId).status,
+      ),
+    ).toEqual(["skip", "skip", "skip", "skip", "skip", "skip"]);
     expect(code).toBe(1);
-    expect(text).toContain("1 of 8 failed.");
+    expect(text).toContain("1 of 10 failed.");
   });
 });
 
@@ -411,9 +497,21 @@ describe("the report obeys the design rules", () => {
       { exists: () => false },
       { mcpGetExit: 1, mcpGet: "" },
       { mcpGet: mcpGetOutput(PLUGIN_PATH, "") },
+      // Same host, disagreeing credentials — the token-match failure.
+      { mcpGet: mcpGetOutput(PLUGIN_PATH, "tok_fixture_disagreeing_zzq9") },
       { mcpList: mcpListOutput("✘ Failed to connect") },
       { mcpList: "" },
       { sessionState: "stale" },
+      { toolsGetExit: 1, toolsGet: "" },
+      { toolsGet: "Type: http\nno url here\n" },
+      { probe: async () => ({ status: 401, body: REJECTED_BODY, contentType: "application/json" }) },
+      { probe: async () => ({ status: 200, body: "<html></html>", contentType: "text/html" }) },
+      { probe: async () => ({ status: 200, body: "{}", contentType: "application/json" }) },
+      {
+        probe: async () => {
+          throw new Error("fixture: unreachable");
+        },
+      },
     ];
     let failures = 0;
     for (const options of configs) {
@@ -451,7 +549,7 @@ describe("the report obeys the design rules", () => {
   test("(d) the closing line is a count and an instruction, not a paragraph", async () => {
     const { text } = await report({ auth: APIKEY_AUTH, exists: () => false });
     const last = text.trimEnd().split("\n").pop() ?? "";
-    expect(last).toContain("2 of 8 failed.");
+    expect(last).toContain("2 of 10 failed.");
     expect(last).toContain("Fix the first one, run suite doctor again.");
     expect(last.split(".").filter((s) => s.trim() !== "")).toHaveLength(2);
   });
@@ -594,6 +692,134 @@ describe("parsers", () => {
     expect(typeof mcpEntryHasToken(mcpGetOutput())).toBe("boolean");
   });
 
+  test("the http entry's URL is read from a URL line, never from a command line", () => {
+    const entry = [
+      "startup-suite:",
+      "  Type: http",
+      "  URL: https://example-suite.invalid/mcp",
+      "  Headers:",
+      "    Authorization: Bearer tok_fixture_alpha",
+    ].join("\n");
+    expect(parseMcpHttpUrl(entry)).toBe("https://example-suite.invalid/mcp");
+    // A stdio entry has no URL, and its Command line must not be mined for one.
+    expect(parseMcpHttpUrl("  Command: /opt/example/bin/bun\n  Args: /opt/example/src/index.ts")).toBeNull();
+    expect(parseMcpHttpUrl("Endpoint = http://example-suite.invalid:4000/mcp")).toBe(
+      "http://example-suite.invalid:4000/mcp",
+    );
+    // Never guessed: a relative or schemeless value is null, i.e. a failure.
+    expect(parseMcpHttpUrl("  URL: /mcp")).toBeNull();
+    expect(parseMcpHttpUrl("nothing readable here")).toBeNull();
+  });
+
+  test("one header's value is lifted, case-insensitively, and Bearer stripped", () => {
+    const entry = [
+      "  Type: http",
+      "  URL: https://example-suite.invalid/mcp",
+      "  Headers:",
+      "    Authorization: Bearer tok_fixture_alpha",
+      "    X-Fixture-Trace: trace-fixture-1",
+    ].join("\n");
+    expect(parseMcpHeaderValue(entry, "authorization")).toBe("Bearer tok_fixture_alpha");
+    expect(parseMcpHeaderValue(entry, "X-Fixture-Trace")).toBe("trace-fixture-1");
+    expect(parseMcpHeaderValue(entry, "X-Absent")).toBeNull();
+    expect(parseMcpHeaderValue("  Authorization:   \n", "Authorization")).toBeNull();
+    expect(parseMcpHeaderValue(`-H 'Authorization: Bearer tok_fixture_beta'`, "Authorization")).toBe(
+      "Bearer tok_fixture_beta",
+    );
+
+    expect(bearerOf("Bearer tok_fixture_alpha")).toBe("tok_fixture_alpha");
+    expect(bearerOf("bearer tok_fixture_alpha")).toBe("tok_fixture_alpha");
+    expect(bearerOf("tok_fixture_alpha")).toBeNull();
+    expect(bearerOf("Bearer   ")).toBeNull();
+  });
+
+  test("the fingerprint compares secrets without carrying any of one", () => {
+    const alpha = "tok_fixture_alpha";
+    const beta = "tok_fixture_beta";
+
+    expect(tokenFingerprint(alpha)).toBe(tokenFingerprint(alpha));
+    expect(tokenFingerprint(alpha)).not.toBe(tokenFingerprint(beta));
+    expect(tokenFingerprint(alpha)).toHaveLength(8);
+    expect(tokenFingerprint(alpha)).toMatch(/^[0-9a-f]{8}$/);
+
+    // ANTI-LEAK: no 4-character run of the input survives into the output, so a
+    // future "just truncate the token" regression fails here instead of
+    // shipping a printed prefix of a live credential.
+    const fp = tokenFingerprint(alpha);
+    for (let i = 0; i + 4 <= alpha.length; i++) {
+      expect(fp.includes(alpha.slice(i, i + 4))).toBe(false);
+    }
+  });
+
+  test("the websocket entry and the https entry resolve to the same host", () => {
+    expect(suiteHostOf("wss://example-suite.invalid/socket")).toBe("example-suite.invalid");
+    expect(suiteHostOf("https://example-suite.invalid/mcp")).toBe("example-suite.invalid");
+    expect(suiteHostOf("wss://example-suite.invalid/socket")).toBe(
+      suiteHostOf("https://example-suite.invalid/mcp"),
+    );
+    expect(suiteHostOf("HTTPS://EXAMPLE-SUITE.INVALID/mcp")).toBe("example-suite.invalid");
+    // `URL` semantics for the port, and nothing beyond them.
+    expect(suiteHostOf("http://example-suite.invalid:4000/mcp")).toBe("example-suite.invalid:4000");
+    expect(suiteHostOf("not a url")).toBeNull();
+    expect(suiteHostOf("")).toBeNull();
+  });
+
+  test("a 401 from the application and a 401 from the gateway are different verdicts", () => {
+    // THE SAME-STATUS PAIR. A classifier tested only on distinct status codes
+    // proves nothing about the distinction this tool exists for.
+    const rpcError = {
+      status: 401,
+      body: JSON.stringify({ code: -32000, message: "unauthorized" }),
+      contentType: "application/json",
+    };
+    const htmlChallenge = {
+      status: 401,
+      body: "<!DOCTYPE html><html><body>sign in</body></html>",
+      contentType: "text/html; charset=utf-8",
+    };
+    expect(classifyProbe(rpcError)).toBe("rejected");
+    expect(classifyProbe(htmlChallenge)).toBe("gateway-challenge");
+    expect(classifyProbe(rpcError)).not.toBe(classifyProbe(htmlChallenge));
+  });
+
+  test("each probe verdict has a case, including an HTML 200 and a toolless 200", () => {
+    expect(
+      classifyProbe({
+        status: 200,
+        body: JSON.stringify({ result: { tools: [{ name: "task_get" }] } }),
+        contentType: "application/json",
+      }),
+    ).toBe("ok");
+
+    // An access proxy answers a credential-less request with a login PAGE, and
+    // it may do so with a 200. HTML is the signal, not the status.
+    expect(
+      classifyProbe({ status: 200, body: "<html><body>sign in</body></html>", contentType: "" }),
+    ).toBe("gateway-challenge");
+
+    // A 200 with no tools is the incident's invisible symptom: healthy-looking
+    // and exposing nothing. It is NOT ok.
+    expect(
+      classifyProbe({
+        status: 200,
+        body: JSON.stringify({ result: { tools: [] } }),
+        contentType: "application/json",
+      }),
+    ).toBe("unreadable");
+    expect(classifyProbe({ status: 200, body: "not json", contentType: "text/plain" })).toBe("unreadable");
+    expect(classifyProbe({ status: 403, body: "opaque denial", contentType: "text/plain" })).toBe("unreadable");
+    expect(classifyProbe({ status: 500, body: "", contentType: "" })).toBe("unreadable");
+
+    // A 403 carrying the JSON-RPC error shape is still an application refusal.
+    expect(
+      classifyProbe({
+        status: 403,
+        body: JSON.stringify({ error: { code: -32000, message: "unauthorized" } }),
+        contentType: "application/json",
+      }),
+    ).toBe("rejected");
+  });
+
   test("the exit code is 1 if and only if something failed", () => {
     const pass: CheckResult = { id: "bun", label: "bun", status: "pass", value: "1.2.4" };
     const skip: CheckResult = { id: "channel", label: "channel", status: "skip", reason: "x" };
@@ -716,6 +942,340 @@ describe.if(HAVE_TMUX)("against a real tmux", () => {
     },
     90_000,
   );
+});
+
+/* ------------------------------------------------------------------------- */
+/* The tools endpoint: an AUTHENTICATED call, which is the whole point         */
+/* ------------------------------------------------------------------------- */
+
+describe("the tools api check", () => {
+  /**
+   * THE POSITIVE CONTROL. Every assertion below is about the check firing; a
+   * check that fires on every input is indistinguishable from one that always
+   * fires, so the SAME fixture machine must also go green.
+   */
+  test("goes green on a healthy tools list, on the same fixture machine", async () => {
+    const { text, code, checks } = await report();
+    const check = byId(checks, "tools");
+    expect(check.status).toBe("pass");
+    expect(code).toBe(0);
+    expect(text).toContain("authenticated");
+    // The count is the proof the call succeeded, and it is not a secret.
+    expect(text).toContain("3 tools");
+  });
+
+  test("a 401 with a JSON-RPC error body is the credential being rejected", async () => {
+    const { text, code, checks } = await report({
+      probe: async () => ({ status: 401, body: REJECTED_BODY, contentType: "application/json" }),
+    });
+    const check = byId(checks, "tools");
+    expect(check.status).toBe("fail");
+    expect(code).toBe(1);
+    expect(text).toContain("credential rejected");
+    // The consequence names the invisible symptom, not the status code.
+    expect(text).toContain("exposes no Suite tools");
+    expect(text).toContain("nothing anywhere prints an error");
+    // It reached the application, so nothing in front of Suite is implicated.
+    expect(text).toContain("The request reached Suite");
+    // Expired and never-valid look identical from here: re-enter, do not mint.
+    expect(text).toContain("rather than minting a new one");
+    expect(text).toContain("→ suite init");
+    // Exactly one runnable line, so the reader has one thing to do.
+    expect(text.split("\n").filter((l) => l.includes("→")).length).toBe(1);
+    // The secret is nowhere in the report.
+    expect(text).not.toContain(TOOLS_TOKEN);
+  });
+
+  /**
+   * THE TEXT DIFFERENCE IS THE TICKET. `rejected` and `unreachable` need
+   * OPPOSITE fixes — one is a wrong credential Suite refused, the other is
+   * nothing answering at all — so a test asserting only "it failed" would pass
+   * on a doctor that printed the same paragraph for both.
+   */
+  test("rejected and unreachable print different text", async () => {
+    const rejected = await report({
+      probe: async () => ({ status: 401, body: REJECTED_BODY, contentType: "application/json" }),
+    });
+    const unreachable = await report({
+      probe: async () => {
+        throw new Error("fixture: getaddrinfo ENOTFOUND");
+      },
+    });
+    const line = (r: { text: string }) =>
+      r.text.split("\n").find((l) => l.includes("tools api")) ?? "";
+
+    expect(byId(unreachable.checks, "tools").status).toBe("fail");
+    expect(unreachable.text).toContain("unreachable");
+    expect(unreachable.text).toContain(`→ claude mcp get ${TOOLS_SERVER}`);
+    expect(line(rejected)).not.toBe(line(unreachable));
+    expect(rejected.text).not.toBe(unreachable.text);
+    // And the remedies differ, which is the part that actually costs an evening.
+    const remedy = (r: { checks: CheckResult[] }) => {
+      const c = byId(r.checks, "tools");
+      return c.status === "fail" ? c.remedy : "";
+    };
+    expect(remedy(rejected)).not.toBe(remedy(unreachable));
+  });
+
+  test("an HTML answer is the gateway, and says the bearer was not evaluated", async () => {
+    const { text, checks } = await report({
+      probe: async () => ({ status: 200, body: "<!DOCTYPE html><html><body>sign in</body></html>", contentType: "text/html; charset=utf-8" }),
+    });
+    expect(byId(checks, "tools").status).toBe("fail");
+    expect(text).toContain("blocked before Suite");
+    expect(text).toContain("never");
+    expect(text).toContain("not even evaluated");
+    expect(text).toContain("→ suite init");
+  });
+
+  test("a 200 carrying no tools is NEVER green", async () => {
+    const { text, code, checks } = await report({
+      probe: async () => ({
+        status: 200,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [] } }),
+        contentType: "application/json",
+      }),
+    });
+    expect(byId(checks, "tools").status).toBe("fail");
+    expect(code).toBe(1);
+    expect(text).toContain("response unreadable");
+  });
+
+  test("a missing or unreadable entry fails, mirroring the plugin check", async () => {
+    const missing = await report({ toolsGetExit: 1, toolsGet: "" });
+    expect(byId(missing.checks, "tools").status).toBe("fail");
+    expect(missing.text).toContain("not registered");
+
+    const weird = await report({ toolsGet: "Type: http\nno url on any line\n" });
+    expect(byId(weird.checks, "tools").status).toBe("fail");
+    expect(weird.text).toContain("entry unreadable");
+    expect(weird.text).toContain("→ suite init");
+  });
+
+  test("without the claude cli it is ⋯ skipped, not red", async () => {
+    const { checks } = await report({ tools: ["bun", "tmux"] });
+    const check = byId(checks, "tools");
+    expect(check.status).toBe("skip");
+    expect(check.status === "skip" && check.reason).toBe("needs the claude cli");
+  });
+
+  /**
+   * THE ps-LEAK GUARD, in code rather than in a reviewer's head.
+   *
+   * `run` puts argv on a command line and a command line is world-readable
+   * through `ps`, so the probe must be an in-process fetch. Recording every argv
+   * the fake sees and asserting none of them carries the token is the only way
+   * this stays true after someone "simplifies" the probe into a spawned command.
+   */
+  test("the bearer never reaches an argv", async () => {
+    const deps = fakeDeps();
+    await runChecks(deps);
+    expect(deps.argvs.length).toBeGreaterThan(3);
+    for (const argv of deps.argvs) {
+      for (const word of argv) {
+        expect(word).not.toContain(TOOLS_TOKEN);
+        expect(word.toLowerCase()).not.toContain("bearer");
+      }
+    }
+    // Anti-vacuity: the recorder DOES capture argv, so an empty sweep would not
+    // be what made this green.
+    expect(deps.argvs.flat()).toContain("--version");
+  });
+
+  test("the probe carries the entry's headers verbatim, not a hardcoded set", async () => {
+    const seen: ProbeRequest[] = [];
+    await report({
+      probe: async (request) => {
+        seen.push(request);
+        return { status: 200, body: toolsListBody(), contentType: "application/json" };
+      },
+    });
+    const request = seen[0];
+    expect(request).toBeDefined();
+    expect(request!.url).toBe(`${SUITE_URL}/mcp`);
+    expect(request!.headers.Authorization).toBe(`Bearer ${TOOLS_TOKEN}`);
+    // Whatever the operator registered rides along; the check knows no names.
+    expect(request!.headers["X-Fixture-Gateway-Id"]).toBe("gateway-fixture-1");
+  });
+
+  test("headers are lifted from the headers block only", () => {
+    const headers = parseMcpHeaders(toolsGetOutput());
+    expect(headers.Authorization).toBe(`Bearer ${TOOLS_TOKEN}`);
+    expect(headers["X-Fixture-Gateway-Id"]).toBe("gateway-fixture-1");
+    // A URL line and a Type line are not headers, however much they look it.
+    expect(Object.keys(headers)).not.toContain("URL");
+    expect(Object.keys(headers)).not.toContain("Type");
+    expect(Object.keys(headers)).not.toContain("Scope");
+    // The argv echo shape too.
+    expect(parseMcpHeaders(`-H 'X-Fixture-Two: two'`)["X-Fixture-Two"]).toBe("two");
+    expect(parseMcpHeaders(mcpGetOutput())).toEqual({});
+  });
+
+  test("the tool count reads the list length, and null when there is none", () => {
+    expect(toolCount(toolsListBody(["a", "b"]))).toBe(2);
+    expect(toolCount(REJECTED_BODY)).toBeNull();
+    expect(toolCount("not json")).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* The token-consistency check: BOTH sides, one assertion each                */
+/* ------------------------------------------------------------------------- */
+
+describe("the token match check", () => {
+  /** A channel entry whose SUITE_URL host is settable, so hosts can differ. */
+  function channelEntry(token: string, host = "suite.example.invalid"): string {
+    return [
+      `${CHANNEL_SERVER}:`,
+      "  Scope: User config",
+      "  Type: stdio",
+      "  Command: bun",
+      `  Args: ${PLUGIN_PATH}`,
+      "  Environment:",
+      `    SUITE_URL=wss://${host}/runtime/ws`,
+      `    SUITE_RUNTIME_ID=${RUNTIME_ID}`,
+      `    SUITE_TOKEN=${token}`,
+      "",
+    ].join("\n");
+  }
+
+  const OTHER_TOKEN = "tok_fixture_disagreeing_zzq9";
+
+  /**
+   * SIDE ONE: it fires. Same host, two different credentials — the shape the
+   * real incident had, and the shape no other surface reports at all.
+   */
+  test("same host + different credentials is a failure naming BOTH entries", async () => {
+    const { text, code, checks } = await report({ mcpGet: channelEntry(OTHER_TOKEN) });
+    const check = byId(checks, "tokens");
+    expect(check.status).toBe("fail");
+    expect(code).toBe(1);
+    expect(text).toContain("entries disagree");
+    // BOTH entries are named, because "one of these two is wrong" is the whole
+    // verdict and a message naming one of them points the reader at a coin flip.
+    expect(text).toContain(CHANNEL_SERVER);
+    expect(text).toContain(TOOLS_SERVER);
+    // The consequence is the invisible symptom, not the mismatch restated.
+    expect(text).toContain("registers and exposes nothing");
+    expect(text).toContain("→ suite init");
+  });
+
+  /**
+   * SIDE TWO: it is SILENT on the healthy shape. A check tested only on its
+   * failure is indistinguishable from one that always fires — and this one runs
+   * on every invocation of a tool whose value is that green means green.
+   */
+  test("same host + identical credentials is silent", async () => {
+    const { text, checks } = await report();
+    const check = byId(checks, "tokens");
+    expect(check.status).toBe("pass");
+    expect(check.status === "pass" && check.value).toBe("both entries agree");
+    expect(text).not.toContain("✘");
+  });
+
+  /** NEVER any part of either value, on either side. Presence-only, as shipped. */
+  test("no part of either credential appears in the report, agreeing or not", async () => {
+    for (const options of [{}, { mcpGet: channelEntry(OTHER_TOKEN) }]) {
+      const { text } = await report(options);
+      for (const secret of [TOOLS_TOKEN, OTHER_TOKEN]) {
+        // The same sweep the credentials check is held to: no prefix of any
+        // length, and not the tail either. A partial echo is still an echo.
+        expect(text).not.toContain(secret);
+        for (let n = 4; n <= secret.length; n++) expect(text).not.toContain(secret.slice(0, n));
+        expect(text).not.toContain(secret.slice(-4));
+      }
+    }
+  });
+
+  /**
+   * DIFFERENT HOSTS IS A SKIP, DELIBERATELY. Two Suite deployments on one box
+   * is a legitimate configuration and two credentials is then correct, so this
+   * check says nothing rather than inventing a verdict. Note the tokens here
+   * ALSO differ — the same input that fails above — so what is being tested is
+   * the host, not the token.
+   */
+  test("different hosts is ⋯ skipped with the reason named, never a failure", async () => {
+    const { text, code, checks } = await report({
+      mcpGet: channelEntry(OTHER_TOKEN, "other-suite.example.invalid"),
+    });
+    const check = byId(checks, "tokens");
+    expect(check.status).toBe("skip");
+    expect(check.status === "skip" && check.reason).toBe("the entries point at different suites");
+    expect(text).toContain("skipped — the entries point at different suites");
+    expect(code).toBe(0);
+  });
+
+  test("an unreadable entry or an unreadable token is ⋯, with its own reason", async () => {
+    const noToken = await report({ mcpGet: channelEntry("") });
+    const a = byId(noToken.checks, "tokens");
+    expect(a.status).toBe("skip");
+    expect(a.status === "skip" && a.reason).toBe(`no SUITE_TOKEN on the ${CHANNEL_SERVER} entry`);
+
+    const noBearer = await report({ toolsGet: toolsGetOutput().replace(/Authorization:.*/, "") });
+    const b = byId(noBearer.checks, "tokens");
+    expect(b.status).toBe("skip");
+    expect(b.status === "skip" && b.reason).toBe(`no bearer on the ${TOOLS_SERVER} entry`);
+
+    const noEntry = await report({ toolsGetExit: 1, toolsGet: "" });
+    const c = byId(noEntry.checks, "tokens");
+    expect(c.status).toBe("skip");
+    expect(c.status === "skip" && c.reason).toBe(`${TOOLS_SERVER} is not registered`);
+  });
+
+  test("the env reader lifts a value by name and never guesses one", () => {
+    expect(mcpEntryEnvValue(channelEntry("tok_fixture_env"), "SUITE_TOKEN")).toBe("tok_fixture_env");
+    expect(mcpEntryEnvValue(channelEntry("tok_fixture_env"), "SUITE_URL")).toBe(
+      "wss://suite.example.invalid/runtime/ws",
+    );
+    expect(mcpEntryEnvValue(channelEntry(""), "SUITE_TOKEN")).toBeNull();
+    expect(mcpEntryEnvValue(channelEntry("x"), "SUITE_ABSENT")).toBeNull();
+    // A header line is not an environment line, however much `Name: value`
+    // resembles `NAME=value`.
+    expect(mcpEntryEnvValue(toolsGetOutput(), "Authorization")).toBeNull();
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* Pending approval: neither red nor green                                    */
+/* ------------------------------------------------------------------------- */
+
+describe("a server that is PENDING APPROVAL and WORKING", () => {
+  /**
+   * THE ANTI-VACUITY FIXTURE FOR THE WHOLE TIER, and the state a real box was
+   * measured in: `claude mcp list` reports `⏸ Pending approval` for BOTH Suite
+   * servers while the tools endpoint answers a real `tools/list` and the channel
+   * delivers messages. A doctor that reads pending as a failure prints red for a
+   * machine that works, which is the misdiagnosis this tier exists to end.
+   */
+  const PENDING_AND_WORKING: FakeOptions = {
+    mcpList: mcpListOutput("⏸ Pending approval", "⏸ Pending approval"),
+  };
+
+  test("the channel line is ⋯, the tools check still passes, and the exit code is 0", async () => {
+    const { text, code, checks } = await report(PENDING_AND_WORKING);
+
+    expect(byId(checks, "channel").status).toBe("skip");
+    expect(text).toContain("skipped — awaiting project approval");
+
+    // The probe is what actually establishes health, and it is untouched by the
+    // approval state: pending said nothing about whether the server works.
+    const tools = byId(checks, "tools");
+    expect(tools.status).toBe("pass");
+    expect(text).toContain("3 tools");
+
+    // Nothing red anywhere, and the process says so.
+    expect(checks.filter((c) => c.status === "fail")).toHaveLength(0);
+    expect(text).not.toContain("✘");
+    expect(code).toBe(0);
+  });
+
+  test("a genuinely failed channel on the same fixture is still red", async () => {
+    // Anti-vacuity for the test above: the pending tier did not simply stop the
+    // channel check from ever reddening.
+    const { code, checks } = await report({ mcpList: mcpListOutput("✘ Failed to connect") });
+    expect(byId(checks, "channel").status).toBe("fail");
+    expect(code).toBe(1);
+  });
 });
 
 /* ------------------------------------------------------------------------- */
