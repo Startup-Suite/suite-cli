@@ -8,6 +8,9 @@ import { type RunResult, type TmuxDeps } from "../src/tmux.ts";
 import {
   AGENT,
   DEV_CHANNEL_ARGS,
+  SKIP_PERMISSIONS_ARG,
+  CONTINUE_ARG,
+  suiteArgs,
   NESTED_REFUSAL_EXIT,
   NOTICE_BODY,
   agentArgv,
@@ -49,7 +52,11 @@ afterAll(() => {
 /* The exact argv delivered to Claude                                         */
 /* ------------------------------------------------------------------------- */
 
-const HEAD = [AGENT, ...DEV_CHANNEL_ARGS];
+const HEAD = [AGENT, ...DEV_CHANNEL_ARGS, SKIP_PERMISSIONS_ARG, CONTINUE_ARG];
+// When the user names a session themselves, `--continue` stands down and the
+// head is one element shorter. Kept as its own constant so a test that means
+// "resuming" cannot silently be written against the default head.
+const HEAD_RESUMING = [AGENT, ...DEV_CHANNEL_ARGS, SKIP_PERMISSIONS_ARG];
 
 describe("argv delivered to Claude", () => {
   test("(a) no arguments: the injected flag and nothing else", () => {
@@ -60,7 +67,7 @@ describe("argv delivered to Claude", () => {
   });
 
   test("(b) --resume passes through, after the injected flag", () => {
-    expect(agentArgv(["--resume"])).toEqual([...HEAD, "--resume"]);
+    expect(agentArgv(["--resume"])).toEqual([...HEAD_RESUMING, "--resume"]);
   });
 
   test("(c) -p 'hello world' survives as ONE argument", () => {
@@ -80,7 +87,7 @@ describe("argv delivered to Claude", () => {
   });
 
   test("(e) after --, everything passes verbatim and the terminator is consumed once", () => {
-    expect(agentArgv(["--", "--resume"])).toEqual([...HEAD, "--resume"]);
+    expect(agentArgv(["--", "--resume"])).toEqual([...HEAD_RESUMING, "--resume"]);
     // The literal word `new` reaches Claude when it follows the terminator,
     // which is the only way to send it at all.
     expect(agentArgv(["--", "new"])).toEqual([...HEAD, "new"]);
@@ -115,8 +122,70 @@ describe("argv delivered to Claude", () => {
     // The wrapper adds; it does not deduplicate. Claude sees the user's copy
     // as a plain repeat rather than the wrapper silently dropping their intent.
     const argv = agentArgv([DEV_CHANNEL_ARGS[0], "server:other"]);
-    expect(argv.slice(0, 3)).toEqual([...HEAD]);
-    expect(argv.slice(3)).toEqual([DEV_CHANNEL_ARGS[0], "server:other"]);
+    expect(argv.slice(0, HEAD.length)).toEqual([...HEAD]);
+    expect(argv.slice(HEAD.length)).toEqual([DEV_CHANNEL_ARGS[0], "server:other"]);
+  });
+});
+
+describe("the Suite participation flags", () => {
+  // These exist because a Suite runtime is unattended. Without
+  // --dangerously-skip-permissions it stops on the first tool-call prompt
+  // waiting for a human who is not there; without --continue every launch is
+  // a cold session. One assertion per side throughout: a rule that fired
+  // unconditionally would pass the first half of each pair and fail the second.
+
+  test("both are injected by default, ahead of the user's arguments", () => {
+    expect(suiteArgs([])).toEqual([SKIP_PERMISSIONS_ARG, CONTINUE_ARG]);
+    expect(agentArgv([])).toEqual([...HEAD]);
+  });
+
+  test("--continue stands down when the user already chose a session", () => {
+    // Each of these picks a session itself; handing it --continue as well
+    // gives Claude two conflicting instructions.
+    for (const selector of ["--resume", "-r", "--continue", "-c", "--from-pr", "--teleport"]) {
+      expect(suiteArgs([selector])).toEqual([SKIP_PERMISSIONS_ARG]);
+    }
+    // ...and the CONTROL: an unrelated flag does NOT suppress it. Without this
+    // half, a bug that dropped --continue for every input would still pass.
+    expect(suiteArgs(["--version"])).toEqual([SKIP_PERMISSIONS_ARG, CONTINUE_ARG]);
+    expect(suiteArgs(["--model", "opus"])).toEqual([SKIP_PERMISSIONS_ARG, CONTINUE_ARG]);
+  });
+
+  test("neither flag is injected twice when the user passes it", () => {
+    expect(suiteArgs([SKIP_PERMISSIONS_ARG])).toEqual([CONTINUE_ARG]);
+    expect(agentArgv([SKIP_PERMISSIONS_ARG])).toEqual([
+      AGENT,
+      ...DEV_CHANNEL_ARGS,
+      CONTINUE_ARG,
+      SKIP_PERMISSIONS_ARG,
+    ]);
+    // Control: a DIFFERENT dangerously-prefixed flag must not be mistaken for
+    // it. --allow-dangerously-skip-permissions is a separate option.
+    expect(suiteArgs(["--allow-dangerously-skip-permissions"])).toEqual([
+      SKIP_PERMISSIONS_ARG,
+      CONTINUE_ARG,
+    ]);
+  });
+
+  test("the terminator is honoured: `-- --resume` still suppresses --continue", () => {
+    // The wrapper must agree with the program it wraps. Claude reads the
+    // arguments after `--` as its own, so scanning only the pre-terminator
+    // slice would inject --continue alongside the user's --resume.
+    expect(suiteArgs(["--", "--resume"])).toEqual([SKIP_PERMISSIONS_ARG]);
+  });
+
+  test("-p one-shots get them too", () => {
+    // A scripted call is the LEAST attended thing we run. Stopping it on a
+    // permission prompt hangs a caller that is capturing stdout.
+    expect(agentArgv(["-p", "hi"])).toEqual([...HEAD, "-p", "hi"]);
+  });
+
+  test("the notice says the permission bypass out loud", () => {
+    // Rule 3 of this module is NOTHING SILENT. A wrapper that hides one
+    // `dangerously` flag trains people not to look at the next one, so the
+    // second flag joins the once-per-machine notice rather than sneaking in.
+    expect(NOTICE_BODY).toContain(SKIP_PERMISSIONS_ARG);
+    expect(NOTICE_BODY).toContain(DEV_CHANNEL_ARGS[0]);
   });
 });
 
@@ -253,7 +322,7 @@ describe("live / none / stale", () => {
       },
       fakeTmux({ which: () => null }),
     );
-    expect(plan.direct).toEqual([...HEAD, "--resume"]);
+    expect(plan.direct).toEqual([...HEAD_RESUMING, "--resume"]);
     expect(plan.warning ?? "").toContain("tmux");
   });
 });
@@ -390,7 +459,7 @@ describe("runClaude", () => {
     expect(r.ran.some((a) => a[1] === "new-session")).toBe(true);
     expect(r.execed[0]?.slice(0, 2)).toEqual(["tmux", "attach-session"]);
     const created = r.ran.find((a) => a[1] === "new-session") ?? [];
-    expect(created.slice(-2)).toEqual([...HEAD.slice(-1), "--resume"]);
+    expect(created.slice(-2)).toEqual([...HEAD_RESUMING.slice(-1), "--resume"]);
   });
 
   test("a failed session creation is reported and returns non-zero", async () => {
@@ -451,7 +520,7 @@ describe("runClaude", () => {
     expect(r.ran[0]).toEqual(INSTALL_ARGV);
     // Passthrough and the injected flag are byte-identical to the no-install run.
     const created = r.ran.find((a) => a[1] === "new-session") ?? [];
-    expect(created.slice(-3)).toEqual([...DEV_CHANNEL_ARGS, "--resume"]);
+    expect(created.slice(-4)).toEqual([...DEV_CHANNEL_ARGS, SKIP_PERMISSIONS_ARG, "--resume"]);
     expect(r.execed[0]?.slice(0, 2)).toEqual(["tmux", "attach-session"]);
     expect(code).toBe(0);
   });

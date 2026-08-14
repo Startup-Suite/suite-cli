@@ -314,11 +314,26 @@ three separate times.
 ## `suite claude`
 
 `suite claude [...]` runs
-`claude --dangerously-load-development-channels server:suite-channel <your args>`
+`claude --dangerously-load-development-channels server:suite-channel
+--dangerously-skip-permissions --continue <your args>`
 inside the session for this directory. Channel plugins must be on Anthropic's
 allowlist to load normally; until this one is approved every session needs that
 flag, and the wrapper injects it so that when it is approved the flag
 disappears from one place and nobody's muscle memory changes.
+
+The other two are what make an agent a **participant** rather than a prompt:
+
+* `--dangerously-skip-permissions` — a Suite runtime is unattended. Without it
+  the agent stops on the first tool-call prompt and waits for somebody who is
+  not there, and the task reads as hung when it is only asking a question.
+* `--continue` — without it every launch is a cold session, so re-attaching to
+  a runtime throws away everything it knew. In a directory with no prior
+  conversation it simply starts a fresh one, so it is always safe to pass.
+
+`--continue` stands down if you choose a session yourself — `--resume`, `-r`,
+`-c`, `--from-pr` or `--teleport` — because handing Claude two session
+instructions is how you get the wrong one. Neither flag is added twice if you
+pass it. Passthrough is otherwise unchanged and still total.
 
 * **live** → attach. **none** → create detached, then attach. `Ctrl-b d`, or
   closing the terminal, leaves the agent running; `suite claude` again
@@ -355,7 +370,7 @@ each of those cases. `suite claude -- new` is how you send the literal word
 
 On the **first run on a machine only**, `suite claude` prints one line saying it
 is loading a development channel plugin that is not yet on Anthropic's
-allowlist — a `!` in yellow, the sentence at default weight, a blank line, and
+allowlist and is skipping permission checks — a `!` in yellow, the sentence at default weight, a blank line, and
 silence on every run after that. No box and no border: a box is recurring chrome
 that reads as a permanent banner, and this is something that happened once, not
 something that lives there. It is deliberate rather than noise — **a wrapper
