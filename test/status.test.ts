@@ -72,6 +72,11 @@ function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[] } {
     config: options.config === undefined ? config() : options.config,
     configFile: "/fixture/home/.config/suite/config.json",
     tmux: { env: {}, which, run },
+    // `suite status` never probes; present because DoctorDeps requires it, and
+    // a throw is the honest stand-in for "this surface does not make the call".
+    probe: async () => {
+      throw new Error("status does not probe the tools endpoint");
+    },
     color: false,
     utf8: true,
     lines,

@@ -21,6 +21,8 @@ import {
   bearerOf,
   classifyProbe,
   suiteHostOf,
+  parseMcpHeaders,
+  toolCount,
   tokenFingerprint,
   renderCheck,
   renderReport,
@@ -30,6 +32,8 @@ import {
   type CheckId,
   type CheckResult,
   type DoctorDeps,
+  type ProbeRequest,
+  type ProbeResult,
 } from "../src/commands/doctor.ts";
 import { CHANNEL_SERVER, TOOLS_SERVER } from "../src/commands/init.ts";
 import { emptyConfig, type SuiteConfig } from "../src/config.ts";
@@ -82,6 +86,11 @@ interface FakeOptions {
   /** What `claude mcp get suite-channel` prints. */
   mcpGet?: string;
   mcpGetExit?: number;
+  /** What `claude mcp get <the tools server>` prints. */
+  toolsGet?: string;
+  toolsGetExit?: number;
+  /** What the authenticated tools probe answers, or a throw for unreachable. */
+  probe?: (request: ProbeRequest) => Promise<ProbeResult>;
   /** What `claude mcp list` prints. */
   mcpList?: string;
   env?: Record<string, string | undefined>;
@@ -109,6 +118,39 @@ function mcpGetOutput(path = PLUGIN_PATH, token = "tok_fixture_0000"): string {
   ].join("\n");
 }
 
+/**
+ * The OTHER entry, and a different shape entirely: the tools server is an HTTP
+ * entry with a URL and headers, not a stdio entry with a command and an env.
+ * The fake used to answer one output for every `mcp get`, which made it
+ * impossible for a test to distinguish reading the right entry from reading the
+ * wrong one.
+ */
+const TOOLS_TOKEN = "tok_fixture_alpha";
+
+function toolsGetOutput(url = `${SUITE_URL}/mcp`, token = TOOLS_TOKEN): string {
+  return [
+    `${TOOLS_SERVER}:`,
+    "  Scope: User config",
+    "  Type: http",
+    `  URL: ${url}`,
+    "  Headers:",
+    `    Authorization: Bearer ${token}`,
+    "    X-Fixture-Gateway-Id: gateway-fixture-1",
+    "",
+  ].join("\n");
+}
+
+/** A healthy `tools/list` reply — three invented tool names. */
+function toolsListBody(names = ["suite_reply", "task_get", "memory_view"]): string {
+  return JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: names.map((name) => ({ name })) } });
+}
+
+const REJECTED_BODY = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  error: { code: -32000, message: "unauthorized" },
+});
+
 function mcpListOutput(channel = "✔ Connected"): string {
   return [
     `${CHANNEL_SERVER}: bun ${PLUGIN_PATH} - ${channel}`,
@@ -117,13 +159,16 @@ function mcpListOutput(channel = "✔ Connected"): string {
   ].join("\n");
 }
 
-function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[] } {
+function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[]; argvs: string[][] } {
   const tools = options.tools ?? ["claude", "bun", "tmux"];
   const lines: string[] = [];
+  /** Every argv the fake `run` saw — the material of the ps-leak guard. */
+  const argvs: string[][] = [];
   const sessionState = options.sessionState ?? "none";
   const has = (name: string) => tools.includes(name);
 
   const run = async (argv: string[]) => {
+    argvs.push([...argv]);
     const [bin, ...args] = argv;
     const name = (bin ?? "").split("/").pop() ?? "";
     const ok = { exitCode: 0, stdout: "", stderr: "" };
@@ -131,6 +176,16 @@ function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[] } {
       if (args[0] === "--version") return { ...ok, stdout: `${options.version ?? HEALTHY_VERSION}\n` };
       if (args[0] === "auth") return { ...ok, stdout: `${options.auth ?? HEALTHY_AUTH}\n` };
       if (args[0] === "mcp" && args[1] === "get") {
+        // NAME-AWARE: the two entries have different shapes and different
+        // failure modes, so one fixture output for both would let a check that
+        // read the wrong entry pass.
+        if (args[2] === TOOLS_SERVER) {
+          return {
+            exitCode: options.toolsGetExit ?? 0,
+            stdout: options.toolsGet ?? toolsGetOutput(),
+            stderr: "",
+          };
+        }
         return {
           exitCode: options.mcpGetExit ?? 0,
           stdout: options.mcpGet ?? mcpGetOutput(),
@@ -164,9 +219,13 @@ function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[] } {
     config: options.config === undefined ? config() : options.config,
     configFile: "/fixture/home/.config/suite/config.json",
     tmux: { env: {}, which: (name) => (has(name) ? `/fixture/bin/${name}` : null), run },
+    probe:
+      options.probe ??
+      (async () => ({ status: 200, body: toolsListBody(), contentType: "application/json" })),
     color: options.color ?? false,
     utf8: options.utf8 ?? true,
     lines,
+    argvs,
     out: (line) => void lines.push(line),
   };
 }
@@ -192,17 +251,17 @@ async function report(options: FakeOptions = {}): Promise<{ text: string; code: 
 /* ------------------------------------------------------------------------- */
 
 describe("an all-healthy machine", () => {
-  test("passes all eight checks and exits 0", async () => {
+  test("passes all nine checks and exits 0", async () => {
     const { text, code, checks } = await report();
-    expect(checks).toHaveLength(8);
-    expect(checks.filter((c) => c.status === "pass")).toHaveLength(8);
+    expect(checks).toHaveLength(9);
+    expect(checks.filter((c) => c.status === "pass")).toHaveLength(9);
     expect(code).toBe(0);
-    expect(text).toContain("8 checks passed.");
+    expect(text).toContain("9 checks passed.");
     expect(text).not.toContain("✘");
     expect(text).not.toContain("⋯");
   });
 
-  test("the eight checks are listed in dependency order", async () => {
+  test("the nine checks are listed in dependency order", async () => {
     const { checks } = await report();
     expect(checks.map((c) => c.id)).toEqual([
       "claude",
@@ -212,6 +271,7 @@ describe("an all-healthy machine", () => {
       "plugin",
       "credentials",
       "channel",
+      "tools",
       "session",
     ]);
   });
@@ -372,20 +432,17 @@ describe("a broken upstream check skips its dependants rather than reddening the
     expect(text).toContain("skipped — needs a working plugin path");
     // Exactly one failure, not a wall of red pointing at one real cause.
     expect(checks.filter((c) => c.status === "fail")).toHaveLength(1);
-    expect(text).toContain("1 of 8 failed.");
+    expect(text).toContain("1 of 9 failed.");
   });
 
   test("no claude at all skips everything that needs it, and still exits 1", async () => {
     const { text, code, checks } = await report({ tools: ["bun", "tmux"] });
     expect(byId(checks, "claude").status).toBe("fail");
-    expect(["auth", "plugin", "credentials", "channel"].map((id) => byId(checks, id as CheckId).status)).toEqual([
-      "skip",
-      "skip",
-      "skip",
-      "skip",
-    ]);
+    expect(
+      ["auth", "plugin", "credentials", "channel", "tools"].map((id) => byId(checks, id as CheckId).status),
+    ).toEqual(["skip", "skip", "skip", "skip", "skip"]);
     expect(code).toBe(1);
-    expect(text).toContain("1 of 8 failed.");
+    expect(text).toContain("1 of 9 failed.");
   });
 });
 
@@ -420,6 +477,16 @@ describe("the report obeys the design rules", () => {
       { mcpList: mcpListOutput("✘ Failed to connect") },
       { mcpList: "" },
       { sessionState: "stale" },
+      { toolsGetExit: 1, toolsGet: "" },
+      { toolsGet: "Type: http\nno url here\n" },
+      { probe: async () => ({ status: 401, body: REJECTED_BODY, contentType: "application/json" }) },
+      { probe: async () => ({ status: 200, body: "<html></html>", contentType: "text/html" }) },
+      { probe: async () => ({ status: 200, body: "{}", contentType: "application/json" }) },
+      {
+        probe: async () => {
+          throw new Error("fixture: unreachable");
+        },
+      },
     ];
     let failures = 0;
     for (const options of configs) {
@@ -457,7 +524,7 @@ describe("the report obeys the design rules", () => {
   test("(d) the closing line is a count and an instruction, not a paragraph", async () => {
     const { text } = await report({ auth: APIKEY_AUTH, exists: () => false });
     const last = text.trimEnd().split("\n").pop() ?? "";
-    expect(last).toContain("2 of 8 failed.");
+    expect(last).toContain("2 of 9 failed.");
     expect(last).toContain("Fix the first one, run suite doctor again.");
     expect(last.split(".").filter((s) => s.trim() !== "")).toHaveLength(2);
   });
@@ -850,6 +917,180 @@ describe.if(HAVE_TMUX)("against a real tmux", () => {
     },
     90_000,
   );
+});
+
+/* ------------------------------------------------------------------------- */
+/* The tools endpoint: an AUTHENTICATED call, which is the whole point         */
+/* ------------------------------------------------------------------------- */
+
+describe("the tools api check", () => {
+  /**
+   * THE POSITIVE CONTROL. Every assertion below is about the check firing; a
+   * check that fires on every input is indistinguishable from one that always
+   * fires, so the SAME fixture machine must also go green.
+   */
+  test("goes green on a healthy tools list, on the same fixture machine", async () => {
+    const { text, code, checks } = await report();
+    const check = byId(checks, "tools");
+    expect(check.status).toBe("pass");
+    expect(code).toBe(0);
+    expect(text).toContain("authenticated");
+    // The count is the proof the call succeeded, and it is not a secret.
+    expect(text).toContain("3 tools");
+  });
+
+  test("a 401 with a JSON-RPC error body is the credential being rejected", async () => {
+    const { text, code, checks } = await report({
+      probe: async () => ({ status: 401, body: REJECTED_BODY, contentType: "application/json" }),
+    });
+    const check = byId(checks, "tools");
+    expect(check.status).toBe("fail");
+    expect(code).toBe(1);
+    expect(text).toContain("credential rejected");
+    // The consequence names the invisible symptom, not the status code.
+    expect(text).toContain("exposes no Suite tools");
+    expect(text).toContain("nothing anywhere prints an error");
+    // It reached the application, so nothing in front of Suite is implicated.
+    expect(text).toContain("The request reached Suite");
+    // Expired and never-valid look identical from here: re-enter, do not mint.
+    expect(text).toContain("rather than minting a new one");
+    expect(text).toContain("→ suite init");
+    // Exactly one runnable line, so the reader has one thing to do.
+    expect(text.split("\n").filter((l) => l.includes("→")).length).toBe(1);
+    // The secret is nowhere in the report.
+    expect(text).not.toContain(TOOLS_TOKEN);
+  });
+
+  /**
+   * THE TEXT DIFFERENCE IS THE TICKET. `rejected` and `unreachable` need
+   * OPPOSITE fixes — one is a wrong credential Suite refused, the other is
+   * nothing answering at all — so a test asserting only "it failed" would pass
+   * on a doctor that printed the same paragraph for both.
+   */
+  test("rejected and unreachable print different text", async () => {
+    const rejected = await report({
+      probe: async () => ({ status: 401, body: REJECTED_BODY, contentType: "application/json" }),
+    });
+    const unreachable = await report({
+      probe: async () => {
+        throw new Error("fixture: getaddrinfo ENOTFOUND");
+      },
+    });
+    const line = (r: { text: string }) =>
+      r.text.split("\n").find((l) => l.includes("tools api")) ?? "";
+
+    expect(byId(unreachable.checks, "tools").status).toBe("fail");
+    expect(unreachable.text).toContain("unreachable");
+    expect(unreachable.text).toContain(`→ claude mcp get ${TOOLS_SERVER}`);
+    expect(line(rejected)).not.toBe(line(unreachable));
+    expect(rejected.text).not.toBe(unreachable.text);
+    // And the remedies differ, which is the part that actually costs an evening.
+    const remedy = (r: { checks: CheckResult[] }) => {
+      const c = byId(r.checks, "tools");
+      return c.status === "fail" ? c.remedy : "";
+    };
+    expect(remedy(rejected)).not.toBe(remedy(unreachable));
+  });
+
+  test("an HTML answer is the gateway, and says the bearer was not evaluated", async () => {
+    const { text, checks } = await report({
+      probe: async () => ({ status: 200, body: "<!DOCTYPE html><html><body>sign in</body></html>", contentType: "text/html; charset=utf-8" }),
+    });
+    expect(byId(checks, "tools").status).toBe("fail");
+    expect(text).toContain("blocked before Suite");
+    expect(text).toContain("never");
+    expect(text).toContain("not even evaluated");
+    expect(text).toContain("→ suite init");
+  });
+
+  test("a 200 carrying no tools is NEVER green", async () => {
+    const { text, code, checks } = await report({
+      probe: async () => ({
+        status: 200,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, result: { tools: [] } }),
+        contentType: "application/json",
+      }),
+    });
+    expect(byId(checks, "tools").status).toBe("fail");
+    expect(code).toBe(1);
+    expect(text).toContain("response unreadable");
+  });
+
+  test("a missing or unreadable entry fails, mirroring the plugin check", async () => {
+    const missing = await report({ toolsGetExit: 1, toolsGet: "" });
+    expect(byId(missing.checks, "tools").status).toBe("fail");
+    expect(missing.text).toContain("not registered");
+
+    const weird = await report({ toolsGet: "Type: http\nno url on any line\n" });
+    expect(byId(weird.checks, "tools").status).toBe("fail");
+    expect(weird.text).toContain("entry unreadable");
+    expect(weird.text).toContain("→ suite init");
+  });
+
+  test("without the claude cli it is ⋯ skipped, not red", async () => {
+    const { checks } = await report({ tools: ["bun", "tmux"] });
+    const check = byId(checks, "tools");
+    expect(check.status).toBe("skip");
+    expect(check.status === "skip" && check.reason).toBe("needs the claude cli");
+  });
+
+  /**
+   * THE ps-LEAK GUARD, in code rather than in a reviewer's head.
+   *
+   * `run` puts argv on a command line and a command line is world-readable
+   * through `ps`, so the probe must be an in-process fetch. Recording every argv
+   * the fake sees and asserting none of them carries the token is the only way
+   * this stays true after someone "simplifies" the probe into a spawned command.
+   */
+  test("the bearer never reaches an argv", async () => {
+    const deps = fakeDeps();
+    await runChecks(deps);
+    expect(deps.argvs.length).toBeGreaterThan(3);
+    for (const argv of deps.argvs) {
+      for (const word of argv) {
+        expect(word).not.toContain(TOOLS_TOKEN);
+        expect(word.toLowerCase()).not.toContain("bearer");
+      }
+    }
+    // Anti-vacuity: the recorder DOES capture argv, so an empty sweep would not
+    // be what made this green.
+    expect(deps.argvs.flat()).toContain("--version");
+  });
+
+  test("the probe carries the entry's headers verbatim, not a hardcoded set", async () => {
+    const seen: ProbeRequest[] = [];
+    await report({
+      probe: async (request) => {
+        seen.push(request);
+        return { status: 200, body: toolsListBody(), contentType: "application/json" };
+      },
+    });
+    const request = seen[0];
+    expect(request).toBeDefined();
+    expect(request!.url).toBe(`${SUITE_URL}/mcp`);
+    expect(request!.headers.Authorization).toBe(`Bearer ${TOOLS_TOKEN}`);
+    // Whatever the operator registered rides along; the check knows no names.
+    expect(request!.headers["X-Fixture-Gateway-Id"]).toBe("gateway-fixture-1");
+  });
+
+  test("headers are lifted from the headers block only", () => {
+    const headers = parseMcpHeaders(toolsGetOutput());
+    expect(headers.Authorization).toBe(`Bearer ${TOOLS_TOKEN}`);
+    expect(headers["X-Fixture-Gateway-Id"]).toBe("gateway-fixture-1");
+    // A URL line and a Type line are not headers, however much they look it.
+    expect(Object.keys(headers)).not.toContain("URL");
+    expect(Object.keys(headers)).not.toContain("Type");
+    expect(Object.keys(headers)).not.toContain("Scope");
+    // The argv echo shape too.
+    expect(parseMcpHeaders(`-H 'X-Fixture-Two: two'`)["X-Fixture-Two"]).toBe("two");
+    expect(parseMcpHeaders(mcpGetOutput())).toEqual({});
+  });
+
+  test("the tool count reads the list length, and null when there is none", () => {
+    expect(toolCount(toolsListBody(["a", "b"]))).toBe(2);
+    expect(toolCount(REJECTED_BODY)).toBeNull();
+    expect(toolCount("not json")).toBeNull();
+  });
 });
 
 /* ------------------------------------------------------------------------- */

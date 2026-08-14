@@ -116,6 +116,7 @@ export const CHECK_IDS = [
   "plugin",
   "credentials",
   "channel",
+  "tools",
   "session",
 ] as const;
 
@@ -303,6 +304,49 @@ export function parseMcpHeaderValue(output: string, headerName: string): string 
   return null;
 }
 
+/**
+ * EVERY header recorded on an MCP entry, by name.
+ *
+ * Lifted GENERICALLY — whatever the operator registered — and never against a
+ * hardcoded list. The `Authorization` header is ours, but a Suite behind an
+ * identity-aware access proxy carries additional operator-specific headers whose
+ * names are that operator's business; a probe that replayed only the ones we
+ * happened to think of would be answered by the gateway instead of by Suite and
+ * would then blame the wrong thing.
+ *
+ * Only lines inside a `Headers:` block and `-H '…'` argv echoes are read, so a
+ * `Type: http` or `URL: …` line can never be mistaken for a header. This
+ * RETURNS SECRETS (see {@link parseMcpHeaderValue}): its only permitted caller
+ * is the probe request builder, which puts the values straight into an outbound
+ * request.
+ */
+export function parseMcpHeaders(output: string): Record<string, string> {
+  const headers: Record<string, string> = {};
+  let inBlock = false;
+  for (const raw of output.split("\n")) {
+    const trimmed = raw.trim();
+    if (trimmed === "") {
+      inBlock = false;
+      continue;
+    }
+    // A bare `Name:` line opens a section; only the headers section counts, and
+    // any other section (`Environment:`) closes it.
+    if (/^[A-Za-z][A-Za-z0-9 _-]*:\s*$/.test(trimmed)) {
+      inBlock = /^headers?\s*:\s*$/i.test(trimmed);
+      continue;
+    }
+    const isFlag = /^-H\s+/.test(trimmed);
+    if (!isFlag && !inBlock) continue;
+    const line = trimmed.replace(/^-H\s+/, "").replace(/^["']|["']$/g, "").trim();
+    const m = /^([A-Za-z0-9-]+)\s*:\s*(.*)$/.exec(line);
+    if (m === null) continue;
+    const name = m[1] ?? "";
+    const value = (m[2] ?? "").trim().replace(/^["']|["']$/g, "").trim();
+    if (value !== "") headers[name] = value;
+  }
+  return headers;
+}
+
 /** The credential out of an `Authorization` header value, or null. */
 export function bearerOf(header: string): string | null {
   const m = /^bearer\s+(.+)$/i.exec(header.trim());
@@ -362,6 +406,30 @@ export interface ProbeResult {
   status: number;
   body: string;
   contentType: string;
+}
+
+/** One outbound probe request: a URL and the headers lifted off the entry. */
+export interface ProbeRequest {
+  url: string;
+  headers: Record<string, string>;
+}
+
+/** The JSON-RPC call the probe makes. `tools/list` — the thing that was empty. */
+export const TOOLS_LIST_BODY = JSON.stringify({
+  jsonrpc: "2.0",
+  id: 1,
+  method: "tools/list",
+  params: {},
+});
+
+/** How many tools a successful `tools/list` returned, or null. */
+export function toolCount(body: string): number | null {
+  try {
+    const tools = (JSON.parse(body) as { result?: { tools?: unknown } } | null)?.result?.tools;
+    return Array.isArray(tools) ? tools.length : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -516,6 +584,15 @@ export interface DoctorDeps {
   cwd: string;
   /** Run a child process and collect its output. */
   run(argv: string[]): Promise<RunResult>;
+  /**
+   * Make ONE authenticated HTTP request and return what came back.
+   *
+   * IN-PROCESS `fetch`, NEVER A SPAWNED `curl`. {@link DoctorDeps.run} puts its
+   * argv on a command line, and a command line on this box is readable by every
+   * other process through `ps`; the bearer must therefore never appear in one.
+   * A test asserts that no argv `run` ever receives contains the token.
+   */
+  probe(request: ProbeRequest): Promise<ProbeResult>;
   which(name: string): string | null;
   /** Does this absolute path exist? Injected so a test needs no real checkout. */
   exists(path: string): boolean;
@@ -650,7 +727,10 @@ export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
   checks.push(credentialsCheck(deps, claudePath, entry, pluginOk));
   checks.push(await channelCheck(deps, claudePath, pluginOk));
 
-  // 8. Session health, via stage 4's three-way detection ------------------
+  // 8. The tools endpoint — an AUTHENTICATED call, not a reachability ping ---
+  checks.push(await toolsCheck(deps, claudePath));
+
+  // 9. Session health, via stage 4's three-way detection ------------------
   checks.push(await sessionCheck(deps, tmuxPath));
 
   return checks;
@@ -902,6 +982,142 @@ export async function toolsStatus(deps: DoctorDeps, claudePath: string): Promise
   return parseServerStatus(`${r.stdout}\n${r.stderr}`, TOOLS_SERVER);
 }
 
+/**
+ * Does the tools MCP entry's credential ACTUALLY AUTHENTICATE?
+ *
+ * WHY THIS CHECK EXISTS. A 401 on the tools HTTP MCP entry is INVISIBLE FROM
+ * THE CLAUDE SIDE. The server registers, `claude mcp list` shows the entry as
+ * content, and it simply EXPOSES NO TOOLS. It presents as SILENCE, NOT AN
+ * ERROR — which is how a real runtime spent an evening receiving work it had no
+ * tool to answer with, while every surface it could see reported healthy.
+ *
+ * So this check makes an AUTHENTICATED CALL and asserts a successful tools
+ * response. "The endpoint is reachable" and "the entry is registered" are
+ * different and near-worthless claims: both are true in exactly the failure
+ * this exists to catch.
+ *
+ * The request is built here from the entry's own headers — every one of them,
+ * whatever the operator registered — and issued through {@link DoctorDeps.probe},
+ * which is in-process `fetch`. Never a spawned command: an argv is world-
+ * readable through `ps`.
+ */
+async function toolsCheck(deps: DoctorDeps, claudePath: string | null): Promise<CheckResult> {
+  const id = "tools";
+  const label = "tools api";
+  if (claudePath === null) {
+    return { id, label, status: "skip", reason: "needs the claude cli" };
+  }
+  const entry = await deps.run([claudePath, "mcp", "get", TOOLS_SERVER]);
+  const output = `${entry.stdout}\n${entry.stderr}`;
+  if (entry.exitCode !== 0) {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "not registered",
+      consequence: [
+        `No ${TOOLS_SERVER} MCP entry exists, so this runtime has no Suite tools`,
+        "at all and cannot answer the work the channel delivers.",
+      ],
+      remedy: "suite init",
+    };
+  }
+  const url = parseMcpHttpUrl(output);
+  if (url === null) {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "entry unreadable",
+      detail: compact(output),
+      consequence: [
+        "We could not find the endpoint URL in the MCP entry, so we cannot tell",
+        "whether this runtime's credential is accepted by Suite.",
+      ],
+      remedy: "suite init",
+    };
+  }
+
+  // Headers verbatim off the entry — the secret goes straight into the request
+  // and is never held anywhere it could be rendered.
+  const headers = {
+    ...parseMcpHeaders(output),
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+  };
+
+  let result: ProbeResult | null = null;
+  try {
+    result = await deps.probe({ url, headers });
+  } catch {
+    result = null;
+  }
+  const verdict: ProbeVerdict = result === null ? "unreachable" : classifyProbe(result);
+
+  if (verdict === "ok") {
+    const count = toolCount(result?.body ?? "") ?? 0;
+    // The count is the proof the call succeeded, and it is not a secret.
+    return { id, label, status: "pass", value: "authenticated", detail: `${count} tools` };
+  }
+  if (verdict === "rejected") {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "credential rejected",
+      consequence: [
+        // Two lines, per rule (b). The first fixes BLAME — the request reached
+        // the application, so the gateway's credentials are not implicated.
+        "The request reached Suite and Suite refused the credential: the entry stays registered and reachable and exposes no Suite tools at all,",
+        // The second is the advice. An expired credential and one that was never
+        // valid present identically from here, so this points at re-entering the
+        // credential known to work rather than at minting a new one.
+        "so this runtime receives work it cannot answer and nothing anywhere prints an error. Re-enter the credential you know works — the same one normally serves both entries — rather than minting a new one.",
+      ],
+      remedy: "suite init",
+    };
+  }
+  if (verdict === "gateway-challenge") {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "blocked before Suite",
+      consequence: [
+        "The gateway in front of Suite answered instead, so the request never reached the application",
+        "and the credential was not even evaluated: what is wrong is the additional headers, not the token.",
+      ],
+      remedy: "suite init",
+    };
+  }
+  if (verdict === "unreachable") {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "unreachable",
+      detail: url,
+      consequence: [
+        "Nothing answered at all: the endpoint URL, DNS or this network is wrong, so no statement",
+        "about the credential can be made in either direction.",
+      ],
+      remedy: `claude mcp get ${TOOLS_SERVER}`,
+    };
+  }
+  return {
+    id,
+    label,
+    status: "fail",
+    value: "response unreadable",
+    detail: compact(`${result?.status ?? ""} ${result?.body ?? ""}`),
+    consequence: [
+      "We got a response we can read as neither a tool list nor a refusal, so the tools this runtime",
+      "actually has are unknown — and a 200 carrying no tools lands here and is never green.",
+    ],
+    remedy: `claude mcp get ${TOOLS_SERVER}`,
+  };
+}
+
 async function sessionCheck(deps: DoctorDeps, tmuxPath: string | null): Promise<CheckResult> {
   if (tmuxPath === null) {
     return { id: "session", label: "session", status: "skip", reason: "needs tmux" };
@@ -974,6 +1190,21 @@ export async function liveDoctorDeps(
     utf8: utf8Enabled(env),
     out: (line) => console.log(line),
     run: (argv) => tmux.run(argv),
+    // In-process fetch, deliberately: a spawned curl would put the bearer on a
+    // command line, and a command line is readable by every process on the box.
+    probe: async ({ url, headers }) => {
+      const response = await fetch(url, {
+        method: "POST",
+        headers,
+        body: TOOLS_LIST_BODY,
+        signal: AbortSignal.timeout(5_000),
+      });
+      return {
+        status: response.status,
+        body: await response.text(),
+        contentType: response.headers.get("content-type") ?? "",
+      };
+    },
   };
 }
 
