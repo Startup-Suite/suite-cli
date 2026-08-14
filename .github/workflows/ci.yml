@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+
+      - name: Install shellcheck (macOS)
+        if: runner.os == 'macOS'
+        run: brew install shellcheck
+
+      # install.sh is POSIX sh regardless of the CLI language, so it is linted
+      # on both platforms.
+      - name: shellcheck
+        run: shellcheck install.sh bin/suite.template
+
+      - name: POSIX syntax check
+        run: sh -n install.sh
+
+      # The tmux integration tests are the only evidence that a session
+      # survives a closed terminal. A runner without tmux would SKIP them and
+      # still go green, so tmux is installed rather than assumed.
+      - name: Install tmux (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y tmux
+
+      - name: Install tmux (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
