@@ -46,6 +46,28 @@ Stage 1 ships the installer and the verb dispatch; the verbs themselves are
 stubs until the later stages land. This README is a placeholder and is
 rewritten in full, with every design decision justified, in stage 7.
 
+## Credentials and config
+
+Credentials are **pasted in**: you click Federate in the Suite UI and paste the
+values at the prompt. There is deliberately no device-code or `suite login`
+flow yet — it is deferred, and when it lands it becomes another provider behind
+the same credential store, changing nothing else.
+
+Nothing you paste is echoed. The token confirmation is a character count
+(`set, 44 chars`) and never a prefix or a last-four tail: a tail is still a
+partial echo, and a count already answers the only question you have.
+
+`~/.config/suite/config.json` (or `$XDG_CONFIG_HOME/suite/config.json`) is the
+repeatable-install file. It holds the Suite URL, the runtime id, the **names**
+of any extra headers, and the session-naming preference. **It never holds a
+secret value** — a test asserts the serialised bytes contain neither the token
+nor any header value.
+
+Writes default to **user scope**. If a write would land inside a git
+repository, `suite` asks `git check-ignore` and **refuses** — non-zero exit, a
+message naming the path — unless the path is ignored. Refusal rather than a
+warning, because a warned-then-written credential file is a committed one.
+
 ## Language
 
 TypeScript on [bun](https://bun.sh). `bun` is already a hard dependency of the
