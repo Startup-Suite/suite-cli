@@ -25,7 +25,7 @@
  */
 import { resolve } from "node:path";
 import { existsSync, statSync } from "node:fs";
-import { mkdir } from "node:fs/promises";
+import { mkdir, writeFile } from "node:fs/promises";
 import {
   createStore,
   solicitCredentials,
@@ -36,6 +36,7 @@ import {
   type SpawnResult,
 } from "../secrets.ts";
 import { dataDir } from "../paths.ts";
+import { CLAUDE_MD, claudeMdPlan } from "../claude_md.ts";
 import { readConfig, writeConfig, type SuiteConfig } from "../config.ts";
 import { nextCommand, row } from "../ui.ts";
 
@@ -85,6 +86,8 @@ export interface InitDeps {
   run: Runner;
   platform: NodeJS.Platform;
   isTTY: boolean;
+  /** Where a starting CLAUDE.md is written. The agent's working directory. */
+  cwd: string;
   out(line: string): void;
 }
 
@@ -503,6 +506,8 @@ export interface InitResult {
   tmuxMissing: boolean;
   checkout: CheckoutOutcome;
   configPath: string;
+  /** `write` when one was created, `skip` when the operator's own was kept. */
+  claudeMd: "write" | "skip";
 }
 
 export async function runInit(deps: InitDeps, options: InitOptions = {}): Promise<InitResult> {
@@ -602,6 +607,17 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
   const configFile = await writeConfig(config, { env: deps.env });
   say(row("config", configFile));
 
+  // 5b. a starting CLAUDE.md, and never a replacement for one ------------
+  const claudeMd = claudeMdPlan(resolve(deps.cwd, "CLAUDE.md"), existsSync(resolve(deps.cwd, "CLAUDE.md")));
+  if (claudeMd.action === "write") {
+    await writeFile(claudeMd.path, CLAUDE_MD, "utf8");
+    say(row("CLAUDE.md", claudeMd.path, "written"));
+  } else {
+    // Yours the moment it exists. Re-running init must never cost an agent the
+    // operating knowledge it has accumulated in this file.
+    say(row("CLAUDE.md", claudeMd.path, "present, left alone"));
+  }
+
   // 6. both MCP entries, via claude mcp add -----------------------------
   const token = deps.store.get(TOKEN_KEY) ?? "";
   const tokenLiteral = options.tokenFromEnv === undefined ? token : envReference(options.tokenFromEnv);
@@ -643,6 +659,7 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
     tmuxMissing: !tmux.present,
     checkout: outcome,
     configPath: configFile,
+    claudeMd: claudeMd.action,
   };
 }
 
@@ -654,6 +671,7 @@ export function liveDeps(prompter: Prompter, store: CredentialStore = createStor
     store,
     platform: process.platform,
     isTTY: Boolean(process.stdout.isTTY),
+    cwd: process.cwd(),
     out: (line) => void process.stdout.write(`${line}\n`),
     run: (argv, options) => spawnWithSecrets(argv, store, options),
   };
