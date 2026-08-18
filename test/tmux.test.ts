@@ -24,6 +24,7 @@ import {
   sanitizeSessionName,
   sessionNameFor,
   sessionNameFromConfig,
+  sessionOptionsArgv,
   singleQuote,
   type ProcessRow,
   type TmuxDeps,
@@ -500,4 +501,28 @@ describe.if(HAVE_TMUX)("against a real tmux", () => {
     },
     30_000,
   );
+});
+
+/* ------------------------------------------------------------------------- */
+/* Session options                                                            */
+/* ------------------------------------------------------------------------- */
+
+describe("session options", () => {
+  test("mouse mode is set ON, scoped to the named session", () => {
+    expect(sessionOptionsArgv("suite-ledger")).toEqual([
+      ["tmux", "set-option", "-t", "suite-ledger", "mouse", "on"],
+    ]);
+  });
+
+  test("no option is ever set globally", () => {
+    /*
+     * The whole point of the session scope: a `-g` here would reach tmux
+     * sessions this CLI never created. Asserted on the argv rather than on the
+     * comment, because a comment cannot be told from a described bug.
+     */
+    for (const argv of sessionOptionsArgv("suite-ledger")) {
+      expect(argv).not.toContain("-g");
+      expect(argv[2]).toBe("-t");
+    }
+  });
 });

@@ -304,6 +304,24 @@ describe("live / none / stale", () => {
     expect(plan.kill).not.toContain("kill-server");
   });
 
+  test("a NEW session gets mouse mode; a LIVE one is never re-configured", () => {
+    /*
+     * The pairing is the test. Configuring on every attach would silently
+     * change a session the user is already working in, so the refutation
+     * (live => undefined) carries as much weight as the positive case.
+     */
+    expect(planFor("none").configure).toEqual([
+      ["tmux", "set-option", "-t", "suite-ledger-0000", "mouse", "on"],
+    ]);
+    expect(planFor("live").configure).toBeUndefined();
+  });
+
+  test("a recycled STALE session is configured like the new session it is", () => {
+    expect(planFor("stale").configure).toEqual([
+      ["tmux", "set-option", "-t", "suite-ledger-0000", "mouse", "on"],
+    ]);
+  });
+
   test("inside tmux we switch-client, never nest an attach", () => {
     const plan = planFor("live", { env: { TMUX: "/tmp/tmux-501/default,123,0" } });
     expect(plan.enter?.kind).toBe("switch");

@@ -238,6 +238,29 @@ one session. The kill is `tmux kill-session -t <name>`, scoped to that single
 name; `kill-server` is never used anywhere in this tool, because it would take
 down every other agent on the box.
 
+### Scrolling: sessions are created with mouse mode on
+
+A session `suite` creates gets `mouse on`, **scoped to that session** — never
+`-g`, because a global set would reach tmux sessions this CLI never created.
+
+Without it, tmux translates a wheel event inside a full-screen application into
+**arrow keys**, so scrolling an agent walks its input history instead of its
+scrollback and the agent reports something like *"scroll wheel is sending arrow
+keys — use PgUp/PgDn to scroll"*. With mouse mode on, the wheel reaches the
+pane's scrollback.
+
+The trade, stated because it is the reason not to do this blindly: mouse mode
+also routes click-drag to tmux's selection rather than the terminal's, so a
+native selection needs the terminal's override modifier held down — **Option**
+on macOS, **Shift** elsewhere.
+
+Only *new* sessions are configured. Reattaching never re-configures a session
+you are already working in. To change one that already exists, or to undo it:
+
+```sh
+tmux set-option -t <session> mouse on    # or: off
+```
+
 ### Three states, not two
 
 `suite` reports **live**, **stale**, or **none** for a session:

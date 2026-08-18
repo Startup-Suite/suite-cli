@@ -39,6 +39,7 @@ import {
   liveTmuxDeps,
   nestingPlan,
   planLaunch,
+  sessionOptionsArgv,
   sessionNameFromConfig,
   TMUX,
   type NestingPlan,
@@ -380,6 +381,14 @@ export interface ClaudePlan {
   kill?: string[];
   /** `tmux new-session -d` argv, when a session must be created. */
   create?: string[];
+  /**
+   * `tmux set-option` argvs applied to a freshly created session.
+   *
+   * Only ever set alongside {@link ClaudePlan.create}: an existing session the
+   * user has been working in keeps whatever options it has, so reattaching
+   * never silently re-configures a session under them.
+   */
+  configure?: string[][];
   /** How to reach the session once it exists. */
   enter?: NestingPlan;
   /** Direct exec: `-p`, or tmux absent. No session, no attach. */
@@ -424,7 +433,13 @@ export function decide(input: DecideInput, deps: TmuxDeps): ClaudePlan {
   }
 
   notes.push(createdNotice(input.session));
-  return { notes, kill, create: launch.argv, enter: nestingPlan(input.session, input.env) };
+  return {
+    notes,
+    kill,
+    create: launch.argv,
+    configure: sessionOptionsArgv(input.session),
+    enter: nestingPlan(input.session, input.env),
+  };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -522,6 +537,17 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     if (created.exitCode !== 0) {
       deps.err(`tmux could not create ${session}: ${created.stderr.trim()}`);
       return created.exitCode;
+    }
+    /*
+     * A display option that will not apply is not a reason to refuse the agent
+     * the user asked for — but it is not allowed to fail quietly either, or the
+     * next person debugging their scroll wheel has nothing to read.
+     */
+    for (const argv of plan.configure ?? []) {
+      const set = await deps.tmux.run(argv);
+      if (set.exitCode !== 0) {
+        deps.err(`tmux could not apply ${argv.slice(4).join(" ")} to ${session}: ${set.stderr.trim()}`);
+      }
     }
   }
 
