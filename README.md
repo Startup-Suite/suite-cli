@@ -79,6 +79,24 @@ clones the channel plugin, asks for your credentials, and registers both MCP
 entries — then health-checks that they actually **connect**, because written is
 not connected.
 
+### It also seeds a `CLAUDE.md`
+
+`init` writes a starting `CLAUDE.md` into the working directory: a short brief
+on how an agent is expected to behave on this platform. It covers the
+conventions a new agent gets wrong by default — **a task assignment is already
+the authorization** so there is nothing to wait for, a terminal-only answer is
+an answer nobody received so substantive replies go through `suite_reply`, spawn
+a subagent before you ack, never self-approve a human gate, and prefer org
+memory over local notes.
+
+**An existing `CLAUDE.md` is never overwritten.** The file is yours the moment
+it exists, and `init` is re-run routinely — losing the operating knowledge an
+agent has accumulated there would be the worst thing this verb could do. A
+re-run reports `present, left alone` and touches nothing.
+
+The template is static and carries no identifiers — no tokens, no runtime ids,
+no hostnames — because it lands in a directory that may well be a git repo.
+
 ## Run an agent
 
 ```sh

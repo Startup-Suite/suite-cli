@@ -124,6 +124,7 @@ function makeDeps(
     store,
     platform: "darwin",
     isTTY: false,
+    cwd: fixture.root,
     lines,
     out: (l) => void lines.push(l),
     run: (argv, opts) => spawnWithSecrets(argv, store, { ...opts, env: fixture.env }),
@@ -214,6 +215,36 @@ describe("init on a machine where nothing is installed", () => {
       expect(line).not.toContain(TOKEN);
       expect(line).not.toContain(HEADER_VALUE);
     }
+  });
+
+  test("writes a starting CLAUDE.md into the working directory", async () => {
+    const fx = makeFixture();
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
+
+    const result = await runInit(deps);
+
+    expect(result.claudeMd).toBe("write");
+    const written = await Bun.file(resolve(fx.root, "CLAUDE.md")).text();
+    expect(written).toContain("assignment IS the authorization");
+    expect(deps.lines.join("\n")).toContain("CLAUDE.md");
+  });
+
+  test("an operator's own CLAUDE.md survives a re-run untouched", async () => {
+    /*
+     * The pairing is the test. Init is re-run routinely, and this file is where
+     * an agent accumulates its operating knowledge — overwriting it would
+     * destroy exactly the thing the template exists to seed. Asserted on the
+     * bytes, not on the log line, because a step can report "left alone" and
+     * still have written.
+     */
+    const fx = makeFixture();
+    const mine = resolve(fx.root, "CLAUDE.md");
+    await Bun.write(mine, "# mine\n\nhard-won notes\n");
+
+    const result = await runInit(makeDeps(fx, scriptedPrompter(credentialAnswers())));
+
+    expect(result.claudeMd).toBe("skip");
+    expect(await Bun.file(mine).text()).toBe("# mine\n\nhard-won notes\n");
   });
 
   test("offers the bun install rather than performing it unasked", async () => {
