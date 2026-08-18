@@ -516,3 +516,32 @@ export function liveTmuxDeps(env: Record<string, string | undefined> = process.e
     },
   };
 }
+
+/* ------------------------------------------------------------------------- */
+/* Session options                                                            */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Options applied to a session immediately after it is created.
+ *
+ * SCOPED TO THE SESSION, never `-g`. A global set would reach every tmux
+ * session on the box including ones this CLI did not create, which is not ours
+ * to change; a session-scoped set leaves the user's own tmux exactly as they
+ * configured it.
+ *
+ * `mouse on` exists for one observable defect. With mouse mode OFF, tmux
+ * translates a wheel event inside a full-screen application into arrow keys —
+ * so scrolling an agent TUI walks its input history instead of its scrollback,
+ * and the agent reports something like "scroll wheel is sending arrow keys".
+ * With mouse mode ON the wheel reaches the pane's scrollback (or the
+ * application, if it asked for mouse reporting) and the arrow-key translation
+ * never happens.
+ *
+ * THE TRADE, stated because it is the reason not to do this blindly: mouse mode
+ * also routes click-drag to tmux's own selection instead of the terminal's, so
+ * a native selection needs the terminal's override modifier (Option on macOS,
+ * Shift elsewhere) held down.
+ */
+export function sessionOptionsArgv(session: string): string[][] {
+  return [[TMUX, "set-option", "-t", session, "mouse", "on"]];
+}
