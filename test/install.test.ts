@@ -11,13 +11,25 @@
  */
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const INSTALL_SH = join(REPO_ROOT, "install.sh");
+
+/*
+ * The version is read from the manifest rather than pinned as a literal.
+ *
+ * Not circularity: the property under test is that all THREE surfaces — the
+ * installer's banner, the POSIX launcher it renders, and the copy it stages —
+ * agree with package.json, which is the single source of truth install.sh
+ * itself reads. A literal here would assert nothing extra and would red every
+ * one of these tests on an ordinary version bump, which is how a pin teaches
+ * people to edit tests as a matter of routine.
+ */
+const VERSION: string = JSON.parse(readFileSync(join(REPO_ROOT, "package.json"), "utf8")).version;
 
 let workRoot: string;
 let tarball: string;
@@ -87,13 +99,13 @@ describe("install.sh", () => {
     const r = runInstaller(makeHome());
     expect(r.status).toBe(0);
     expect(existsSync(r.dest)).toBe(true);
-    expect(r.stdout).toContain("suite 0.1.0");
+    expect(r.stdout).toContain(`suite ${VERSION}`);
     // The library was staged too, not just the launcher.
     expect(existsSync(join(r.home, ".local", "share", "suite", "cli", "src", "cli.ts"))).toBe(true);
     // The installed entrypoint answers --version without needing bun.
     const v = spawnSync(r.dest, ["--version"], { encoding: "utf8" });
     expect(v.status).toBe(0);
-    expect(v.stdout.trim()).toBe("0.1.0");
+    expect(v.stdout.trim()).toBe(VERSION);
   });
 
   test("a second run is idempotent", () => {
@@ -129,7 +141,7 @@ describe("install.sh", () => {
     const accepted = runInstaller(home, { stdin: "y\n" });
     expect(accepted.status).toBe(0);
     expect(accepted.stdout).toContain("suite 0.0.9 is already installed");
-    expect(spawnSync(dest, ["--version"], { encoding: "utf8" }).stdout.trim()).toBe("0.1.0");
+    expect(spawnSync(dest, ["--version"], { encoding: "utf8" }).stdout.trim()).toBe(VERSION);
   });
 
   test("a failed fetch leaves NO file at the destination and exits non-zero", () => {
