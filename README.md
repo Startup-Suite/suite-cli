@@ -171,6 +171,21 @@ than left to be inferred from behaviour:
 5. [**What happens when tmux is absent**](#when-tmux-is-absent) — a direct run
    with a loud warning. **Never a silent fallback.**
 
+## Versioning
+
+`package.json` holds the version, and it is the only place it lives —
+`suite --version`, the POSIX launcher and `install.sh`'s banner all read it.
+
+**Bump it in the same PR as the change**, and add the `CHANGELOG.md` entry in
+that same PR. Someone running an installed CLI answers "is there anything new
+since mine?" by comparing `suite --version` against the changelog; a change that
+ships without a bump is invisible to them, and a bump without an entry tells
+them something moved but not what.
+
+Minor for a new capability or a changed default, patch for a fix that changes no
+behaviour anyone relied on. A test asserts the changelog's newest heading equals
+the shipped version, so the two cannot drift apart silently.
+
 ## Credentials and config
 
 Credentials are **pasted in**: you click Federate in the Suite UI and paste the

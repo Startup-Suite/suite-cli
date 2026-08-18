@@ -22,6 +22,14 @@ import { buildLeanBin, leanPath, LEAN_TOOLS, EXCLUDED_TOOLS, MissingHostToolErro
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TEMPLATE = join(REPO_ROOT, "bin", "suite.template");
 
+/*
+ * An INVENTED version, deliberately not the manifest's. These tests are about
+ * the launcher answering with whatever install.sh substituted into it — so a
+ * value that cannot coincide with the real one keeps the assertion honest: if
+ * substitution silently failed, matching the manifest by luck would look green.
+ */
+const FIXTURE_VERSION = "9.9.9-fixture";
+
 let workRoot: string;
 
 beforeAll(() => {
@@ -55,7 +63,7 @@ function makeSandbox(): Sandbox {
 
   const rendered = readFileSync(TEMPLATE, "utf8")
     .replaceAll("@SUITE_LIB_DIR@", libDir)
-    .replaceAll("@SUITE_VERSION@", "0.1.0");
+    .replaceAll("@SUITE_VERSION@", FIXTURE_VERSION);
   const suite = join(binDir, "suite");
   writeFileSync(suite, rendered);
   chmodSync(suite, 0o755);
@@ -256,7 +264,7 @@ describe("suite launcher with bun absent", () => {
     const sandbox = makeSandbox();
     const r = runSuite(sandbox, ["--version"]);
     expect(r.status).toBe(0);
-    expect(r.stdout.trim()).toBe("0.1.0");
+    expect(r.stdout.trim()).toBe(FIXTURE_VERSION);
     expect(r.stderr).toBe("");
   });
 
