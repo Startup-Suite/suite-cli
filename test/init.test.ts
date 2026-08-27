@@ -22,6 +22,7 @@ import {
   whichBin,
   type InitDeps,
 } from "../src/commands/init.ts";
+import { CLAUDE_MD } from "../src/claude_md.ts";
 import { createStore, spawnWithSecrets, type Prompter } from "../src/secrets.ts";
 import {
   STUBBED_NOT_PROVEN,
@@ -245,6 +246,59 @@ describe("init on a machine where nothing is installed", () => {
 
     expect(result.claudeMd).toBe("skip");
     expect(await Bun.file(mine).text()).toBe("# mine\n\nhard-won notes\n");
+  });
+
+  test("a project's own CLAUDE.md still leaves the agent with the conventions", async () => {
+    /*
+     * The defect this pairing exists for: a repo that ships a codebase guide at
+     * this filename used to leave the agent with NOTHING, silently, because
+     * `exists` cannot tell that document from an agent's brief. Rule 1 still
+     * holds — asserted on the bytes — and the conventions arrive beside it.
+     */
+    const fx = makeFixture();
+    const theirs = "# core\n\n## Common Commands\n\nmix test\n";
+    const mine = resolve(fx.root, "CLAUDE.md");
+    await Bun.write(mine, theirs);
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
+
+    const result = await runInit(deps);
+
+    // Rule 1, unchanged: their file is not written to, not appended to.
+    expect(result.claudeMd).toBe("skip");
+    expect(await Bun.file(mine).text()).toBe(theirs);
+
+    // And yet the agent ends up with the conventions.
+    const owned = resolve(fx.root, "SUITE_CONVENTIONS.md");
+    expect(existsSync(owned)).toBe(true);
+    expect(await Bun.file(owned).text()).toContain("assignment IS the authorization");
+    expect(result.conventions).toBe("unlinked");
+
+    // Silence is what let this survive, so the run says it plainly.
+    const printed = deps.lines.join("\n");
+    expect(printed).toContain("SUITE_CONVENTIONS.md");
+    expect(printed).toContain("states no Suite conventions");
+    expect(printed).toContain("@SUITE_CONVENTIONS.md");
+  });
+
+  test("a CLAUDE.md that already carries the conventions gets no second copy", async () => {
+    // The control. Without it, an implementation that writes the owned file
+    // unconditionally passes the test above and litters every repo.
+    const fx = makeFixture();
+    await Bun.write(resolve(fx.root, "CLAUDE.md"), CLAUDE_MD);
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
+
+    const result = await runInit(deps);
+
+    expect(result.conventions).toBe("carries");
+    expect(existsSync(resolve(fx.root, "SUITE_CONVENTIONS.md"))).toBe(false);
+    expect(deps.lines.join("\n")).not.toContain("states no Suite conventions");
+  });
+
+  test("a freshly seeded CLAUDE.md needs no second file either", async () => {
+    const fx = makeFixture();
+    const result = await runInit(makeDeps(fx, scriptedPrompter(credentialAnswers())));
+    expect(result.conventions).toBe("seeded");
+    expect(existsSync(resolve(fx.root, "SUITE_CONVENTIONS.md"))).toBe(false);
   });
 
   test("offers the bun install rather than performing it unasked", async () => {

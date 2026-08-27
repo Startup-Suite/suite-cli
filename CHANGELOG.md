@@ -10,6 +10,19 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.3.0
+
+- **`suite init` no longer leaves an agent without the conventions just because
+  the repo ships its own `CLAUDE.md`.** That filename carries two different
+  documents — an agent's brief and a project's codebase guide — and `exists`
+  cannot tell them apart, so in most mature repos `init` skipped, printed
+  `present, left alone`, and the agent received none of the conventions with
+  nothing saying so. An existing `CLAUDE.md` is still **never** written to.
+  Instead the conventions go to `SUITE_CONVENTIONS.md`, a file the CLI owns
+  outright and rewrites on every run, and `init` names what the existing file is
+  missing plus the one line (`@SUITE_CONVENTIONS.md`) that loads it. A
+  `CLAUDE.md` that already states the conventions gets no second file.
+
 ## 0.2.0
 
 - **`suite init` seeds a starting `CLAUDE.md`** for new Suite agents — how a
