@@ -25,7 +25,7 @@
  */
 import { resolve } from "node:path";
 import { existsSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import {
   createStore,
   solicitCredentials,
@@ -36,7 +36,15 @@ import {
   type SpawnResult,
 } from "../secrets.ts";
 import { dataDir } from "../paths.ts";
-import { CLAUDE_MD, claudeMdPlan } from "../claude_md.ts";
+import {
+  CLAUDE_MD,
+  CONVENTIONS_FILENAME,
+  CONVENTIONS_MD,
+  claudeMdPlan,
+  conventionsAdvice,
+  conventionsPlan,
+  type ConventionsPlan,
+} from "../claude_md.ts";
 import { readConfig, writeConfig, type SuiteConfig } from "../config.ts";
 import { nextCommand, row } from "../ui.ts";
 
@@ -508,6 +516,8 @@ export interface InitResult {
   configPath: string;
   /** `write` when one was created, `skip` when the operator's own was kept. */
   claudeMd: "write" | "skip";
+  /** How the conventions reach the agent — see {@link ConventionsPlan.claudeMd}. */
+  conventions: ConventionsPlan["claudeMd"];
 }
 
 export async function runInit(deps: InitDeps, options: InitOptions = {}): Promise<InitResult> {
@@ -608,7 +618,11 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
   say(row("config", configFile));
 
   // 5b. a starting CLAUDE.md, and never a replacement for one ------------
-  const claudeMd = claudeMdPlan(resolve(deps.cwd, "CLAUDE.md"), existsSync(resolve(deps.cwd, "CLAUDE.md")));
+  const claudeMdPath = resolve(deps.cwd, "CLAUDE.md");
+  // Read, never written when it exists. The content only feeds the decision
+  // below; every branch here leaves an existing file byte-for-byte alone.
+  const existingClaudeMd = existsSync(claudeMdPath) ? await readFile(claudeMdPath, "utf8") : null;
+  const claudeMd = claudeMdPlan(claudeMdPath, existingClaudeMd !== null);
   if (claudeMd.action === "write") {
     await writeFile(claudeMd.path, CLAUDE_MD, "utf8");
     say(row("CLAUDE.md", claudeMd.path, "written"));
@@ -617,6 +631,17 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
     // operating knowledge it has accumulated in this file.
     say(row("CLAUDE.md", claudeMd.path, "present, left alone"));
   }
+
+  // 5c. and the conventions themselves, which a skip used to swallow --------
+  // A project's codebase guide and an agent's brief share this filename, so a
+  // file being present is no evidence the agent has the conventions. When it
+  // has not, they go to a path this CLI owns and the gap is SAID OUT LOUD.
+  const conventions = conventionsPlan(resolve(deps.cwd, CONVENTIONS_FILENAME), existingClaudeMd);
+  if (conventions.action === "write") {
+    await writeFile(conventions.path, CONVENTIONS_MD, "utf8");
+    say(row(CONVENTIONS_FILENAME, conventions.path, "written"));
+  }
+  for (const line of conventionsAdvice(conventions)) say(row("", "", line));
 
   // 6. both MCP entries, via claude mcp add -----------------------------
   const token = deps.store.get(TOKEN_KEY) ?? "";
@@ -660,6 +685,7 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
     checkout: outcome,
     configPath: configFile,
     claudeMd: claudeMd.action,
+    conventions: conventions.claudeMd,
   };
 }
 

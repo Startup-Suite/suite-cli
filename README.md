@@ -94,6 +94,25 @@ it exists, and `init` is re-run routinely — losing the operating knowledge an
 agent has accumulated there would be the worst thing this verb could do. A
 re-run reports `present, left alone` and touches nothing.
 
+### ...and if that file is a project's, not an agent's
+
+Two different documents share the filename: an agent's brief, and a *project's*
+codebase guide. Most mature repos ship the second one, and `init` cannot tell
+them apart — so a skip used to mean the agent got **none** of the conventions,
+silently.
+
+When your `CLAUDE.md` exists and states none of them, `init` leaves it alone and
+writes `SUITE_CONVENTIONS.md` beside it — a file the CLI **owns and rewrites on
+every run**, so keep your own notes in `CLAUDE.md`. It then prints what is
+missing and the single line that loads it:
+
+```
+@SUITE_CONVENTIONS.md
+```
+
+A `CLAUDE.md` that already states the conventions, or that already loads that
+file, gets no second copy and no nagging.
+
 The template is static and carries no identifiers — no tokens, no runtime ids,
 no hostnames — because it lands in a directory that may well be a git repo.
 
