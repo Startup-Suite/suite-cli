@@ -11,10 +11,11 @@ import { liveDeps, runInit } from "./commands/init.ts";
 import { liveClaudeDeps, runClaude } from "./commands/claude.ts";
 import { liveDoctorDeps, runDoctor } from "./commands/doctor.ts";
 import { runStatus } from "./commands/status.ts";
+import { liveDeepseekDeps, runDeepseek } from "./commands/deepseek.ts";
 import { liveUpdateDeps, runUpdate } from "./commands/update.ts";
 import { ttyPrompter } from "./secrets.ts";
 
-export type Verb = "init" | "claude" | "claude new" | "doctor" | "status" | "update";
+export type Verb = "init" | "claude" | "claude new" | "deepseek" | "doctor" | "status" | "update";
 
 export interface Dispatch {
   verb: Verb | null;
@@ -22,7 +23,7 @@ export interface Dispatch {
   args: string[];
 }
 
-const VERBS = new Set(["init", "claude", "doctor", "status", "update"]);
+const VERBS = new Set(["init", "claude", "deepseek", "doctor", "status", "update"]);
 
 /**
  * Pure: map argv to a verb plus untouched passthrough arguments.
@@ -98,6 +99,7 @@ export function usage(): string {
     row("init", "wire this machine to Suite"),
     row("claude", "run Claude Code in a persistent session"),
     row("claude new", "force a new session"),
+    row("deepseek", "run a DeepSeek Harness agent federated into Suite"),
     row("doctor", "diagnose a broken setup"),
     row("status", "show federation and session state"),
     row("update", "install the latest suite CLI"),
@@ -135,6 +137,11 @@ export async function run(argv: string[]): Promise<number> {
       force: verb === "claude new",
       explicitSession: session,
     });
+  }
+  if (verb === "deepseek") {
+    // Ours: `--root DIR` before a `--`. Everything else reaches dsh verbatim.
+    const { args } = parse(argv);
+    return runDeepseek(args, liveDeepseekDeps());
   }
   if (verb === "update") return runUpdate(liveUpdateDeps());
   if (verb === "doctor") return runDoctor(await liveDoctorDeps());
