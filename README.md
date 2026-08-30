@@ -136,6 +136,8 @@ again from the same place and you are back in the same session.
 | `suite claude -p '…'` | One-shot, non-interactive: **bypasses tmux entirely** and execs Claude directly |
 | `suite claude --session NAME` | Per-invocation override of the derived session name. The one option the wrapper owns; not persisted |
 | `suite claude -- …` | `--` terminates wrapper options; everything after it is Claude's, including the literal word `new` |
+| `suite deepseek [...]` | Runs a DeepSeek Harness agent federated into Suite. Installs the harness on demand; every argument after ours passes through to `dsh` |
+| `suite deepseek --root DIR` | The agent's root folder — its cwd, its `DSH_HOME`, and where a per-agent identity may live |
 | `suite update` | Re-runs the installer to replace this install with the latest published CLI |
 | `suite doctor` | Diagnoses a broken setup — one runnable remedy per failure, and a stale session is never reported green |
 | `suite status` | Shows which runtime this box is federated as, and the state and age of each session |
@@ -172,6 +174,70 @@ One state is deliberately neither: `⏸ Pending approval` in `claude mcp list` i
 a *project-approval* state, not a connectivity verdict. A pending server is
 routinely delivering messages, so doctor reports it as `⋯ skipped — awaiting
 project approval` and does not fail the run on that account.
+
+## `suite deepseek`
+
+A second kind of agent, and deliberately a different shape from `suite claude`.
+`suite claude` wraps a binary you already installed and passes everything
+through. `dsh` composes itself from a profile plus ordered patch files, so this
+verb's real job is **materialising that composition on this machine** and then
+getting out of the way.
+
+```
+suite deepseek --root ~/agents/oddjob
+```
+
+On each run it installs the harness if absent, copies the bundled federation
+plugin into place, writes the composition patch, and execs `dsh`. Nothing is
+cached that a re-run would not rebuild, so upgrading this CLI upgrades the
+plugin with no separate publish step.
+
+### One machine, several agents
+
+`suite claude` federates the BOX, so the machine config names one runtime. An
+agent root may instead carry its own identity, and when it does it wins
+outright — a half-inherited identity is how an agent ends up connecting as its
+neighbour:
+
+| File | Holds |
+| --- | --- |
+| `<root>/suite.json` | Suite URL, runtime id, header **names**. No secret |
+| `<root>/.suite-state.json` | The runtime token and header values. Mode `0600` |
+
+Both have the same shape as the machine-level pair, so a working setup can be
+copied and edited rather than re-derived.
+
+### The generated patch is not a shipped file
+
+`dsh` reads a plugin entry's `name:` as a **literal string** — that field is
+consumed before `!!js` expressions are evaluated, so it cannot name a path that
+is correct on two machines. The patch is therefore rendered per run with this
+machine's resolved paths baked in. Everything that varies otherwise goes
+through the environment, which *is* expanded.
+
+Three things the patch does that are easy to get wrong, each pinned by a test:
+
+- **Declares the provider route**, not merely the default model's name. Naming
+  a provider without a matching `llm-pi-ai` route fails at the first turn with
+  `NO_ADAPTER` — after the socket connects, with every status green.
+- **Disables the one-shot runner.** The headless profile's runner tears the
+  whole plugin tree down when its task ends, taking the agent factory with it;
+  a plugin holding the event loop open then keeps the process alive around a
+  dead tree.
+- **Declares one MCP server per entry.** The client takes `serverName` as a
+  field, not a `servers` map — and an invalid config there prints the fully
+  resolved config, credentials included, to stderr.
+
+### Credentials
+
+One token. The runtime token authenticates both the federation websocket and
+the MCP endpoint — verified against a live deployment rather than assumed. It
+reaches the child through the environment and never through argv.
+
+Deployments behind an access proxy may need extra headers. The CLI knows none
+of them by name: whatever `headerNames` the config carries is forwarded from
+the credential store as `SUITE_HEADER_<NORMALISED_NAME>`, and a deployment with
+none works unchanged.
 
 ## Five decisions, stated rather than guessed
 
