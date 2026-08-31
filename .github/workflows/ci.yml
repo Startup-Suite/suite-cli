@@ -29,10 +29,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install shellcheck
+      # `unzip` is not in the base image and is not obviously CI's business —
+      # but `setup-bun` downloads a .zip and fails with "Unable to locate
+      # executable file: unzip", an error that names neither bun nor the image.
+      # `ca-certificates` for the same class of reason: the download is HTTPS.
+      - name: Install shellcheck and download prerequisites
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends shellcheck
+          apt-get install -y --no-install-recommends shellcheck unzip ca-certificates
 
       # install.sh is POSIX sh regardless of the CLI language, so it is linted
       # on every platform this job runs on.
