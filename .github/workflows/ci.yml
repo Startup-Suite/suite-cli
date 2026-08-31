@@ -27,23 +27,28 @@ jobs:
     container:
       image: ubuntu:24.04
     steps:
-      - uses: actions/checkout@v4
-
       # Everything here is absent from `ubuntu:24.04` and each absence
       # surfaces as an error naming neither the package nor the image:
       #   unzip           — `setup-bun` downloads a .zip: "Unable to locate
       #                     executable file: unzip"
       #   ca-certificates — that download is over HTTPS
-      #   git             — the gitignore-guard tests shell out to it:
-      #                     "Executable not found in $PATH: git". `checkout`
-      #                     itself does not need it; it falls back to the REST
-      #                     tarball, so the job gets all the way to the tests
-      #                     before this bites.
+      #   curl            — `install.sh` probes for it and refuses without
+      #                     it, so its install tests exit nonzero
+      #   git             — needed TWICE over, which is why this step runs
+      #                     BEFORE checkout. The gitignore-guard tests shell
+      #                     out to it, and `actions/checkout` silently falls
+      #                     back to a REST tarball without it — leaving no
+      #                     `.git`, so `git ls-files` returns nothing and the
+      #                     hygiene test's anti-vacuity assertion fires. That
+      #                     guard is what caught this; a scan over zero files
+      #                     would otherwise have passed.
       - name: Install test prerequisites
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            shellcheck unzip ca-certificates git
+            shellcheck unzip ca-certificates curl git
+
+      - uses: actions/checkout@v4
 
       # install.sh is POSIX sh regardless of the CLI language, so it is linted
       # on every platform this job runs on.
