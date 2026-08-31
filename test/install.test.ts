@@ -40,7 +40,12 @@ beforeAll(() => {
   const stage = join(workRoot, "stage");
   const pkgDir = join(stage, "suite-cli-main");
   mkdirSync(pkgDir, { recursive: true });
-  for (const entry of ["install.sh", "package.json", "src", "bin"]) {
+  // `assets` belongs here because a real GitHub archive contains it. Omitting
+  // it made this fixture describe an archive that cannot exist, and that gap
+  // is precisely what let the installer ship without assets/ unnoticed: the
+  // tests could not have caught it, because the thing they installed from
+  // never had the directory in the first place.
+  for (const entry of ["install.sh", "package.json", "src", "bin", "assets"]) {
     const cp = spawnSync("cp", ["-R", join(REPO_ROOT, entry), join(pkgDir, entry)]);
     expect(cp.status).toBe(0);
   }
@@ -106,6 +111,22 @@ describe("install.sh", () => {
     const v = spawnSync(r.dest, ["--version"], { encoding: "utf8" });
     expect(v.status).toBe(0);
     expect(v.stdout.trim()).toBe(VERSION);
+  });
+
+  test("ships assets/, which `suite deepseek` needs at runtime", () => {
+    // Regression: the installer copied only src/ and package.json, so every
+    // install and every `suite update` produced a CLI whose deepseek verb
+    // died at the last moment with "the bundled federation plugin was not
+    // found", naming a directory the installer had never created. The verb
+    // materialises the plugin out of this tree on every run — that is how
+    // upgrading the CLI upgrades the plugin — so its absence is not cosmetic.
+    const r = runInstaller(makeHome());
+    expect(r.status).toBe(0);
+    const plugin = join(
+      r.home, ".local", "share", "suite", "cli",
+      "assets", "dsh-plugins", "suite-federation", "index.js",
+    );
+    expect(existsSync(plugin)).toBe(true);
   });
 
   test("a second run is idempotent", () => {

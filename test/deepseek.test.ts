@@ -19,6 +19,7 @@ import { describe, expect, test } from "bun:test";
 import { parse } from "yaml";
 import {
   agentNameFromRuntimeId,
+  sessionNameForAgent,
   envNameForHeader,
   mcpUrl,
   parseDeepseekOptions,
@@ -71,6 +72,46 @@ describe("agentNameFromRuntimeId", () => {
   test("keeps anything else verbatim rather than guessing", () => {
     expect(agentNameFromRuntimeId("ryan-home-openclaw")).toBe("ryan-home-openclaw");
     expect(agentNameFromRuntimeId("dsh-runner")).toBe("dsh-runner");
+  });
+});
+
+describe("sessionNameForAgent", () => {
+  test("names the session for the agent, not the working directory", () => {
+    // Unlike `suite claude`, which keys on cwd. A dsh agent is one identity
+    // owning one root — two shells asking for `oddjob` must reach the SAME
+    // session, and a cwd-derived name would silently give them two.
+    expect(sessionNameForAgent("oddjob")).toBe("suite-oddjob");
+  });
+
+  test("is stable regardless of where it is invoked from", () => {
+    expect(sessionNameForAgent("oddjob")).toBe(sessionNameForAgent("oddjob"));
+  });
+
+  test("sanitises anything tmux would choke on", () => {
+    expect(sessionNameForAgent("Odd Job.v2")).toBe("suite-odd-job-v2");
+    expect(sessionNameForAgent("--weird--")).toBe("suite-weird");
+  });
+
+  test("two different agents never collide", () => {
+    expect(sessionNameForAgent("oddjob")).not.toBe(sessionNameForAgent("oddjob2"));
+  });
+});
+
+describe("parseDeepseekOptions --no-session", () => {
+  test("is ours and does not reach dsh", () => {
+    const { noSession, rest } = parseDeepseekOptions(["--no-session", "--verbose"]);
+    expect(noSession).toBe(true);
+    expect(rest).toEqual(["--verbose"]);
+  });
+
+  test("defaults to false, so the session is the normal path", () => {
+    expect(parseDeepseekOptions([]).noSession).toBe(false);
+  });
+
+  test("after `--` it belongs to dsh", () => {
+    const { noSession, rest } = parseDeepseekOptions(["--", "--no-session"]);
+    expect(noSession).toBe(false);
+    expect(rest).toEqual(["--no-session"]);
   });
 });
 

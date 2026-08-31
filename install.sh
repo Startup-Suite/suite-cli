@@ -224,6 +224,18 @@ cp -R "$src_root/src" "$staged_lib/src" || die "could not stage the suite-cli so
 cp "$src_root/package.json" "$staged_lib/package.json" ||
 	die "could not stage package.json"
 
+# assets/ ships too, and its absence is FATAL rather than a warning.
+#
+# `suite deepseek` materialises the federation plugin out of
+# assets/dsh-plugins/ on every run — that is how upgrading the CLI upgrades
+# the plugin without a second publish step. An install that omits it produces
+# a CLI whose deepseek verb fails at the last moment with "the bundled
+# federation plugin was not found", pointing at a directory the installer
+# never created. Every `suite update` reintroduced that until this line
+# existed.
+cp -R "$src_root/assets" "$staged_lib/assets" ||
+	die "could not stage assets/ — suite deepseek needs the bundled plugin"
+
 staged_bin="$TMPDIR_SUITE/suite"
 sed -e "s|@SUITE_LIB_DIR@|$lib_dir|g" -e "s|@SUITE_VERSION@|$version|g" \
 	"$src_root/bin/suite.template" >"$staged_bin" ||
