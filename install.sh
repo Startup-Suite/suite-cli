@@ -7,7 +7,17 @@ set -eu
 
 REPO="Startup-Suite/suite-cli"
 REF="${SUITE_CLI_REF:-main}"
-TARBALL_URL="${SUITE_CLI_TARBALL_URL:-https://codeload.github.com/${REPO}/tar.gz/refs/heads/${REF}}"
+# codeload.github.com serves tarballs by commit SHA at /tar.gz/<sha>, but
+# branch names need /tar.gz/refs/heads/<branch>. Detect SHAs (40 hex chars)
+# and use the appropriate path.
+case "$REF" in
+	[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+		TARBALL_URL="${SUITE_CLI_TARBALL_URL:-https://codeload.github.com/${REPO}/tar.gz/${REF}}"
+		;;
+	*)
+		TARBALL_URL="${SUITE_CLI_TARBALL_URL:-https://codeload.github.com/${REPO}/tar.gz/refs/heads/${REF}}"
+		;;
+esac
 
 TMPDIR_SUITE=""
 
