@@ -50,6 +50,24 @@ jobs:
 
       - uses: actions/checkout@v4
 
+      # THE WORKSPACE IS NOT OWNED BY THE USER RUNNING GIT.
+      #
+      # A previous job on this runner hands the shared `_work` checkout back to
+      # uid 1000 (see the last step). This job is root inside its container, so
+      # git sees a repository owned by someone else and refuses every command
+      # with "detected dubious ownership" — and `trackedFiles()` in
+      # test/hygiene.test.ts does not capture stderr, so the refusal surfaces
+      # only as an empty file list and a failed anti-vacuity assertion that
+      # says nothing about git.
+      #
+      # `git ls-files | wc -l` is echoed deliberately: the count is the thing
+      # the test depends on, and printing it turns a silent zero into a visible
+      # one the next time this breaks for a different reason.
+      - name: Trust the workspace, and show git can read it
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "tracked files: $(git ls-files --cached --others --exclude-standard | wc -l)"
+
       # install.sh is POSIX sh regardless of the CLI language, so it is linted
       # on every platform this job runs on.
       - name: shellcheck
