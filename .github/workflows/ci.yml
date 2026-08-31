@@ -5,27 +5,71 @@ on:
     branches: ["**"]
   pull_request:
 
+# WHY THIS IS TWO JOBS AND NOT A MATRIX
+#
+# It used to be `matrix: os: [ubuntu-latest, macos-latest]`, which worked while
+# both legs ran on GitHub-hosted machines. The Linux leg now runs on the org's
+# self-hosted runner, and that leg needs a `container:` — the runner is Bluefin
+# (Fedora bootc), so `apt-get` does not exist on the host and the shellcheck and
+# tmux installs would fail before any test ran.
+#
+# `container:` is a job-level key. It cannot be applied to one arm of a matrix,
+# so the two platforms have to be two jobs. The duplicated steps are the price
+# of the Linux leg running at all.
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    name: test (linux)
+    runs-on: [self-hosted, linux, x64]
+    # Debian-based so `apt-get` works, which is what the shellcheck and tmux
+    # installs below need. The job is root inside it, so no `sudo` — the host
+    # runner has no passwordless sudo either, and the prefix would fail with
+    # "sudo: not found" rather than anything about the packages.
+    container:
+      image: ubuntu:24.04
     steps:
+      # Everything here is absent from `ubuntu:24.04` and each absence
+      # surfaces as an error naming neither the package nor the image:
+      #   unzip           — `setup-bun` downloads a .zip: "Unable to locate
+      #                     executable file: unzip"
+      #   ca-certificates — that download is over HTTPS
+      #   curl            — `install.sh` probes for it and refuses without
+      #                     it, so its install tests exit nonzero
+      #   git             — needed TWICE over, which is why this step runs
+      #                     BEFORE checkout. The gitignore-guard tests shell
+      #                     out to it, and `actions/checkout` silently falls
+      #                     back to a REST tarball without it — leaving no
+      #                     `.git`, so `git ls-files` returns nothing and the
+      #                     hygiene test's anti-vacuity assertion fires. That
+      #                     guard is what caught this; a scan over zero files
+      #                     would otherwise have passed.
+      - name: Install test prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            shellcheck unzip ca-certificates curl git
+
       - uses: actions/checkout@v4
 
-      - name: Install shellcheck (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y shellcheck
-
-      - name: Install shellcheck (macOS)
-        if: runner.os == 'macOS'
-        run: brew install shellcheck
+      # THE WORKSPACE IS NOT OWNED BY THE USER RUNNING GIT.
+      #
+      # A previous job on this runner hands the shared `_work` checkout back to
+      # uid 1000 (see the last step). This job is root inside its container, so
+      # git sees a repository owned by someone else and refuses every command
+      # with "detected dubious ownership" — and `trackedFiles()` in
+      # test/hygiene.test.ts does not capture stderr, so the refusal surfaces
+      # only as an empty file list and a failed anti-vacuity assertion that
+      # says nothing about git.
+      #
+      # `git ls-files | wc -l` is echoed deliberately: the count is the thing
+      # the test depends on, and printing it turns a silent zero into a visible
+      # one the next time this breaks for a different reason.
+      - name: Trust the workspace, and show git can read it
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          echo "tracked files: $(git ls-files --cached --others --exclude-standard | wc -l)"
 
       # install.sh is POSIX sh regardless of the CLI language, so it is linted
-      # on both platforms.
+      # on every platform this job runs on.
       - name: shellcheck
         run: shellcheck install.sh bin/suite.template
 
@@ -35,12 +79,64 @@ jobs:
       # The tmux integration tests are the only evidence that a session
       # survives a closed terminal. A runner without tmux would SKIP them and
       # still go green, so tmux is installed rather than assumed.
-      - name: Install tmux (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get install -y tmux
+      - name: Install tmux
+        run: apt-get install -y --no-install-recommends tmux
 
-      - name: Install tmux (macOS)
-        if: runner.os == 'macOS'
+      # setup-bun works on this runner as-is. `actions/setup-python` does not —
+      # its manifest covers Ubuntu, macOS and Windows only — but bun ships a
+      # static binary, which was verified on this runner before relying on it.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      - name: Test
+        run: bun test
+
+      # The container runs as root, and on a self-hosted runner every job
+      # shares one `_work` checkout. Root-owned leftovers make the NEXT job's
+      # `actions/checkout` die with `EACCES: unlink` while deleting the
+      # workspace — seconds in, before any step of the job it belongs to.
+      # None of this is visible on hosted runners, where every job gets a
+      # fresh machine and nothing is shared.
+      - name: Hand the workspace back to the runner
+        if: always()
+        run: chown -R 1000:1000 "$GITHUB_WORKSPACE" || true
+
+  # macOS COVERAGE IS OFF, DELIBERATELY AND VISIBLY.
+  #
+  # This CLI supports macOS, so dropping the job outright would quietly lose
+  # real coverage. But GitHub-hosted minutes are exhausted org-wide — a hosted
+  # job now fails in about two seconds with a billing message without executing
+  # a step — and the org's self-hosted runner is Linux, so there is nowhere for
+  # this to run today.
+  #
+  # Rather than delete it or leave a permanently red check that everyone learns
+  # to ignore, it is gated on a repository variable. Set `ENABLE_MACOS_CI` to
+  # `true` once either hosted minutes are restored or a macOS runner is
+  # registered, and this comes back exactly as it was.
+  test-macos:
+    name: test (macos)
+    if: vars.ENABLE_MACOS_CI == 'true'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: brew install shellcheck
+
+      - name: shellcheck
+        run: shellcheck install.sh bin/suite.template
+
+      - name: POSIX syntax check
+        run: sh -n install.sh
+
+      - name: Install tmux
         run: brew install tmux
 
       - uses: oven-sh/setup-bun@v2
