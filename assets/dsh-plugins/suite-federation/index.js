@@ -13,6 +13,9 @@
  * conversation keeps its history the way a human participant would expect.
  */
 import { randomUUID } from 'node:crypto'
+import { existsSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import WebSocket from 'ws'
 import { Socket } from 'phoenix'
 import z from '@deepseek-ai/schemastery'
@@ -31,6 +34,49 @@ export const Config = z.object({
 
 const RECONNECT_BASE_MS = 1000
 const RECONNECT_MAX_MS = 30000
+
+// ── Cost computation ────────────────────────────────────────────────────────
+// pi-ai's models.generated.js is not in the package's `exports` map, so we
+// resolve it by walking up from this file to find the nearest node_modules
+// that contains it.  The result is cached — pricing data is static for the
+// lifetime of the process.
+let _pricingMap = null
+
+async function loadPricingMap() {
+  if (_pricingMap) return _pricingMap
+  _pricingMap = {}
+  try {
+    let dir = dirname(fileURLToPath(import.meta.url))
+    let modelsPath = null
+    while (true) {
+      const candidate = join(dir, 'node_modules', '@earendil-works', 'pi-ai', 'dist', 'models.generated.js')
+      if (existsSync(candidate)) { modelsPath = candidate; break }
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+    if (!modelsPath) return _pricingMap
+    const mod = await import(pathToFileURL(modelsPath).href)
+    const or = mod.MODELS?.openrouter
+    if (or) {
+      _pricingMap = Object.fromEntries(
+        Object.entries(or).map(([id, m]) => [id, m?.cost ?? null]),
+      )
+    }
+  } catch { /* pricing unavailable — cost_usd stays undefined */ }
+  return _pricingMap
+}
+
+function costUsd(pricingMap, model, usage) {
+  const rate = pricingMap[model]
+  if (!rate) return undefined
+  return (
+    (rate.input * (usage.inputTokens ?? 0) +
+     rate.output * (usage.outputTokens ?? 0) +
+     (rate.cacheRead ?? 0) * (usage.cacheReadTokens ?? 0) +
+     (rate.cacheWrite ?? 0) * (usage.cacheWriteTokens ?? 0)) / 1_000_000
+  )
+}
 
 /** Collect the assistant text produced after `fromSeq`. */
 function summarize(events, fromSeq) {
@@ -247,6 +293,8 @@ export function apply(ctx, config) {
       // agent_usage_events; without a provider report there is nothing true to
       // send, so we stay silent rather than post a zero row.
       if (provider && model) {
+        const pricingMap = await loadPricingMap()
+        const usd = costUsd(pricingMap, model, usage)
         channel?.push('usage_event', {
           space_id: spaceId,
           model,
@@ -261,6 +309,7 @@ export function apply(ctx, config) {
             usage.outputTokens +
             usage.cacheReadTokens +
             usage.cacheWriteTokens,
+          ...(usd !== undefined ? { cost_usd: usd } : {}),
           latency_ms: Date.now() - startedAt,
           metadata: { harness: 'dsh', runtime_id: runtimeId },
         })
