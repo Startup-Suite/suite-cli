@@ -112,6 +112,21 @@ export function apply(ctx, config) {
   )
   const sessionsBySpace = new Map()
   const inflight = new Set()
+
+  // Dispatches that arrived while this space's turn was running.
+  //
+  // The one-turn-per-space rule is right — two concurrent turns on one session
+  // interleave into nonsense — but DROPPING the second message was the wrong
+  // half of it. A message that vanishes is indistinguishable from an agent
+  // that ignored you, which is the failure this whole plugin exists to avoid
+  // reproducing. They queue and run in order instead.
+  const pending = new Map()
+
+  // A cap, because an unbounded queue turns a slow model into an ever-growing
+  // backlog of stale questions nobody wants answered any more. Oldest is
+  // dropped first and said out loud: losing the newest would mean discarding
+  // exactly the message the human just sent.
+  const MAX_PENDING_PER_SPACE = 5
   const seen = new Set()
 
   let socket = null
@@ -143,6 +158,28 @@ export function apply(ctx, config) {
     return agent
   }
 
+  /**
+   * Start the next queued dispatch for a space, if any.
+   *
+   * Deferred to a fresh task rather than awaited inline: this runs from
+   * `handleAttention`'s own `finally`, and recursing there would grow the
+   * stack once per queued message and keep the first turn's frame alive for
+   * the whole chain.
+   */
+  function drainNext(spaceId) {
+    const queue = pending.get(spaceId)
+    if (queue === undefined || queue.length === 0) {
+      pending.delete(spaceId)
+      return
+    }
+    const next = queue.shift()
+    if (queue.length === 0) pending.delete(spaceId)
+    process.stderr.write(
+      `[suite-federation] DRAIN space=${spaceId} remaining=${queue.length}\n`,
+    )
+    setTimeout(() => void handleAttention(next), 0)
+  }
+
   /** Run one dispatch to completion and push the reply. */
   async function handleAttention(payload) {
     const spaceId = payload.signal?.space_id
@@ -151,7 +188,19 @@ export function apply(ctx, config) {
     // One turn at a time per space: Suite can dispatch again while we think,
     // and two concurrent turns on one session interleave into nonsense.
     if (inflight.has(spaceId)) {
-      logger.warn?.(`turn already running for ${spaceId}, dropping duplicate`)
+      const queue = pending.get(spaceId) ?? []
+      queue.push(payload)
+      let dropped = 0
+      while (queue.length > MAX_PENDING_PER_SPACE) {
+        queue.shift()
+        dropped += 1
+      }
+      pending.set(spaceId, queue)
+      process.stderr.write(
+        `[suite-federation] QUEUED space=${spaceId} depth=${queue.length}` +
+          (dropped > 0 ? ` dropped_oldest=${dropped}` : '') +
+          '\n',
+      )
       return
     }
     inflight.add(spaceId)
@@ -223,6 +272,7 @@ export function apply(ctx, config) {
       channel?.push('typing', { space_id: spaceId, typing: false })
     } finally {
       inflight.delete(spaceId)
+      drainNext(spaceId)
     }
   }
 

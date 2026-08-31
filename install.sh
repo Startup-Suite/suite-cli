@@ -126,14 +126,20 @@ fetch() {
 	resolve_gh_token
 	if command -v curl >/dev/null 2>&1; then
 		# --fail turns an HTTP error into a non-zero exit rather than a body.
-		if [ -n "$GH_TOKEN" ]; then
-			curl -fsSL -H "Authorization: token $GH_TOKEN" "$1" -o "$2"
+		#
+		# "${GH_TOKEN:-}", not "$GH_TOKEN": under `set -u` an unset parameter
+		# kills the whole script. When gh is not on PATH (the shape of the CI
+		# container, and of a bare curl|sh install), resolve_gh_token never
+		# assigns the variable, and the bare form dies instantly with
+		# "GH_TOKEN: parameter not set" and exit 2.
+		if [ -n "${GH_TOKEN:-}" ]; then
+			curl -fsSL -H "Authorization: token ${GH_TOKEN}" "$1" -o "$2"
 		else
 			curl -fsSL "$1" -o "$2"
 		fi
 	elif command -v wget >/dev/null 2>&1; then
-		if [ -n "$GH_TOKEN" ]; then
-			wget -q --header="Authorization: token $GH_TOKEN" -O "$2" "$1"
+		if [ -n "${GH_TOKEN:-}" ]; then
+			wget -q --header="Authorization: token ${GH_TOKEN}" -O "$2" "$1"
 		else
 			wget -q -O "$2" "$1"
 		fi
@@ -223,6 +229,18 @@ mkdir -p "$staged_lib"
 cp -R "$src_root/src" "$staged_lib/src" || die "could not stage the suite-cli sources"
 cp "$src_root/package.json" "$staged_lib/package.json" ||
 	die "could not stage package.json"
+
+# assets/ ships too, and its absence is FATAL rather than a warning.
+#
+# `suite deepseek` materialises the federation plugin out of
+# assets/dsh-plugins/ on every run — that is how upgrading the CLI upgrades
+# the plugin without a second publish step. An install that omits it produces
+# a CLI whose deepseek verb fails at the last moment with "the bundled
+# federation plugin was not found", pointing at a directory the installer
+# never created. Every `suite update` reintroduced that until this line
+# existed.
+cp -R "$src_root/assets" "$staged_lib/assets" ||
+	die "could not stage assets/ — suite deepseek needs the bundled plugin"
 
 staged_bin="$TMPDIR_SUITE/suite"
 sed -e "s|@SUITE_LIB_DIR@|$lib_dir|g" -e "s|@SUITE_VERSION@|$version|g" \

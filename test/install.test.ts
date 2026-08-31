@@ -11,7 +11,7 @@
  */
 import { describe, expect, test, beforeAll, afterAll } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, existsSync, writeFileSync, chmodSync, readFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,7 +40,12 @@ beforeAll(() => {
   const stage = join(workRoot, "stage");
   const pkgDir = join(stage, "suite-cli-main");
   mkdirSync(pkgDir, { recursive: true });
-  for (const entry of ["install.sh", "package.json", "src", "bin"]) {
+  // `assets` belongs here because a real GitHub archive contains it. Omitting
+  // it made this fixture describe an archive that cannot exist, and that gap
+  // is precisely what let the installer ship without assets/ unnoticed: the
+  // tests could not have caught it, because the thing they installed from
+  // never had the directory in the first place.
+  for (const entry of ["install.sh", "package.json", "src", "bin", "assets"]) {
     const cp = spawnSync("cp", ["-R", join(REPO_ROOT, entry), join(pkgDir, entry)]);
     expect(cp.status).toBe(0);
   }
@@ -67,9 +72,34 @@ function makeHome(): string {
   return home;
 }
 
+/**
+ * A PATH holding exactly the externals install.sh invokes — and no `gh`.
+ *
+ * The CI container (ubuntu:24.04, no gh installed) is the only leg of this
+ * suite where GH_TOKEN goes unassigned through the whole fetch, which is how
+ * a bare "$GH_TOKEN" under `set -u` shipped green from a dev box: on a machine
+ * with gh on PATH, resolve_gh_token always assigns the variable (possibly to
+ * an empty string) and the unset-parameter branch never runs. This fixture
+ * reproduces the CI shape on ANY machine, so the bug it caught cannot pass
+ * again just because the developer happens to have gh.
+ */
+function ghlessPath(): string {
+  const bin = mkdtempSync(join(workRoot, "ghless-bin."));
+  // `sh` itself belongs here too: Node resolves the spawned executable against
+  // the child's env.PATH, so a PATH without sh fails the spawn before the
+  // installer gets to run at all. gzip is here because `tar -z` execs it via
+  // PATH rather than linking it in.
+  for (const tool of ["sh", "uname", "mktemp", "mkdir", "tar", "gzip", "sed", "head", "cp", "mv", "rm", "chmod", "curl", "dirname"]) {
+    const resolved = spawnSync("sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim();
+    if (!resolved) throw new Error(`cannot build ghless PATH: ${tool} not found`);
+    symlinkSync(resolved, join(bin, tool));
+  }
+  return bin;
+}
+
 function runInstaller(
   home: string,
-  opts: { url?: string; stdin?: string } = {},
+  opts: { url?: string; stdin?: string; path?: string } = {},
 ): RunResult {
   const url = opts.url ?? `file://${tarball}`;
   const result = spawnSync("sh", [INSTALL_SH], {
@@ -78,7 +108,7 @@ function runInstaller(
     env: {
       // A deliberately minimal environment: no inherited XDG_* or PATH
       // surprises from the developer's shell.
-      PATH: process.env.PATH ?? "/usr/bin:/bin",
+      PATH: opts.path ?? process.env.PATH ?? "/usr/bin:/bin",
       HOME: home,
       XDG_BIN_HOME: join(home, ".local", "bin"),
       XDG_DATA_HOME: join(home, ".local", "share"),
@@ -106,6 +136,22 @@ describe("install.sh", () => {
     const v = spawnSync(r.dest, ["--version"], { encoding: "utf8" });
     expect(v.status).toBe(0);
     expect(v.stdout.trim()).toBe(VERSION);
+  });
+
+  test("ships assets/, which `suite deepseek` needs at runtime", () => {
+    // Regression: the installer copied only src/ and package.json, so every
+    // install and every `suite update` produced a CLI whose deepseek verb
+    // died at the last moment with "the bundled federation plugin was not
+    // found", naming a directory the installer had never created. The verb
+    // materialises the plugin out of this tree on every run — that is how
+    // upgrading the CLI upgrades the plugin — so its absence is not cosmetic.
+    const r = runInstaller(makeHome());
+    expect(r.status).toBe(0);
+    const plugin = join(
+      r.home, ".local", "share", "suite", "cli",
+      "assets", "dsh-plugins", "suite-federation", "index.js",
+    );
+    expect(existsSync(plugin)).toBe(true);
   });
 
   test("a second run is idempotent", () => {
@@ -173,6 +219,20 @@ describe("install.sh", () => {
     const last = lines[lines.length - 1] ?? "";
     expect(last).toBe("suite init");
     expect(last).toBe(last.trimStart());
+  });
+
+  test("runs to completion with no gh on PATH (the CI shape)", () => {
+    // Regression, PR #13 red in CI 2026-08-31: fetch() read the bare
+    // "$GH_TOKEN" under `set -u`. With gh absent — the shape of the CI
+    // container — resolve_gh_token never assigns the variable, so dash died
+    // instantly with "GH_TOKEN: parameter not set" and exit 2, seven tests
+    // at once. Every dev run was green because gh on PATH sets the variable
+    // (to a real token, or an empty string via `|| true`), so only CI could
+    // see it. This test pins the CI shape to the dev box.
+    const r = runInstaller(makeHome(), { path: ghlessPath() });
+    expect(r.stderr).not.toContain("parameter not set");
+    expect(r.status).toBe(0);
+    expect(existsSync(r.dest)).toBe(true);
   });
 
   test("refuses Windows by name", () => {

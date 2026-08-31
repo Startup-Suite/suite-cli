@@ -31,6 +31,16 @@ import { join } from "node:path";
 import { readConfig, type SuiteConfig } from "../config.ts";
 import { createStore, TOKEN_KEY, assertNoSecretsInArgv, type CredentialStore } from "../secrets.ts";
 import { dataDir } from "../paths.ts";
+import {
+  attachArgv,
+  composeNewSession,
+  detectState,
+  liveTmuxDeps,
+  nestingPlan,
+  SESSION_PREFIX,
+  TMUX,
+  type TmuxDeps,
+} from "../tmux.ts";
 
 export const AGENT = "deepseek";
 
@@ -93,9 +103,23 @@ export const AGENT_CONFIG_FILE = "suite.json";
 /** The per-agent credential file inside an agent root. Mode 0600. */
 export const AGENT_STATE_FILE = ".suite-state.json";
 
+/**
+ * The tmux session an agent's harness runs in.
+ *
+ * Named for the AGENT rather than the working directory, unlike
+ * `suite claude`. A dsh agent is a long-lived identity that owns one root;
+ * two shells in different directories asking for `oddjob` mean the same
+ * session, and deriving the name from `cwd` would silently give them two.
+ */
+export function sessionNameForAgent(name: string): string {
+  return `${SESSION_PREFIX}-${name.replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").toLowerCase()}`;
+}
+
 export interface DeepseekOptions {
   /** Override the agent root directory. */
   root?: string;
+  /** Skip tmux entirely and exec the harness in this process. */
+  noSession?: boolean;
   /** Arguments forwarded to dsh verbatim, after ours. */
   rest: string[];
 }
@@ -108,6 +132,7 @@ export interface DeepseekOptions {
 export function parseDeepseekOptions(args: string[]): DeepseekOptions {
   const rest: string[] = [];
   let root: string | undefined;
+  let noSession = false;
   let terminated = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i] ?? "";
@@ -124,9 +149,13 @@ export function parseDeepseekOptions(args: string[]): DeepseekOptions {
       i++;
       continue;
     }
+    if (arg === "--no-session") {
+      noSession = true;
+      continue;
+    }
     rest.push(arg);
   }
-  return { root, rest };
+  return { root, rest, noSession };
 }
 
 /**
@@ -228,6 +257,8 @@ export function envNameForHeader(name: string): string {
 
 export interface DeepseekDeps {
   which(bin: string): string | null;
+  /** Whether stdout is a terminal. False under a service manager. */
+  isTTY(): boolean;
   run(argv: string[], opts: { cwd?: string; env?: Record<string, string> }): Promise<number>;
   exec(argv: string[], opts: { cwd: string; env: Record<string, string> }): Promise<never> | Promise<number>;
   stderr: { write(text: string): void };
@@ -253,6 +284,20 @@ export async function installHarness(dir: string, deps: DeepseekDeps): Promise<n
   }
   deps.stderr.write(`suite: installing the DeepSeek Harness into ${dir}\n`);
   return await deps.run([bunPath(deps), "add", ...DSH_PACKAGES], { cwd: dir });
+}
+
+/**
+ * How to invoke this CLI again as a child.
+ *
+ * Prefers the installed `suite` launcher when there is one — it is on PATH,
+ * survives `suite update`, and is what a human would type. Falls back to the
+ * running interpreter plus this module's entry point, which is what a checkout
+ * needs.
+ */
+export function selfArgv(env: NodeJS.ProcessEnv = process.env): string[] {
+  const lib = env.SUITE_LIB_DIR;
+  if (lib !== undefined && lib !== "") return [process.execPath, join(lib, "src", "cli.ts")];
+  return [process.execPath, join(import.meta.dir, "..", "cli.ts")];
 }
 
 /**
@@ -424,7 +469,100 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   assertNoSecretsInArgv(argv, store);
 
   const env = { ...process.env, ...publicEnv(config, root), ...secretEnv(config, store) } as Record<string, string>;
-  return await deps.exec(argv, { cwd: root, env });
+
+  // `--no-session` is what a service manager uses: systemd wants the harness
+  // in the foreground of the unit it supervises, not handed to a terminal
+  // multiplexer it cannot see into.
+  if (options.noSession) return await deps.exec(argv, { cwd: root, env });
+
+  // WHAT TMUX RUNS IS THIS CLI AGAIN, NOT dsh.
+  //
+  // `composeNewSession` refuses secrets in argv, and it is right to. dsh takes
+  // its credentials from the ENVIRONMENT, and a tmux session created against
+  // an already-running server does not inherit the caller's environment — so
+  // handing tmux the dsh argv produces a session that boots without a token,
+  // dies immediately, and takes the session with it. That is exactly what it
+  // did the first time.
+  //
+  // Re-entering the CLI with `--no-session` sidesteps both: the child re-reads
+  // the config and the 0600 credential file itself, so nothing secret is ever
+  // in an argv or in tmux's environment.
+  const relaunch = [...selfArgv(), "deepseek", "--root", root, "--no-session", ...options.rest];
+  return await runInSession(sessionNameForAgent(name), relaunch, root, env, store, deps);
+}
+
+/**
+ * Start the harness inside a tmux session, or attach to the one already
+ * running it.
+ *
+ * WHY A SESSION AT ALL. Without one the harness is a child of whatever shell
+ * started it: closing the terminal kills the agent, and a second person cannot
+ * see what it is doing. `suite claude` solved this with tmux and this verb
+ * uses the same mechanism deliberately — one persistence story for both agent
+ * kinds, and `tmux ls` shows them side by side.
+ *
+ * A STALE SESSION IS NOT A LIVE ONE. `detectState` distinguishes a session
+ * whose harness is still running from one whose pane is sitting at a dead
+ * shell. Attaching to the second looks like the agent hanging, so it is
+ * recycled rather than joined — the same three-way handling `suite claude`
+ * documents at length.
+ */
+async function runInSession(
+  session: string,
+  argv: string[],
+  cwd: string,
+  env: Record<string, string>,
+  store: CredentialStore,
+  deps: DeepseekDeps,
+): Promise<number> {
+  const tmux: TmuxDeps = liveTmuxDeps(env);
+
+  if (tmux.which(TMUX) === null) {
+    // Never silently: losing persistence is exactly the kind of downgrade that
+    // is invisible until the terminal closes and the agent goes with it.
+    deps.stderr.write(
+      "suite: tmux is not installed, so this agent will not survive its terminal.\n" +
+        "suite: install tmux to keep it running, or pass --no-session to silence this.\n",
+    );
+    return await deps.exec(argv, { cwd, env });
+  }
+
+  const state = await detectState(session, tmux, "dsh");
+
+  if (state === "stale") {
+    deps.stderr.write(`suite: recycling stale session ${session}\n`);
+    await tmux.run([TMUX, "kill-session", "-t", session]);
+  }
+
+  if (state !== "live") {
+    const create = composeNewSession({ session, command: argv, cwd }, store);
+    const created = await tmux.run(create);
+    if (created.exitCode !== 0) {
+      deps.stderr.write(`suite: tmux could not create ${session}: ${created.stderr.trim()}\n`);
+      return created.exitCode;
+    }
+    deps.stderr.write(`suite: started ${session}\n`);
+  } else {
+    deps.stderr.write(`suite: attaching to ${session}\n`);
+  }
+
+  // NOT A TERMINAL — create and leave. A service manager starting this agent
+  // has no TTY to attach to, and `tmux attach` without one fails with "open
+  // terminal failed", which systemd would report as the agent crashing. The
+  // session is what matters: it outlives this process and a human can join it
+  // later with the same command. Returning here is the difference between an
+  // agent you can look in on and one you can only read logs from.
+  if (!deps.isTTY()) {
+    deps.stderr.write(`suite: ${session} is running detached — attach with the same command from a terminal\n`);
+    return 0;
+  }
+
+  const enter = nestingPlan(session, env);
+  if (enter.kind === "refuse") {
+    deps.stderr.write(`${enter.message}\n`);
+    return 1;
+  }
+  return await deps.exec(enter.argv, { cwd, env });
 }
 
 /**
@@ -477,6 +615,7 @@ export async function loadAgentCredentials(root: string, config: SuiteConfig): P
 export function liveDeepseekDeps(): DeepseekDeps {
   return {
     which: (bin) => Bun.which(bin),
+    isTTY: () => process.stdout.isTTY === true,
     run: async (argv, opts) => {
       const proc = Bun.spawn(argv, { cwd: opts.cwd, env: { ...process.env, ...(opts.env ?? {}) }, stdout: "inherit", stderr: "inherit" });
       return await proc.exited;
