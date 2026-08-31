@@ -73,8 +73,12 @@ export async function resolveRefToSha(ref: string): Promise<string> {
     if (token) headers.Authorization = `token ${token}`;
     const res = await fetch(`https://api.github.com/repos/${REPO}/commits/${ref}`, { headers });
     if (!res.ok) return ref;
-    const data = await res.json();
-    return data.sha ?? ref;
+    // `res.json()` is `unknown` under this tsconfig, so the shape is narrowed
+    // rather than asserted: a response without a string `sha` falls back to
+    // the ref we already have instead of installing from `undefined`.
+    const data: unknown = await res.json();
+    const sha = typeof data === "object" && data !== null ? (data as { sha?: unknown }).sha : undefined;
+    return typeof sha === "string" && sha !== "" ? sha : ref;
   } catch {
     return ref;
   }
