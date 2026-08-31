@@ -149,8 +149,10 @@ describe("nothing silent", () => {
   test("the URL about to be piped into a shell is printed first", async () => {
     const d = deps();
     await runUpdate(d);
-    expect(d.stdout[0]).toContain(installerUrl(DEFAULT_REF));
-    expect(d.stdout[0]).toContain(VERSION);
+    // The first line may be a "resolved ref to sha" message; find the announcement.
+    const announcement = d.stdout.find((l) => l.includes(installerUrl(DEFAULT_REF)));
+    expect(announcement).toBeDefined();
+    expect(announcement).toContain(VERSION);
   });
 
   test("a non-default ref is called out; the default is not noise", () => {

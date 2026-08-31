@@ -57,6 +57,30 @@ export function installerUrl(ref: string): string {
 }
 
 /**
+ * Resolve a ref to a commit SHA, avoiding raw.githubusercontent.com's
+ * branch-name cache. Returns the original ref if resolution fails.
+ */
+export async function resolveRefToSha(ref: string): Promise<string> {
+  // Only resolve branch names; tags and SHAs are already immutable.
+  if (/^[0-9a-f]{40}$/.test(ref)) return ref;
+  try {
+    const token = process.env.GH_TOKEN ?? (await (async () => {
+      const proc = Bun.spawn(["gh", "auth", "token"], { stdout: "pipe", stderr: "ignore" });
+      const text = await new Response(proc.stdout).text();
+      return text.trim() || undefined;
+    })());
+    const headers: Record<string, string> = { Accept: "application/vnd.github.v3+json" };
+    if (token) headers.Authorization = `token ${token}`;
+    const res = await fetch(`https://api.github.com/repos/${REPO}/commits/${ref}`, { headers });
+    if (!res.ok) return ref;
+    const data = await res.json();
+    return data.sha ?? ref;
+  } catch {
+    return ref;
+  }
+}
+
+/**
  * The exact argv that performs the update.
  *
  * `SUITE_CLI_REF` is exported into the installer's environment AND used to
@@ -137,13 +161,20 @@ export async function runUpdate(deps: UpdateDeps): Promise<number> {
     return UPDATE_REFUSED_EXIT;
   }
 
+  // Resolve branch names to commit SHAs to avoid raw.githubusercontent.com's
+  // branch-name cache serving a stale install.sh.
+  const sha = await resolveRefToSha(ref);
+  if (sha !== ref) {
+    deps.out(`resolved ${ref} to ${sha.slice(0, 7)}`);
+  }
+
   for (const line of announceLines(ref)) deps.out(line);
 
   // The installer owns the outcome from here, including its own "replace
   // 0.1.0 with 0.2.0? [y/N]" prompt. It is NOT auto-answered: an update that
   // silently overwrites is the thing the prompt exists to prevent, and it
   // inherits the terminal, so the user answers it directly.
-  return deps.exec(updateArgv(ref, fetcher));
+  return deps.exec(updateArgv(sha, fetcher));
 }
 
 export function liveUpdateDeps(): UpdateDeps {
