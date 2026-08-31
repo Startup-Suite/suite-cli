@@ -94,15 +94,39 @@ on_path() {
 }
 
 # ------------------------------------------------------------------ fetch ----
+# The suite-cli repo is private, so unauthenticated fetches against
+# codeload.github.com return 404. A GH_TOKEN may already be exported by
+# `suite update`; if not, resolve one from `gh` when available. When no
+# token is found the fetch falls back to unauthenticated, which still works
+# if the repo is ever made public.
+resolve_gh_token() {
+	if [ -n "${GH_TOKEN:-}" ]; then
+		return 0
+	fi
+	if command -v gh >/dev/null 2>&1; then
+		GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+		export GH_TOKEN
+	fi
+}
+
 fetch() {
 	# fetch <url> <dest-file>. Downloads to the caller's temp path only; the
 	# caller moves it into place. A partial file must never reach the
 	# destination.
+	resolve_gh_token
 	if command -v curl >/dev/null 2>&1; then
 		# --fail turns an HTTP error into a non-zero exit rather than a body.
-		curl -fsSL "$1" -o "$2"
+		if [ -n "$GH_TOKEN" ]; then
+			curl -fsSL -H "Authorization: token $GH_TOKEN" "$1" -o "$2"
+		else
+			curl -fsSL "$1" -o "$2"
+		fi
 	elif command -v wget >/dev/null 2>&1; then
-		wget -q -O "$2" "$1"
+		if [ -n "$GH_TOKEN" ]; then
+			wget -q --header="Authorization: token $GH_TOKEN" -O "$2" "$1"
+		else
+			wget -q -O "$2" "$1"
+		fi
 	else
 		die "neither curl nor wget is available to download suite-cli"
 	fi

@@ -62,10 +62,29 @@ export function installerUrl(ref: string): string {
  * `SUITE_CLI_REF` is exported into the installer's environment AND used to
  * build its URL, from the same argument — see the module note. Pure and
  * exported so a test can pin both halves without running an install.
+ *
+ * When the repo is private the raw URL 404s without auth, so we resolve a
+ * GitHub token from `gh` and pass it as an Authorization header. The token
+ * is resolved lazily at exec time, not baked into the argv, so no secret
+ * appears in the printed command line.
  */
 export function updateArgv(ref: string, fetcher: Fetcher = "curl"): string[] {
-  const download = fetcher === "curl" ? `curl -fsSL '${installerUrl(ref)}'` : `wget -qO- '${installerUrl(ref)}'`;
-  return ["sh", "-c", `${download} | SUITE_CLI_REF='${ref}' sh`];
+  const url = installerUrl(ref);
+  // GH_TOKEN is exported so install.sh can use it for its own tarball fetch.
+  // The ${TOKEN:+...} expansion emits the header only when a token was
+  // resolved, keeping the public-repo path identical to today.
+  //
+  // The installer is downloaded to a temp file first, not piped directly to sh.
+  // When curl -f writes to a pipe and the downstream process exits early
+  // (e.g. install.sh's replace prompt is declined), curl fails with exit 23
+  // ("Failure writing output to destination"), which -f promotes to a fatal
+  // error even though the download itself succeeded.
+  const tmp = '/tmp/suite-install.sh';
+  const download =
+    fetcher === "curl"
+      ? `GH_TOKEN=$(gh auth token 2>/dev/null || true); export GH_TOKEN; curl -fsSL \${GH_TOKEN:+-H "Authorization: token $GH_TOKEN"} -o ${tmp} '${url}' && SUITE_CLI_REF='${ref}' sh ${tmp}`
+      : `GH_TOKEN=$(gh auth token 2>/dev/null || true); export GH_TOKEN; wget -q \${GH_TOKEN:+--header="Authorization: token $GH_TOKEN"} -O ${tmp} '${url}' && SUITE_CLI_REF='${ref}' sh ${tmp}`;
+  return ["sh", "-c", download];
 }
 
 /** The ref to install: explicit override, else the published default. */

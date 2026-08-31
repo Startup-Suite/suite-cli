@@ -73,7 +73,7 @@ describe("the ref reaches both halves", () => {
   test("wget is used when curl is absent, and it still carries the ref", () => {
     // A box with only wget must not be handed a curl command line.
     const script = updateArgv("v1.2.3", "wget")[2] ?? "";
-    expect(script).toContain("wget -qO-");
+    expect(script).toContain("wget -q ");
     expect(script).not.toContain("curl ");
     expect(script).toContain("SUITE_CLI_REF='v1.2.3'");
   });
