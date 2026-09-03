@@ -4,6 +4,7 @@ import {
   HALT_MARKERS,
   TAIL_BYTES,
   buildReorientation,
+  claudeRoot,
   contextTokens,
   conversationMb,
   detectHalt,
@@ -243,5 +244,34 @@ describe("ask-scan window", () => {
 
   test("stays bounded — these transcripts reach gigabytes", () => {
     expect(ASK_SCAN_BYTES).toBeLessThanOrEqual(8 * 1024 * 1024);
+  });
+});
+
+describe("relocated Claude state", () => {
+  /**
+   * The gap that mattered most, because of its direction. Assuming ~/.claude
+   * on a host with CLAUDE_CONFIG_DIR set means no transcripts are found, every
+   * session is skipped, and the sweep reports a clean box — silence that looks
+   * exactly like health.
+   */
+  test("CLAUDE_CONFIG_DIR wins over the default", () => {
+    expect(claudeRoot("/home/q", { CLAUDE_CONFIG_DIR: "/mnt/state/claude" })).toBe(
+      "/mnt/state/claude",
+    );
+  });
+
+  test("falls back to ~/.claude when unset or empty", () => {
+    expect(claudeRoot("/home/q", {})).toBe("/home/q/.claude");
+    expect(claudeRoot("/home/q", { CLAUDE_CONFIG_DIR: "" })).toBe("/home/q/.claude");
+  });
+
+  test("transcriptDir composes under the override, not the home dir", () => {
+    expect(transcriptDir("/home/q", "/a/b", { CLAUDE_CONFIG_DIR: "/state" })).toBe(
+      "/state/projects/-a-b",
+    );
+  });
+
+  test("and under home when there is no override", () => {
+    expect(transcriptDir("/home/q", "/a/b")).toBe("/home/q/.claude/projects/-a-b");
   });
 });

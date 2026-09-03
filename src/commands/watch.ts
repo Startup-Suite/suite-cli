@@ -22,6 +22,7 @@ import {
   sendEnterArgv,
   sendLiteralArgv,
   telemetryRequest,
+  claudeRoot,
   projectSlugResolved,
   resolveTmux,
 } from "../halt.ts";
@@ -118,11 +119,18 @@ export function recentAsks(tail: string, limit = 5): string[] {
  * while its transcripts showed 9 of 12 sessions halted. Observation must not
  * depend on us owning the session; only the recovery keystrokes do.
  */
-export function liveListProjectDirs(home: string): string[] {
-  const root = `${home}/.claude/projects`;
+export function liveListProjectDirs(
+  home: string,
+  env: Record<string, string | undefined> = process.env,
+): string[] {
+  const root = `${claudeRoot(home, env)}/projects`;
   try {
     return readdirSync(root).map((n) => `${root}/${n}`);
   } catch {
+    // Absent root: say so rather than sweeping nothing and calling it healthy.
+    // An unreadable or relocated state directory looks identical to a box with
+    // no halted sessions, and only one of those is good news.
+    console.error(`suite watch: no transcripts under ${root} — nothing to inspect`);
     return [];
   }
 }
@@ -507,7 +515,7 @@ export async function forceRecover(
   const target = parseTargets(panes.stdout).find((t) => t.session === session);
   if (!target) return { recovered: false, reason: "session not found", prompt: "" };
 
-  const dir = `${opts.home}/.claude/projects/${projectSlugResolved(target.cwd, deps.realpath)}`;
+  const dir = `${claudeRoot(opts.home, deps.tmux.env)}/projects/${projectSlugResolved(target.cwd, deps.realpath)}`;
   const newest = deps.newestTranscript(dir);
   const tail = newest ? (deps.readTail(newest.path, TAIL_BYTES) ?? "") : "";
 

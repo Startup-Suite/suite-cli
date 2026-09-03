@@ -53,7 +53,19 @@ const ROOT = realpathSync(mkdtempSync(resolve(tmpdir(), "suite-persist-")));
 
 /** A PATH that finds tmux and /bin/sh, with our stub `claude` shadowing any real one. */
 const STUB_BIN = resolve(ROOT, "bin");
-const SYSTEM_PATH = ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"].join(":");
+// Both package-manager prefixes, not just Homebrew's. A Linux host with tmux
+// under Linuxbrew was not finding it, so HAVE_TMUX was false and this entire
+// persistence suite skipped — which is exactly what the guard below exists to
+// surface, and it did. Same omission cost the watchdog a silent failure.
+const SYSTEM_PATH = [
+  "/opt/homebrew/bin",
+  "/home/linuxbrew/.linuxbrew/bin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
+].join(":");
 
 mkdirSync(STUB_BIN, { recursive: true });
 

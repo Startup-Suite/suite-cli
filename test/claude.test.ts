@@ -33,6 +33,7 @@ import {
 import { CLAUDE_CODE_URL } from "../src/commands/doctor.ts";
 import type { Prompter } from "../src/secrets.ts";
 import { sessionNameFromConfig } from "../src/tmux.ts";
+import { ensureSupervision } from "../src/supervisor.ts";
 
 /* ------------------------------------------------------------------------- */
 /* Scratch HOME. Nothing in this file touches the real config dir.            */
@@ -661,5 +662,51 @@ describe("runClaude", () => {
     expect(
       await listSessionNames(fakeTmux({ run: async () => ({ exitCode: 0, stdout: "a\nb\n", stderr: "" }) })),
     ).toEqual(["a", "b"]);
+  });
+});
+
+describe("supervision on session create", () => {
+  /**
+   * A session started on an unsupervised box is the one that dies quietly
+   * overnight. Creating one therefore guarantees the watchdog exists, rather
+   * than assuming somebody ran `suite init` on this host first.
+   *
+   * Injected, so a caller that supplies no supervisorIo installs nothing —
+   * which is what keeps this suite from writing real units.
+   */
+  test("ensureSupervision writes a unit and activates it", async () => {
+    const calls: string[] = [];
+    const io = {
+      mkdirp: (d: string) => calls.push(`mkdirp ${d}`),
+      writeFile: (p: string) => calls.push(`write ${p}`),
+      run: async (argv: string[]) => {
+        calls.push(argv.join(" "));
+        return { exitCode: 0 };
+      },
+    };
+    const res = await ensureSupervision(io, {
+      platform: "linux",
+      home: "/home/q",
+      binary: "/home/q/.local/bin/suite",
+      intervalSeconds: 60,
+    });
+    expect(res.watchdog).toContain("suite-watch");
+    expect(calls.some((c) => c.includes("suite-watch.service"))).toBe(true);
+    // Restore unit written but NOT enabled — the operator opts in.
+    expect(calls.some((c) => c.includes("suite-agents.service"))).toBe(true);
+    expect(calls.some((c) => c.includes("enable") && c.includes("suite-agents"))).toBe(false);
+  });
+
+  /** Supervision is insurance; the agent is the point. A failure must not throw. */
+  test("a service manager that refuses does not throw", async () => {
+    const io = {
+      mkdirp: () => {},
+      writeFile: () => {},
+      run: async () => ({ exitCode: 1 }),
+    };
+    const res = await ensureSupervision(io, {
+      platform: "linux", home: "/home/q", binary: "/b/suite", intervalSeconds: 60,
+    });
+    expect(res.watchdog).toContain("NOT running");
   });
 });

@@ -128,9 +128,27 @@ export function projectSlugResolved(cwd: string, realpath: (p: string) => string
   return projectSlug(resolved);
 }
 
+/**
+ * Root of Claude Code's own state, honouring CLAUDE_CONFIG_DIR.
+ *
+ * Assuming `~/.claude` is the failure that matters most here, because of the
+ * DIRECTION it fails in: a relocated config dir means no transcripts are found,
+ * every session is skipped, and the sweep reports a clean box. Silence that
+ * looks like health is the exact thing this watchdog exists to eliminate, so it
+ * must not be built on a guess about where state lives.
+ */
+export function claudeRoot(home: string, env: Record<string, string | undefined> = {}): string {
+  const override = env.CLAUDE_CONFIG_DIR;
+  return override && override !== "" ? override : `${home}/.claude`;
+}
+
 /** Absolute path of the transcript directory for a working directory. */
-export function transcriptDir(home: string, cwd: string): string {
-  return `${home}/.claude/projects/${projectSlug(cwd)}`;
+export function transcriptDir(
+  home: string,
+  cwd: string,
+  env: Record<string, string | undefined> = {},
+): string {
+  return `${claudeRoot(home, env)}/projects/${projectSlug(cwd)}`;
 }
 
 /**

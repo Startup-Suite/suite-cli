@@ -478,3 +478,44 @@ export function writeRestoreUnit(io: SupervisorIo, plan: RestoreUnitPlan): void 
   io.mkdirp(plan.path.slice(0, plan.path.lastIndexOf("/")));
   io.writeFile(plan.path, plan.contents);
 }
+
+/**
+ * Make sure this machine is supervised, from any command that starts an agent.
+ *
+ * `suite init` wires a machine up, but a box is not necessarily initialised by
+ * the person who later runs an agent on it, and a session started on an
+ * unsupervised host is exactly the one that dies quietly overnight. So the
+ * command that CREATES a session also guarantees the watchdog exists, rather
+ * than relying on someone having run init first.
+ *
+ * Idempotent and non-fatal by construction: it re-writes its own unit and
+ * re-activates, and a failure here must never stop an agent from starting —
+ * the agent is the point, supervision is insurance.
+ */
+export async function ensureSupervision(
+  io: SupervisorIo,
+  input: SupervisorInput,
+): Promise<{ watchdog: string; restore: string | null }> {
+  let watchdog: string;
+  try {
+    const res = await installSupervisor(io, supervisorPlan(input));
+    watchdog = res.installed ? res.summary : `NOT running: ${res.summary}`;
+  } catch (err) {
+    watchdog = `NOT running: ${(err as Error).message}`;
+  }
+
+  // Restore-on-boot is written, never enabled — the operator opts in per
+  // machine. Writing it here means the option exists on a box that was never
+  // explicitly initialised.
+  let restore: string | null = null;
+  try {
+    const plan = restoreUnitPlan(input);
+    if (plan) {
+      writeRestoreUnit(io, plan);
+      restore = plan.enableHint;
+    }
+  } catch {
+    restore = null;
+  }
+  return { watchdog, restore };
+}
