@@ -580,6 +580,7 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
         home,
         binary: `${home}/.local/bin/suite`,
         inheritedPath: deps.env.PATH,
+        inheritedLocale: deps.env.LANG ?? deps.env.LC_ALL,
         intervalSeconds: 60,
       });
       deps.err(`watchdog: ${sup.watchdog}`);

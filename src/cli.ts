@@ -220,6 +220,7 @@ export async function run(argv: string[]): Promise<number> {
         home,
         binary: resolveSelfBinary(process.env, process.argv),
         inheritedPath: process.env.PATH,
+        inheritedLocale: process.env.LANG ?? process.env.LC_ALL,
         intervalSeconds: opts.intervalSeconds,
       });
       const res = await installSupervisor(liveSupervisorIo(), plan);

@@ -715,6 +715,7 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
       // fails to start with no useful signal.
       binary: `${home}/.local/bin/suite`,
       inheritedPath: deps.env.PATH,
+      inheritedLocale: deps.env.LANG ?? deps.env.LC_ALL,
       intervalSeconds: 60,
     });
     supervisor = await installSupervisor(deps.supervisorIo, plan);

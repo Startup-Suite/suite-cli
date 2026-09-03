@@ -464,7 +464,11 @@ export function liveWatchDeps(
           body,
         });
         return res.status;
-      } catch {
+      } catch (err) {
+        // Say WHY. A bare 0 cost an hour of blind debugging: the daemon was
+        // sweeping correctly and only the POST was failing, and "HTTP 0"
+        // looked identical to a collector that was merely down.
+        console.error(`suite watch: telemetry POST failed: ${(err as Error).message}`);
         return 0;
       }
     },

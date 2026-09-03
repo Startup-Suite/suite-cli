@@ -11,6 +11,8 @@ import {
   tmuxSupervisorArgv,
   parseEnvFile,
   readTelemetryAuth,
+  restoreUnitPlan,
+  serviceLocale,
   servicePath,
   supervisorPlan,
   systemdUnit,
@@ -328,5 +330,53 @@ describe("Linux without user systemd", () => {
     const res = await installSupervisor(io, supervisorPlan({ ...base, platform: "linux" }));
     expect(res.kind).toBe("tmux");
     expect(res.installed).toBe(true);
+  });
+});
+
+describe("locale in the service environment", () => {
+  /**
+   * NOT cosmetic. With no locale, tmux substitutes the TAB in `-F` output with
+   * an underscore, so every tab-split parser in this CLI yields nothing:
+   * list-panes appears to return no sessions and the watchdog reports a clean
+   * box forever. Measured on a real host — byte 23 of the same command is 9
+   * under a shell and 95 under `env -i`. launchd and systemd both supply a
+   * minimal environment with no locale.
+   */
+  test("systemd and launchd units both carry a UTF-8 locale", () => {
+    expect(systemdUnit({ ...base, platform: "linux" })).toContain("Environment=LANG=");
+    expect(launchdPlist({ ...base, platform: "darwin" })).toContain("<key>LANG</key>");
+  });
+
+  test("the tmux fallback passes it to its child too", () => {
+    expect(tmuxSupervisorArgv("/b/suite", 60).flat().some((a) => a.startsWith("LANG="))).toBe(true);
+  });
+
+  test("inherits the installer's locale when it is a real one", () => {
+    expect(serviceLocale("en_GB.UTF-8")).toBe("en_GB.UTF-8");
+  });
+
+  /** C and POSIX are exactly the locales that trigger the substitution. */
+  test("refuses C/POSIX/empty and falls back to UTF-8", () => {
+    expect(serviceLocale("C")).toBe("en_US.UTF-8");
+    expect(serviceLocale("POSIX")).toBe("en_US.UTF-8");
+    expect(serviceLocale("")).toBe("en_US.UTF-8");
+    expect(serviceLocale(undefined)).toBe("en_US.UTF-8");
+  });
+
+  /**
+   * A daemon whose output goes nowhere is undebuggable: the watchdog ran for
+   * minutes under launchd emitting nothing observable, and the only way to see
+   * why was to give it somewhere to write. systemd captures both streams in
+   * the journal; launchd captures neither unless told.
+   */
+  test("the launchd plist captures stdout, not only stderr", () => {
+    const plist = launchdPlist({ ...base, platform: "darwin" });
+    expect(plist).toContain("<key>StandardOutPath</key>");
+    expect(plist).toContain("<key>StandardErrorPath</key>");
+  });
+
+  test("the restore unit carries it as well", () => {
+    const plan = restoreUnitPlan({ ...base, platform: "linux" });
+    expect(plan?.contents).toContain("Environment=LANG=");
   });
 });

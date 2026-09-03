@@ -39,6 +39,8 @@ export interface SupervisorInput {
   home: string;
   /** PATH of the process installing the unit. See servicePath. */
   inheritedPath?: string;
+  /** Locale of the installing process. See serviceLocale — this is load-bearing. */
+  inheritedLocale?: string;
   /** Absolute path to the suite executable. Never a bare name — see above. */
   binary: string;
   /** Seconds between sweeps. */
@@ -75,6 +77,8 @@ export function tmuxSupervisorArgv(binary: string, intervalSeconds: number): str
       SERVICE_NAME,
       "-e",
       `${SUPERVISED_ENV}=1`,
+      "-e",
+      `LANG=${serviceLocale(process.env.LANG)}`,
       binary,
       "watch",
       "--interval",
@@ -143,6 +147,26 @@ export function servicePath(home: string, inherited?: string): string {
  * from starting, which is why systemd gets the `-` prefix and launchd is given
  * no reference to it at all.
  */
+/**
+ * Locale for the service, and it is NOT cosmetic.
+ *
+ * With no locale set, tmux substitutes the TAB in `-F` format output with an
+ * underscore. Every parser in this CLI splits those rows on tab, so they all
+ * yield nothing — `list-panes` appears to return no sessions, the sweep finds
+ * nothing to do, and the watchdog reports a clean box forever. Measured on a
+ * real host: byte 23 of the same command is 9 under a normal shell and 95 under
+ * `env -i`, and setting either LANG or LC_ALL restores it.
+ *
+ * launchd and systemd both hand a service a minimal environment with no locale,
+ * so a supervisor installed without this is silently blind from the moment it
+ * starts — which is the exact failure it exists to catch.
+ */
+export function serviceLocale(inherited?: string): string {
+  return inherited && inherited !== "" && inherited !== "C" && inherited !== "POSIX"
+    ? inherited
+    : "en_US.UTF-8";
+}
+
 export function envFilePath(home: string): string {
   return `${home}/.config/suite/watch.env`;
 }
@@ -157,6 +181,7 @@ After=default.target
 Type=simple
 Environment=PATH=${servicePath(input.home, input.inheritedPath)}
 Environment=HOME=${input.home}
+Environment=LANG=${serviceLocale(input.inheritedLocale)}
 Environment=${SUPERVISED_ENV}=1
 EnvironmentFile=-${envFilePath(input.home)}
 ExecStart=${input.binary} watch --interval ${input.intervalSeconds}
@@ -193,12 +218,14 @@ export function launchdPlist(input: SupervisorInput): string {
   <dict>
     <key>PATH</key><string>${servicePath(input.home, input.inheritedPath)}</string>
     <key>HOME</key><string>${input.home}</string>
+    <key>LANG</key><string>${serviceLocale(input.inheritedLocale)}</string>
     <key>${SUPERVISED_ENV}</key><string>1</string>
   </dict>
   <key>Nice</key><integer>10</integer>
   <key>ProcessType</key><string>Background</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${input.home}/.local/state/suite-watch.log</string>
   <key>StandardErrorPath</key><string>${input.home}/.local/state/suite-watch.log</string>
 </dict>
 </plist>
@@ -414,6 +441,7 @@ Type=oneshot
 RemainAfterExit=yes
 Environment=PATH=${servicePath(input.home, input.inheritedPath)}
 Environment=HOME=${input.home}
+Environment=LANG=${serviceLocale(input.inheritedLocale)}
 ExecStart=${input.binary} restore
 
 [Install]
@@ -436,6 +464,7 @@ export function restoreLaunchdPlist(input: SupervisorInput): string {
   <dict>
     <key>PATH</key><string>${servicePath(input.home, input.inheritedPath)}</string>
     <key>HOME</key><string>${input.home}</string>
+    <key>LANG</key><string>${serviceLocale(input.inheritedLocale)}</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>StandardErrorPath</key><string>${input.home}/.local/state/suite-agents.log</string>
