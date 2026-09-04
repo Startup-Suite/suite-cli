@@ -9,7 +9,13 @@ import {
   serializeRoster,
   upsertEntry,
 } from "../src/roster.ts";
-import { type RestoreDeps, loadRoster, recordLaunch, runRestore } from "../src/commands/restore.ts";
+import {
+  type RestoreDeps,
+  loadRoster,
+  recordLaunch,
+  runRestore,
+  runningSessions,
+} from "../src/commands/restore.ts";
 
 const entry = (session: string, cwd = "/w"): RosterEntry => ({
   session,
@@ -234,5 +240,66 @@ describe("adopting sessions that predate the roster", () => {
 
   test("a pane with no discoverable command is skipped, not recorded empty", () => {
     expect(adoptEntries([{ session: "suite-x", cwd: "/w", argv: [] }], [], now)).toEqual([]);
+  });
+});
+
+/**
+ * The seam the pure adoption tests above cannot see.
+ *
+ * `adoptEntries` was tested with argv handed to it directly, so it has always
+ * passed. What was wrong lived one layer out, in the `ps` format string:
+ * `runningSessions` asked for THREE columns while `parseProcesses` parses FOUR,
+ * and the parser's `(\S+)` group silently consumed argv[0]. Adoption then
+ * recorded `tmux new-session … -c <cwd> --dangerously-load-development-channels`
+ * — a command with no program in it — and reported success, because
+ * `looksLikeAgent` matches on `comm` and `comm` was the piece that got eaten.
+ * Replaying it gives `command new-session: invalid flag --`.
+ */
+describe("reading the running agents off the process table", () => {
+  const PANES = "suite-brosnan\t39909\t/Volumes/Dev/agents/brosnan\n";
+  const PS = [
+    "  685     1 tmux             tmux new-session -d -s suite-brosnan -c /Volumes/Dev/agents/brosnan claude --continue",
+    "39909   685 claude           claude --dangerously-load-development-channels server:suite-channel --continue",
+    "39934 39909 bun              bun /Users/rock/Dev/sources/claude-code-suite-channel/src/index.ts",
+    "",
+  ].join("\n");
+
+  function psDeps(): RestoreDeps {
+    return {
+      tmux: {
+        env: {},
+        which: () => "/usr/bin/tmux",
+        async run(argv) {
+          if (argv.includes("list-panes")) return { exitCode: 0, stdout: PANES, stderr: "" };
+          if (argv[0] === "ps") {
+            // The contract under test: whatever format is requested must be the
+            // one `parseProcesses` reads. Anything else is answered emptily so
+            // a drifted format fails loudly instead of half-working.
+            const fmt = argv[2] ?? "";
+            return fmt === "pid=,ppid=,comm=,args="
+              ? { exitCode: 0, stdout: PS, stderr: "" }
+              : { exitCode: 0, stdout: "", stderr: "" };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      },
+      readRoster: () => null,
+      writeRoster: () => {},
+      now: () => new Date("2026-09-02T00:00:00.000Z"),
+      log: () => {},
+    };
+  }
+
+  test("keeps the program name, so the replayed command can actually run", async () => {
+    const found = await runningSessions(psDeps());
+    expect(found).toHaveLength(1);
+    expect(found[0]?.argv[0]).toBe("claude");
+  });
+
+  test("the adopted command starts a program, not a flag", async () => {
+    const [e] = adoptEntries(await runningSessions(psDeps()), [], "2026-09-02T00:00:00.000Z");
+    const afterCwd = e?.command[e.command.indexOf("/Volumes/Dev/agents/brosnan") + 1];
+    expect(afterCwd).toBe("claude");
+    expect(afterCwd?.startsWith("-")).toBe(false);
   });
 });

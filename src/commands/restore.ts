@@ -110,7 +110,15 @@ export async function runningSessions(deps: RestoreDeps): Promise<RunningSession
     "-F",
     "#{session_name}\t#{pane_pid}\t#{pane_current_path}",
   ]);
-  const ps = await deps.tmux.run(["ps", "-eo", "pid=,ppid=,args="]);
+  // FOUR columns, because that is what `parseProcesses` parses. This read
+  // `pid=,ppid=,args=` and the mismatch was silent in the worst direction: the
+  // parser's `(\S+)` group ate argv[0], so every adopted agent was recorded
+  // WITHOUT the program name — `tmux new-session … -c <cwd> --dangerously-…`.
+  // `looksLikeAgent` still matched (comm === "claude"), so adoption reported
+  // success and the roster looked entirely plausible, while replaying it gave
+  // `command new-session: invalid flag --` and no session at all. Two agents on
+  // a real host were unrestorable from the day they were adopted.
+  const ps = await deps.tmux.run(["ps", "-eo", "pid=,ppid=,comm=,args="]);
   const procs = parseProcesses(ps.stdout);
   const out: RunningSession[] = [];
   const seen = new Set<string>();

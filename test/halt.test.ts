@@ -29,6 +29,9 @@ const REAL_CONTEXT_HALT =
 const REAL_REQUEST_HALT =
   '{"type":"assistant","message":{"content":[{"type":"text","text":"Request too large for the API\'s 32MB request limit: this conversation is about 37.3MB, and none of it is images or documents that could be removed, so removing attachments or compacting cannot make it fit."}]},"requestId":"req_011Cxyz"}';
 
+const REAL_JOINED_HALT =
+  '{"type":"assistant","message":{"content":[{"type":"text","text":"Prompt is too long \u00b7 automatic compaction failed: Request too large for the API\'s 32MB request limit: this conversation is about 46.9MB, and none of it is images or documents that could be removed, so removing attachments or compacting cannot make it fit. Double press esc to go back past the large content, or /clear to start a new conversation."}]},"requestId":"req_011Cjoin"}';
+
 describe("halt detection", () => {
   test("finds the context-window wall in a real record", () => {
     expect(detectHalt(REAL_CONTEXT_HALT)).toBe("context_window");
@@ -36,6 +39,30 @@ describe("halt detection", () => {
 
   test("finds the request-size wall in a real record", () => {
     expect(detectHalt(REAL_REQUEST_HALT)).toBe("request_size");
+  });
+
+  /**
+   * The shape that was actually on a wedged host, and that neither marker
+   * matched: both walls in ONE message, because compaction was attempted and
+   * failed. The watcher called that session healthy for eleven hours.
+   */
+  test("finds the joined wall Claude Code emits when compaction fails", () => {
+    expect(detectHalt(REAL_JOINED_HALT)).toBe("request_size");
+  });
+
+  test("the joined wall still yields the size the API measured", () => {
+    expect(conversationMb(REAL_JOINED_HALT)).toBe(46.9);
+  });
+
+  /**
+   * A later record mentioning the ceiling must not reclassify an earlier
+   * context-window halt: the scan is bounded to the matched record.
+   */
+  test("does not borrow a request-size phrase from a following record", () => {
+    const tail =
+      REAL_CONTEXT_HALT +
+      '\n{"type":"assistant","message":{"content":[{"type":"text","text":"We hit Request too large for the API\'s 32MB request limit last week."}]}}';
+    expect(detectHalt(tail)).toBe("context_window");
   });
 
   test("healthy transcript tail detects nothing", () => {
@@ -55,6 +82,12 @@ describe("halt detection", () => {
     const discussing =
       '{"type":"assistant","message":{"content":[{"type":"text","text":"The halt record is \\"content\\":[{\\"type\\":\\"text\\",\\"text\\":\\"Prompt is too long\\"}] and we match it anchored."}]}}';
     expect(discussing).toContain("Prompt is too long");
+    expect(detectHalt(discussing)).toBeNull();
+  });
+
+  test("does NOT fire on an agent quoting the JOINED error in prose", () => {
+    const discussing =
+      '{"type":"assistant","message":{"content":[{"type":"text","text":"It said \\"Prompt is too long \u00b7 automatic compaction failed: Request too large for the API\'s 32MB request limit\\" and stopped."}]}}';
     expect(detectHalt(discussing)).toBeNull();
   });
 

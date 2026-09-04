@@ -45,18 +45,37 @@ export type HaltKind = "context_window" | "request_size";
  *
  * Each begins at the `"content":[{...}]` boundary so the match can only land on
  * a real assistant record. Do not "simplify" these to the bare sentence.
+ *
+ * THEY ARE PREFIXES, NOT WHOLE VALUES, and that is the correction. The first
+ * version of this list closed the `context_window` marker with `"}]`, which
+ * required the halt message to be the bare sentence and nothing else. Claude
+ * Code does not always emit it that way: when it tries to compact and cannot,
+ * it emits BOTH walls joined into one message —
+ *
+ *   "Prompt is too long · automatic compaction failed: Request too large for
+ *    the API's 32MB request limit: this conversation is about 46.9MB, …"
+ *
+ * — which matches neither marker: the first because the text keeps going, the
+ * second because `Request too large` is no longer at the start of the value.
+ * The record sat in a real transcript in exactly the anchored shape this module
+ * looks for, and `detectHalt` returned null for eleven hours while the watcher
+ * reported the session healthy. Anchoring is what makes the match honest;
+ * anchoring at BOTH ends is what made it blind.
  */
 export const HALT_MARKERS: ReadonlyArray<{ kind: HaltKind; marker: string }> = [
-  {
-    kind: "context_window",
-    marker: '"content":[{"type":"text","text":"Prompt is too long"}]',
-  },
   {
     kind: "request_size",
     marker:
       '"content":[{"type":"text","text":"Request too large for the API\'s 32MB request limit',
   },
+  {
+    kind: "context_window",
+    marker: '"content":[{"type":"text","text":"Prompt is too long',
+  },
 ];
+
+/** The sentence that makes a halt a request-size halt wherever it appears. */
+const REQUEST_SIZE_PHRASE = "Request too large for the API's 32MB request limit";
 
 /** Bytes of transcript tail to inspect. A halt is always terminal. */
 export const TAIL_BYTES = 65536;
@@ -75,12 +94,38 @@ export const TAIL_BYTES = 65536;
  */
 export const ASK_SCAN_BYTES = 2 * 1024 * 1024;
 
-/** The kind of halt present in a transcript tail, or null if healthy. */
+/**
+ * The kind of halt present in a transcript tail, or null if healthy.
+ *
+ * The joined message is classified as `request_size` rather than
+ * `context_window`, because the API's own words are that removing attachments
+ * or compacting "cannot make it fit" — the request ceiling is the wall that is
+ * actually holding, and the context window is only how it got there. Reading
+ * the same event as `context_window` would report a wall that a smaller next
+ * turn could get past, which is the wrong thing to tell an operator.
+ */
 export function detectHalt(tail: string): HaltKind | null {
   for (const { kind, marker } of HALT_MARKERS) {
-    if (tail.includes(marker)) return kind;
+    const at = tail.indexOf(marker);
+    if (at === -1) continue;
+    if (kind === "context_window" && haltText(tail, at).includes(REQUEST_SIZE_PHRASE)) {
+      return "request_size";
+    }
+    return kind;
   }
   return null;
+}
+
+/**
+ * The matched text value, bounded to its own record.
+ *
+ * Bounded rather than a fixed slice: a fixed window runs past the closing
+ * `"}]` into whatever record follows, so a later, unrelated mention of the
+ * request ceiling would reclassify this halt.
+ */
+function haltText(tail: string, at: number): string {
+  const end = tail.indexOf('"}]', at);
+  return end === -1 ? tail.slice(at) : tail.slice(at, end);
 }
 
 /**
