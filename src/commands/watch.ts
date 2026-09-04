@@ -20,6 +20,9 @@ import {
   detectHalt,
   planRecovery,
   sendEnterArgv,
+  capturePaneArgv,
+  clearPromptArgv,
+  promptLanded,
   sendLiteralArgv,
   telemetryRequest,
   claudeRoot,
@@ -242,6 +245,9 @@ export function rssBySession(
   return out;
 }
 
+/** How many times to retype a reorientation that did not land whole. */
+export const REORIENT_ATTEMPTS = 3;
+
 /**
  * Recover one session: clear it, then reorient it.
  *
@@ -250,18 +256,43 @@ export function rssBySession(
  * reorientation into a prompt that is still tearing down loses it silently, and
  * a silently lost reorientation is worse than none because the session looks
  * handled.
+ *
+ * THE PAUSE IS NOT SUFFICIENT, WHICH IS WHY THE PANE IS READ BACK. On the first
+ * real recovery this watcher performed, 1.5s was not enough: the reorientation
+ * was typed into a prompt still redrawing and only its last two lines arrived.
+ * The agent woke holding a truncated fragment and asked what had been cut off,
+ * while the log said "cleared and reoriented". A fixed pause cannot be proven
+ * long enough on a machine nobody is watching; reading back what is actually in
+ * the prompt can. So: type, look, and only press Enter once the opening line is
+ * there — otherwise clear the prompt and type it again.
+ *
+ * Returns whether the reorientation was delivered whole. A false is the honest
+ * answer for a session that was cleared and then left without its briefing, and
+ * the caller must not report it as recovered.
  */
 export async function recoverSession(
   deps: WatchDeps,
   session: string,
   prompt: string,
-): Promise<void> {
+): Promise<boolean> {
   const tmux = resolveTmux(deps.tmux.which);
   await deps.tmux.run(sendLiteralArgv(session, "/clear", tmux));
   await deps.tmux.run(sendEnterArgv(session, tmux));
   await deps.sleep(1500);
-  await deps.tmux.run(sendLiteralArgv(session, prompt, tmux));
-  await deps.tmux.run(sendEnterArgv(session, tmux));
+
+  for (let attempt = 1; attempt <= REORIENT_ATTEMPTS; attempt++) {
+    await deps.tmux.run(sendLiteralArgv(session, prompt, tmux));
+    const pane = await deps.tmux.run(capturePaneArgv(session, tmux));
+    if (promptLanded(pane.stdout, prompt)) {
+      await deps.tmux.run(sendEnterArgv(session, tmux));
+      return true;
+    }
+    // Whatever partial text did arrive must go, or the retry appends to it and
+    // the agent receives the fragment twice over.
+    await deps.tmux.run(clearPromptArgv(session, tmux));
+    await deps.sleep(1500);
+  }
+  return false;
 }
 
 /**
@@ -365,9 +396,12 @@ export async function runWatch(deps: WatchDeps, opts: WatchOptions): Promise<Hal
           contextTokens: contextTokens(tail),
           recentAsks: recentAsks(deps.readTail(newest.path, ASK_SCAN_BYTES) ?? tail),
         });
-        await recoverSession(deps, session, prompt);
-        recovered = true;
-        deps.log(`${session}: ${halt} — cleared and reoriented`);
+        recovered = await recoverSession(deps, session, prompt);
+        deps.log(
+          recovered
+            ? `${session}: ${halt} — cleared and reoriented`
+            : `${session}: ${halt} — CLEARED BUT NOT REORIENTED after ${REORIENT_ATTEMPTS} attempts; the session is usable but unbriefed`,
+        );
       } else {
         deps.log(`${session}: ${halt} — would clear and reorient (dry run)`);
       }
@@ -536,8 +570,14 @@ export async function forceRecover(
   });
 
   if (!opts.apply) return { recovered: false, reason: "dry run", prompt };
-  await recoverSession(deps, session, prompt);
-  return { recovered: true, reason: "cleared and reoriented", prompt };
+  const landed = await recoverSession(deps, session, prompt);
+  return {
+    recovered: landed,
+    reason: landed
+      ? "cleared and reoriented"
+      : "cleared, but the reorientation never landed in the prompt",
+    prompt,
+  };
 }
 
 /**

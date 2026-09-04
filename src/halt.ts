@@ -316,6 +316,37 @@ export function sendLiteralArgv(session: string, text: string, tmux = "tmux"): s
   return [tmux, "send-keys", "-t", session, "-l", text];
 }
 
+/** Read a pane's visible contents, to check what a send actually delivered. */
+export function capturePaneArgv(session: string, tmux = "tmux"): string[] {
+  return [tmux, "capture-pane", "-p", "-t", session];
+}
+
+/** Clear whatever is sitting in the prompt before typing into it again. */
+export function clearPromptArgv(session: string, tmux = "tmux"): string[] {
+  return [tmux, "send-keys", "-t", session, "C-u"];
+}
+
+/**
+ * Did the reorientation actually land in the prompt?
+ *
+ * THIS IS THE CHECK THE FIRST REAL RECOVERY NEEDED AND DID NOT HAVE. On a
+ * wedged agent, `/clear` was accepted and the reorientation was typed 1.5s
+ * later — and only its last two lines arrived. The head, including the sentence
+ * explaining that the context had been cleared, was swallowed by a prompt still
+ * redrawing. The watcher logged "cleared and reoriented" regardless, so the
+ * only evidence was the agent itself replying that its message was cut off.
+ *
+ * The opening is what gets lost, so the opening is what is checked. Both sides
+ * are whitespace-collapsed because the pane hard-wraps and re-indents anything
+ * long enough to matter.
+ */
+export function promptLanded(pane: string, prompt: string): boolean {
+  const flat = (t: string): string => t.replace(/\s+/g, " ").trim();
+  const head = flat(prompt.split("\n")[0] ?? "");
+  if (head === "") return true;
+  return flat(pane).includes(head);
+}
+
 /** Press Enter in a session. Separate call: `-l` would type the word. */
 export function sendEnterArgv(session: string, tmux = "tmux"): string[] {
   return [tmux, "send-keys", "-t", session, "Enter"];

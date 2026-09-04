@@ -9,6 +9,7 @@ import {
   conversationMb,
   detectHalt,
   planRecovery,
+  promptLanded,
   projectSlug,
   projectSlugResolved,
   resolveTmux,
@@ -306,5 +307,29 @@ describe("relocated Claude state", () => {
 
   test("and under home when there is no override", () => {
     expect(transcriptDir("/home/q", "/a/b")).toBe("/home/q/.claude/projects/-a-b");
+  });
+});
+
+describe("checking that a reorientation actually landed", () => {
+  const PROMPT =
+    "Your context was cleared automatically after the session hit the API's 32MB request limit.\n\nWorking directory: /w\n\nRe-read any file.";
+
+  test("sees the opening line in a pane that hard-wrapped it", () => {
+    const pane =
+      "\u276f Your context was cleared automatically after the session hit the API's\n  32MB request limit.\n\n  Working directory: /w";
+    expect(promptLanded(pane, PROMPT)).toBe(true);
+  });
+
+  /**
+   * The observed truncation: only the tail arrived. Matching on any part of the
+   * prompt would call this landed — the opening is checked precisely because
+   * the opening is the part that goes missing.
+   */
+  test("rejects a pane holding only the tail of the prompt", () => {
+    expect(promptLanded("\u276f Re-read any file.", PROMPT)).toBe(false);
+  });
+
+  test("an empty prompt is vacuously landed rather than an infinite retry", () => {
+    expect(promptLanded("", "")).toBe(true);
   });
 });

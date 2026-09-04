@@ -99,14 +99,59 @@ describe("reconstructing the recent asks", () => {
 
 describe("recovery ordering", () => {
   /**
+   * A pane that behaves like the real one: text typed into it shows up, and
+   * `C-u` wipes it. `swallowFirst` models the failure this feature was built
+   * from — a prompt still redrawing after `/clear` accepts a send and keeps
+   * almost none of it.
+   */
+  function paneDeps(swallowFirst = 0): { deps: WatchDeps; calls: string[] } {
+    const calls: string[] = [];
+    let pane = "";
+    let typed = 0;
+    const deps = {
+      tmux: {
+        env: {},
+        which: () => "/usr/bin/tmux",
+        async run(argv: string[]) {
+          calls.push(argv.join(" "));
+          if (argv[1] === "capture-pane") return { exitCode: 0, stdout: pane, stderr: "" };
+          if (argv.includes("C-u")) pane = "";
+          else if (argv.includes("-l")) {
+            const text = argv[argv.length - 1] ?? "";
+            if (text !== "/clear") {
+              typed += 1;
+              // A swallowed send keeps only the tail, exactly as observed.
+              pane += typed <= swallowFirst ? (text.split("\n").pop() ?? "") : text;
+            }
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      },
+      now: () => new Date("2026-09-02T00:00:00Z"),
+      async sleep(ms: number) {
+        calls.push(`sleep ${ms}`);
+      },
+      async post() {
+        return 200;
+      },
+      readTail: () => null,
+      newestTranscript: () => null,
+      log: () => {},
+    } as unknown as WatchDeps;
+    return { deps, calls };
+  }
+
+  const REORIENT = "Your context was cleared automatically.\n\nWorking directory: /w\n\nRe-read any file.";
+
+  /**
    * The pause is load-bearing. `/clear` must be accepted and the TUI redrawn
    * before the reorientation is typed; sent too early it lands in a prompt that
    * is tearing down and is lost silently — which is worse than sending nothing,
    * because the session then looks handled.
    */
-  test("clears, waits, then reorients", async () => {
-    const { deps, calls } = recordingDeps();
-    await recoverSession(deps, "suite-x", "REORIENT");
+  test("clears, waits, reorients, and presses Enter only once it sees the text", async () => {
+    const { deps, calls } = paneDeps();
+    expect(await recoverSession(deps, "suite-x", REORIENT)).toBe(true);
     // Absolute path, not bare "tmux": see resolveTmux — a watcher under
     // launchd or cron has a PATH without Homebrew, and a bare name there
     // fails silently and totally.
@@ -114,13 +159,40 @@ describe("recovery ordering", () => {
       "/usr/bin/tmux send-keys -t suite-x -l /clear",
       "/usr/bin/tmux send-keys -t suite-x Enter",
       "sleep 1500",
-      "/usr/bin/tmux send-keys -t suite-x -l REORIENT",
+      `/usr/bin/tmux send-keys -t suite-x -l ${REORIENT}`,
+      "/usr/bin/tmux capture-pane -p -t suite-x",
       "/usr/bin/tmux send-keys -t suite-x Enter",
     ]);
   });
 
+  /**
+   * THE CASE THIS EXISTS FOR. A send that arrives truncated must not be
+   * submitted: the agent would wake holding a fragment, which is what happened
+   * on the first real recovery — it replied asking what had been cut off, while
+   * the watcher's log said "cleared and reoriented".
+   */
+  test("retypes a send that arrived truncated, and does not submit the fragment", async () => {
+    const { deps, calls } = paneDeps(1);
+    expect(await recoverSession(deps, "s", REORIENT)).toBe(true);
+    const typed = calls.filter((c) => c.includes(`-l ${REORIENT}`));
+    expect(typed).toHaveLength(2);
+    // The partial text is wiped before the retry, or the agent gets it twice.
+    expect(calls.indexOf("/usr/bin/tmux send-keys -t s C-u")).toBeLessThan(
+      calls.lastIndexOf(`/usr/bin/tmux send-keys -t s -l ${REORIENT}`),
+    );
+    // One Enter for /clear. The second only comes after the pane read back whole.
+    expect(calls.filter((c) => c.endsWith("-t s Enter"))).toHaveLength(2);
+  });
+
+  test("reports failure rather than success when it never lands", async () => {
+    const { deps, calls } = paneDeps(99);
+    expect(await recoverSession(deps, "s", REORIENT)).toBe(false);
+    // Only the Enter that submitted /clear. The briefing was never submitted.
+    expect(calls.filter((c) => c.endsWith("-t s Enter"))).toHaveLength(1);
+  });
+
   test("the prompt is sent literally, so its slashes are not read as keys", async () => {
-    const { deps, calls } = recordingDeps();
+    const { deps, calls } = paneDeps();
     await recoverSession(deps, "s", "/not-a-command");
     expect(calls.some((c) => c.endsWith("send-keys -t s -l /not-a-command"))).toBe(true);
   });
