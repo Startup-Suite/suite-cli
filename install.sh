@@ -126,14 +126,20 @@ fetch() {
 	resolve_gh_token
 	if command -v curl >/dev/null 2>&1; then
 		# --fail turns an HTTP error into a non-zero exit rather than a body.
-		if [ -n "$GH_TOKEN" ]; then
-			curl -fsSL -H "Authorization: token $GH_TOKEN" "$1" -o "$2"
+		#
+		# "${GH_TOKEN:-}", not "$GH_TOKEN": under `set -u` an unset parameter
+		# kills the whole script. When gh is not on PATH (the shape of the CI
+		# container, and of a bare curl|sh install), resolve_gh_token never
+		# assigns the variable, and the bare form dies instantly with
+		# "GH_TOKEN: parameter not set" and exit 2.
+		if [ -n "${GH_TOKEN:-}" ]; then
+			curl -fsSL -H "Authorization: token ${GH_TOKEN}" "$1" -o "$2"
 		else
 			curl -fsSL "$1" -o "$2"
 		fi
 	elif command -v wget >/dev/null 2>&1; then
-		if [ -n "$GH_TOKEN" ]; then
-			wget -q --header="Authorization: token $GH_TOKEN" -O "$2" "$1"
+		if [ -n "${GH_TOKEN:-}" ]; then
+			wget -q --header="Authorization: token ${GH_TOKEN}" -O "$2" "$1"
 		else
 			wget -q -O "$2" "$1"
 		fi
