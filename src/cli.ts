@@ -10,12 +10,51 @@ import { row, nextCommand } from "./ui.ts";
 import { liveDeps, runInit } from "./commands/init.ts";
 import { liveClaudeDeps, runClaude } from "./commands/claude.ts";
 import { liveDoctorDeps, runDoctor } from "./commands/doctor.ts";
+import { hostname } from "node:os";
 import { runStatus } from "./commands/status.ts";
+import {
+  forceRecover,
+  liveWatchDeps,
+  overCeiling,
+  parseWatchArgs,
+  runWatch,
+  shouldSelfInstall,
+} from "./commands/watch.ts";
+import { liveRestoreDeps, runRestore } from "./commands/restore.ts";
+import {
+  installSupervisor,
+  liveSupervisorIo,
+  readTelemetryAuth,
+  resolveSelfBinary,
+  supervisorPlan,
+} from "./supervisor.ts";
+import { readFileSync as readFileForAuth } from "node:fs";
+
+/** Telemetry auth from env or the 0600 env file; absent is a valid answer. */
+function telemetryAuth(): string | null {
+  return readTelemetryAuth(process.env, (p) => {
+    try {
+      return readFileForAuth(p, "utf8");
+    } catch {
+      return null;
+    }
+  });
+}
+import { emptyConfig, readConfig } from "./config.ts";
 import { liveDeepseekDeps, runDeepseek } from "./commands/deepseek.ts";
 import { liveUpdateDeps, runUpdate } from "./commands/update.ts";
 import { ttyPrompter } from "./secrets.ts";
 
-export type Verb = "init" | "claude" | "claude new" | "deepseek" | "doctor" | "status" | "update";
+export type Verb =
+  | "init"
+  | "claude"
+  | "claude new"
+  | "deepseek"
+  | "doctor"
+  | "status"
+  | "update"
+  | "watch"
+  | "restore";
 
 export interface Dispatch {
   verb: Verb | null;
@@ -23,7 +62,7 @@ export interface Dispatch {
   args: string[];
 }
 
-const VERBS = new Set(["init", "claude", "deepseek", "doctor", "status", "update"]);
+const VERBS = new Set(["init", "claude", "deepseek", "doctor", "status", "update", "watch", "restore"]);
 
 /**
  * Pure: map argv to a verb plus untouched passthrough arguments.
@@ -81,12 +120,18 @@ export function parseClaudeOptions(args: string[]): { session?: string; rest: st
  * The only options `suite init` parses. Everything else the CLI takes is a
  * verb, deliberately: an option surface is a thing to keep compatible forever.
  */
-export function parseInitOptions(args: string[]): { checkout?: string; tokenFromEnv?: string } {
-  const out: { checkout?: string; tokenFromEnv?: string } = {};
+export function parseInitOptions(args: string[]): {
+  checkout?: string;
+  tokenFromEnv?: string;
+  noSupervisor?: boolean;
+} {
+  const out: { checkout?: string; tokenFromEnv?: string; noSupervisor?: boolean } = {};
   for (let i = 0; i < args.length; i++) {
     const next = args[i + 1];
     if (args[i] === "--checkout" && next !== undefined) out.checkout = next;
     if (args[i] === "--token-from-env" && next !== undefined) out.tokenFromEnv = next;
+    // Opting OUT. Installing the watchdog is the default; see InitOptions.
+    if (args[i] === "--no-supervisor") out.noSupervisor = true;
   }
   return out;
 }
@@ -96,12 +141,14 @@ export function usage(): string {
     "",
     row("suite", VERSION),
     "",
-    row("init", "wire this machine to Suite"),
+    row("init", "wire this machine to Suite (installs the watchdog; --no-supervisor to skip)"),
     row("claude", "run Claude Code in a persistent session"),
     row("claude new", "force a new session"),
     row("deepseek", "run a DeepSeek Harness agent federated into Suite"),
     row("doctor", "diagnose a broken setup"),
     row("status", "show federation and session state"),
+    row("watch", "recover halted agent sessions (--dry-run, --once, --interval N, --force SESSION)"),
+    row("restore", "bring recorded agents back up (--adopt, --dry-run, --forget NAME)"),
     row("update", "install the latest suite CLI"),
     "",
     nextCommand("suite init"),
@@ -142,6 +189,100 @@ export async function run(argv: string[]): Promise<number> {
     // Ours: `--root DIR` before a `--`. Everything else reaches dsh verbatim.
     const { args } = parse(argv);
     return runDeepseek(args, liveDeepseekDeps());
+  }
+  if (verb === "watch") {
+    const { args } = parse(argv);
+    const opts = parseWatchArgs(args);
+    const deps = liveWatchDeps();
+
+    // Forced recovery: prove the clear + reorient path on demand.
+    if (opts.force) {
+      const base = {
+        apply: opts.apply,
+        config: (await readConfig()) ?? emptyConfig(),
+        auth: telemetryAuth(),
+        host: hostname(),
+        home: process.env.HOME ?? "",
+      };
+      const res = await forceRecover(deps, base, opts.force);
+      console.log(`suite watch: ${opts.force}: ${res.reason}`);
+      if (res.prompt) console.log(`--- reorientation sent ---\n${res.prompt}`);
+      return res.recovered || !opts.apply ? 0 : 1;
+    }
+
+    // Self-installing: typing `suite watch` leaves behind a service that
+    // outlives the terminal, rather than a loop that dies with it. The daemon
+    // it installs is marked so it does not reinstall itself on every restart.
+    if (shouldSelfInstall(opts, process.env)) {
+      const home = process.env.HOME ?? "";
+      const plan = supervisorPlan({
+        platform: process.platform,
+        home,
+        binary: resolveSelfBinary(process.env, process.argv),
+        inheritedPath: process.env.PATH,
+        inheritedLocale: process.env.LANG ?? process.env.LC_ALL,
+        intervalSeconds: opts.intervalSeconds,
+      });
+      const res = await installSupervisor(liveSupervisorIo(), plan);
+      console.log(
+        res.installed
+          ? `suite watch: running as ${res.summary} — nothing further to set up`
+          : `suite watch: ${res.summary}`,
+      );
+      // One sweep now, so the operator sees the current state immediately
+      // rather than waiting a full interval to learn it works.
+      await runWatch(deps, {
+        apply: opts.apply,
+        config: (await readConfig()) ?? emptyConfig(),
+        auth: telemetryAuth(),
+        host: hostname(),
+        home,
+      });
+      return res.installed ? 0 : 1;
+    }
+    const config = (await readConfig()) ?? emptyConfig();
+    const base = {
+      apply: opts.apply,
+      config,
+      auth: telemetryAuth(),
+      host: hostname(),
+      home: process.env.HOME ?? "",
+    };
+    if (opts.once) {
+      await runWatch(deps, base);
+      return 0;
+    }
+    // Long-running: a halt is permanent until something acts, so a missed pass
+    // costs latency rather than correctness. Errors are logged and the loop
+    // continues; exiting would leave every later halt unattended.
+    for (;;) {
+      try {
+        await runWatch(deps, base);
+      } catch (err) {
+        console.error(`suite watch: pass failed: ${(err as Error).message}`);
+      }
+      // Bounded by construction. On macOS this is the ONLY memory bound, since
+      // launchd has no MemoryMax; the supervisor restarts us clean.
+      const over = overCeiling(process.memoryUsage().rss);
+      if (over) {
+        console.error(`suite watch: exiting for a clean restart — ${over}`);
+        return 1;
+      }
+      await deps.sleep(opts.intervalSeconds * 1000);
+    }
+  }
+  if (verb === "restore") {
+    const { args } = parse(argv);
+    const i = args.indexOf("--forget");
+    const forget = i === -1 ? undefined : args[i + 1];
+    const res = await runRestore(liveRestoreDeps(), process.env.HOME ?? "", {
+      apply: !args.includes("--dry-run"),
+      forget,
+      adopt: args.includes("--adopt"),
+    });
+    // Failing to restore an agent is a real failure; a fully-skipped run on a
+    // healthy box is a success, which is what makes this safe to run at boot.
+    return res.failed.length > 0 ? 1 : 0;
   }
   if (verb === "update") return runUpdate(liveUpdateDeps());
   if (verb === "doctor") return runDoctor(await liveDoctorDeps());

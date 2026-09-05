@@ -166,6 +166,86 @@ describe("init on a machine where nothing is installed", () => {
     expect(fx.env.PATH).toBe(fx.bin);
   });
 
+  /**
+   * The watchdog is only installed when an IO is injected, which is what keeps
+   * the rest of this suite from writing real unit files. That makes it possible
+   * for it to be silently skipped forever, so these two tests exist to prove it
+   * actually fires when wired, and only then.
+   */
+  test("installs the session watchdog by default", async () => {
+    const fx = makeFixture();
+    const calls: string[] = [];
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      platform: "linux",
+      supervisorIo: {
+        mkdirp: (d) => calls.push(`mkdirp ${d}`),
+        writeFile: (path, contents) => calls.push(`write ${path} :: ${contents.length}B`),
+        run: async (argv) => {
+          calls.push(argv.join(" "));
+          return { exitCode: 0 };
+        },
+      },
+    });
+
+    const result = await runInit(deps);
+
+    expect(result.supervisor?.installed).toBe(true);
+    expect(calls.some((c) => c.startsWith("write ") && c.includes("suite-watch.service"))).toBe(true);
+    expect(calls).toContain("systemctl --user enable --now suite-watch.service");
+    expect(deps.lines.some((l) => l.includes("watchdog:"))).toBe(true);
+  });
+
+  /**
+   * Restore-on-boot is WRITTEN but never ENABLED. A host that silently starts
+   * agents after a reboot would be a worse surprise than the missing agent it
+   * fixes, so the operator opts in per machine and init only prints how.
+   */
+  test("writes the agent restore unit but does not enable it", async () => {
+    const fx = makeFixture();
+    const calls: string[] = [];
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      platform: "linux",
+      supervisorIo: {
+        mkdirp: (d) => calls.push(`mkdirp ${d}`),
+        writeFile: (path) => calls.push(`write ${path}`),
+        run: async (argv) => {
+          calls.push(argv.join(" "));
+          return { exitCode: 0 };
+        },
+      },
+    });
+
+    await runInit(deps);
+
+    expect(calls.some((c) => c === "write /home/q/.config/systemd/user/suite-agents.service" ||
+      c.endsWith("suite-agents.service"))).toBe(true);
+    // The watchdog IS enabled; the agent restore is NOT. Assert the absence
+    // specifically, or "we enabled everything" would pass this test.
+    expect(calls.some((c) => c.includes("enable") && c.includes("suite-agents"))).toBe(false);
+    expect(deps.lines.some((l) => l.includes("NOT enabled"))).toBe(true);
+  });
+
+  test("--no-supervisor declines it, and nothing is written", async () => {
+    const fx = makeFixture();
+    const calls: string[] = [];
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      platform: "linux",
+      supervisorIo: {
+        mkdirp: (d) => calls.push(d),
+        writeFile: (p2) => calls.push(p2),
+        run: async (argv) => {
+          calls.push(argv.join(" "));
+          return { exitCode: 0 };
+        },
+      },
+    });
+
+    const result = await runInit(deps, { noSupervisor: true });
+
+    expect(result.supervisor ?? null).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
   test("takes the clone path, runs bun install, and registers both entries at user scope", async () => {
     const fx = makeFixture();
     const prompter = scriptedPrompter(credentialAnswers());

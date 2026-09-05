@@ -28,6 +28,8 @@ import { dirname } from "node:path";
 import { readConfig, emptyConfig, type SuiteConfig } from "../config.ts";
 import { statePath } from "../paths.ts";
 import { createStore, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
+import { type RestoreDeps, liveRestoreDeps, recordLaunch } from "./restore.ts";
+import { type SupervisorIo, ensureSupervision, liveSupervisorIo } from "../supervisor.ts";
 import { confirm, type InstallPlan } from "./init.ts";
 import { CLAUDE_CODE_URL } from "./doctor.ts";
 import { colorEnabled } from "../ui.ts";
@@ -453,6 +455,18 @@ export interface ClaudeDeps {
   tmux: TmuxDeps;
   env: Record<string, string | undefined>;
   cwd: string;
+  /**
+   * How launches are recorded for restore-on-boot. Optional by construction:
+   * a caller that supplies nothing records nothing, which is what keeps the
+   * test suite from writing a real roster into a developer's home directory.
+   */
+  restore?: RestoreDeps;
+  /**
+   * How supervision reaches the filesystem and service manager. Optional for
+   * the same reason `restore` is: a caller that supplies nothing installs
+   * nothing, which is what keeps the test suite from writing real units.
+   */
+  supervisorIo?: SupervisorIo;
   store: CredentialStore;
   config: SuiteConfig;
   statePath: string;
@@ -538,6 +552,40 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
       deps.err(`tmux could not create ${session}: ${created.stderr.trim()}`);
       return created.exitCode;
     }
+    // Record for restore-on-boot. A by-product of launching, never a list the
+    // operator maintains — a hand-curated roster is wrong exactly when needed.
+    //
+    // INJECTED, not imported: a caller that supplies no restore deps records
+    // nothing. That is what stops the test suite writing a real roster into the
+    // developer's home directory, which is exactly what it did before this.
+    if (deps.restore) {
+      recordLaunch(deps.restore, deps.env.HOME ?? "", {
+        session,
+        command: plan.create,
+        cwd: deps.cwd,
+        kind: "claude",
+      });
+    }
+
+    // A session started on an unsupervised box is the one that dies quietly
+    // overnight, so creating one also guarantees the watchdog exists. Only on
+    // CREATE — re-attaching to a live session changes nothing about the host.
+    if (deps.supervisorIo) {
+      const home = deps.env.HOME ?? "";
+      const sup = await ensureSupervision(deps.supervisorIo, {
+        // ClaudeDeps types platform as a plain string (it is injected in tests
+        // as arbitrary values); supervisorPlan only branches on darwin/linux
+        // and treats anything else as unsupported, so narrowing here is safe.
+        platform: deps.platform as NodeJS.Platform,
+        home,
+        binary: `${home}/.local/bin/suite`,
+        inheritedPath: deps.env.PATH,
+        inheritedLocale: deps.env.LANG ?? deps.env.LC_ALL,
+        intervalSeconds: 60,
+      });
+      deps.err(`watchdog: ${sup.watchdog}`);
+      if (sup.restore) deps.err(`restore-on-boot written (not enabled): ${sup.restore}`);
+    }
     /*
      * A display option that will not apply is not a reason to refuse the agent
      * the user asked for — but it is not allowed to fail quietly either, or the
@@ -570,6 +618,8 @@ export async function liveClaudeDeps(
 ): Promise<ClaudeDeps> {
   const config = (await readConfig({ env })) ?? emptyConfig();
   return {
+    restore: liveRestoreDeps(),
+    supervisorIo: liveSupervisorIo(),
     tmux: liveTmuxDeps(env),
     platform: process.platform,
     prompter,

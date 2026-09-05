@@ -24,7 +24,7 @@
  *     prints the raw line — never a false green.
  */
 import { resolve } from "node:path";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import {
   createStore,
@@ -47,6 +47,14 @@ import {
 } from "../claude_md.ts";
 import { readConfig, writeConfig, type SuiteConfig } from "../config.ts";
 import { nextCommand, row } from "../ui.ts";
+import {
+  type SupervisorIo,
+  type SupervisorResult,
+  installSupervisor,
+  restoreUnitPlan,
+  supervisorPlan,
+  writeRestoreUnit,
+} from "../supervisor.ts";
 
 /* ------------------------------------------------------------------------- */
 /* Empirical finding — ${ENV_VAR} interpolation                               */
@@ -96,6 +104,15 @@ export interface InitDeps {
   isTTY: boolean;
   /** Where a starting CLAUDE.md is written. The agent's working directory. */
   cwd: string;
+  /**
+   * How the session watchdog reaches the filesystem and the service manager.
+   *
+   * Injected rather than imported so `init` has no unmockable side effect: a
+   * caller that supplies nothing installs nothing. That is what keeps the test
+   * suite from writing real unit files and shelling out to systemctl, and it is
+   * why this is optional rather than defaulted to the live implementation.
+   */
+  supervisorIo?: SupervisorIo;
   out(line: string): void;
 }
 
@@ -107,6 +124,15 @@ export interface InitOptions {
    * {@link ENV_INTERPOLATION_SUPPORTED} for why this is not the default.
    */
   tokenFromEnv?: string;
+  /**
+   * Skip installing the session watchdog.
+   *
+   * Installing is the DEFAULT and that is the whole point: a watchdog an
+   * operator has to find out about is one that is not running on the morning it
+   * was needed. This flag exists for boxes where clearing a session
+   * automatically is not wanted, not as a way to defer the decision.
+   */
+  noSupervisor?: boolean;
 }
 
 export const PLUGIN_REPO = "https://github.com/Startup-Suite/claude-code-suite-channel.git";
@@ -509,6 +535,8 @@ export const FEDERATE_HINT = [
 ].join("\n");
 
 export interface InitResult {
+  /** Null when the operator declined with --no-supervisor. */
+  supervisor?: SupervisorResult | null;
   exitCode: number;
   /** True when tmux is unavailable — sessions will not outlive a terminal. */
   tmuxMissing: boolean;
@@ -676,10 +704,49 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
   const report = connectionReport(statuses);
   for (const line of report.lines) say(line);
 
+  // The watchdog, installed unless explicitly declined.
+  let supervisor: SupervisorResult | null = null;
+  if (!options.noSupervisor && deps.supervisorIo) {
+    const home = deps.env.HOME ?? "";
+    const plan = supervisorPlan({
+      platform: deps.platform,
+      home,
+      // Absolute path: a service inherits a minimal PATH, and a bare name there
+      // fails to start with no useful signal.
+      binary: `${home}/.local/bin/suite`,
+      inheritedPath: deps.env.PATH,
+      inheritedLocale: deps.env.LANG ?? deps.env.LC_ALL,
+      intervalSeconds: 60,
+    });
+    supervisor = await installSupervisor(deps.supervisorIo, plan);
+    say(
+      supervisor.installed
+        ? `watchdog: ${supervisor.summary}`
+        : `watchdog NOT running: ${supervisor.summary}`,
+    );
+
+    // Agent restore-on-boot: written, deliberately NOT enabled. An operator
+    // opts in per machine; a host that silently starts agents after a reboot
+    // would be a worse surprise than the missing agent this fixes.
+    const restore = restoreUnitPlan({
+      platform: deps.platform,
+      home,
+      binary: `${home}/.local/bin/suite`,
+      inheritedPath: deps.env.PATH,
+      intervalSeconds: 60,
+    });
+    if (restore) {
+      writeRestoreUnit(deps.supervisorIo, restore);
+      say(`agent restore-on-boot written (NOT enabled). To turn it on:`);
+      say(`  ${restore.enableHint}`);
+    }
+  }
+
   say("");
   say(nextCommand("suite claude"));
 
   return {
+    supervisor,
     exitCode: report.ok ? 0 : 1,
     tmuxMissing: !tmux.present,
     checkout: outcome,
@@ -700,5 +767,10 @@ export function liveDeps(prompter: Prompter, store: CredentialStore = createStor
     cwd: process.cwd(),
     out: (line) => void process.stdout.write(`${line}\n`),
     run: (argv, options) => spawnWithSecrets(argv, store, options),
+    supervisorIo: {
+      mkdirp: (dir) => void mkdirSync(dir, { recursive: true }),
+      writeFile: (path, contents) => void writeFileSync(path, contents),
+      run: async (argv) => ({ exitCode: (await spawnWithSecrets(argv, store)).exitCode }),
+    },
   };
 }

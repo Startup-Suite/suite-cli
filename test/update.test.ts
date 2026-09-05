@@ -18,6 +18,7 @@ import {
   installerUrl,
   refIsSafe,
   resolveRef,
+  SIGPIPE_EXIT,
   runUpdate,
   updateArgv,
   type UpdateDeps,
@@ -186,5 +187,30 @@ describe("the update exits with the installer's own code", () => {
   test("a failed install is reported as failed, not swallowed", async () => {
     const d = deps({ exec: async () => 3 });
     expect(await runUpdate(d)).toBe(3);
+    expect(d.stderr.join(" ")).toContain("exited 3");
+  });
+
+  /**
+   * `suite update | head` — the reader exits, the installer dies of SIGPIPE
+   * partway, and every word explaining what was happening went into the pipe
+   * that just closed. What is left on screen is the announcement with no
+   * ending, which reads as success. Found by noticing the deployed file did
+   * not contain the change that had just been "installed".
+   */
+  test("a cut-off install says so on STDERR, where a closed pipe cannot eat it", async () => {
+    const d = deps({ exec: async () => SIGPIPE_EXIT });
+    expect(await runUpdate(d)).toBe(SIGPIPE_EXIT);
+    const said = d.stderr.join(" ");
+    expect(said).toContain("NOTHING WAS INSTALLED");
+    expect(said).toContain("piped");
+    // The reassurance matters as much as the alarm: the user is on the old
+    // version and it still works, because install.sh swaps only at the end.
+    expect(said).toContain("previous version is intact");
+  });
+
+  test("a successful install says nothing on stderr", async () => {
+    const d = deps({ exec: async () => 0 });
+    expect(await runUpdate(d)).toBe(0);
+    expect(d.stderr).toEqual([]);
   });
 });
