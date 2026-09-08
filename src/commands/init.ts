@@ -92,7 +92,7 @@ export function envReference(variable: string): string {
 
 export type Runner = (
   argv: string[],
-  options?: { cwd?: string; allowSecretsInArgv?: boolean },
+  options?: { cwd?: string; allowSecretsInArgv?: boolean; env?: Record<string, string | undefined> },
 ) => Promise<SpawnResult>;
 
 export interface InitDeps {
@@ -299,22 +299,96 @@ export function spinner(label: string, deps: Pick<InitDeps, "isTTY">): { stop():
 /* The plugin checkout                                                        */
 /* ------------------------------------------------------------------------- */
 
+/**
+ * Why a `git pull --ff-only` failed, as far as its own output will say.
+ *
+ * THE MESSAGE MUST NOT ASSERT A CAUSE IT DID NOT DETERMINE. The first version
+ * of this error printed git's stderr and then, unconditionally, "it has local
+ * commits or a diverged history". On a real host that line was false: the
+ * checkout was clean and exactly level with origin, and the pull had failed
+ * because the HTTPS remote had no usable credential. The operator was handed
+ * git's own "Authentication failed" and a sentence telling them to go resolve a
+ * divergence that did not exist.
+ */
+export type PullFailureKind = "auth" | "diverged" | "unknown";
+
+export function classifyPullFailure(detail: string): PullFailureKind {
+  const d = detail.toLowerCase();
+  if (
+    d.includes("authentication failed") ||
+    d.includes("invalid username or token") ||
+    d.includes("could not read username") ||
+    d.includes("permission denied (publickey)") ||
+    d.includes("terminal prompts disabled")
+  ) {
+    return "auth";
+  }
+  if (d.includes("non-fast-forward") || d.includes("diverged") || d.includes("not possible to fast-forward")) {
+    return "diverged";
+  }
+  return "unknown";
+}
+
+/** What to tell the operator to do, given what actually went wrong. */
+export function pullRemedyLines(kind: PullFailureKind, dir: string): string[] {
+  switch (kind) {
+    case "auth":
+      return [
+        `  git could not authenticate to the remote. The checkout itself is probably fine.`,
+        `  Either give git a credential — \`gh auth setup-git\` — or point it at SSH:`,
+        `    git -C ${dir} remote set-url origin git@github.com:Startup-Suite/claude-code-suite-channel.git`,
+      ];
+    case "diverged":
+      return [
+        `  it has local commits or a diverged history. Resolve it there, or move it aside.`,
+        `  init will not force, reset or delete a checkout it did not create.`,
+      ];
+    default:
+      return [
+        `  init could not tell why from git's output above, so it is not guessing.`,
+        `  init will not force, reset or delete a checkout it did not create.`,
+      ];
+  }
+}
+
 export class PullFailed extends Error {
   readonly exitCode = 4;
+  readonly kind: PullFailureKind;
   constructor(dir: string, detail: string) {
+    const kind = classifyPullFailure(detail);
     super(
       [
         `the plugin checkout at ${dir} could not be fast-forwarded:`,
         detail.trim(),
-        `  it has local commits or a diverged history. Resolve it there, or move it aside.`,
-        `  init will not force, reset or delete a checkout it did not create.`,
+        ...pullRemedyLines(kind, dir),
       ].join("\n"),
     );
     this.name = "PullFailed";
+    this.kind = kind;
   }
 }
 
 export type CheckoutOutcome = "cloned" | "updated";
+
+/**
+ * Never let git ask the operator a question here.
+ *
+ * These git calls run underneath a spinner. When the remote wants credentials
+ * git writes "Username for 'https://github.com':" straight to the terminal, the
+ * spinner repaints over it, and what the operator sees is a corrupted line —
+ * observed for real as `plugin  ⠹anername for 'https://github.com':`. A prompt
+ * nobody can read is worse than a refusal: with the prompt disabled git fails
+ * immediately and says why, which `classifyPullFailure` can then act on.
+ */
+export function noGitPrompt(
+  env: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  // MERGED, not replaced. `spawnWithSecrets` uses `options.env` as the whole
+  // environment rather than an overlay, so handing it the one variable would
+  // run git with no PATH, no HOME and therefore no credential helper or SSH
+  // config — turning "cannot authenticate" into a different, stranger failure.
+  return { ...env, GIT_TERMINAL_PROMPT: "0" };
+}
 
 /**
  * Clone the plugin, or fast-forward an existing checkout.
@@ -325,12 +399,12 @@ export type CheckoutOutcome = "cloned" | "updated";
  */
 export async function cloneOrUpdate(dir: string, deps: InitDeps): Promise<CheckoutOutcome> {
   if (existsSync(resolve(dir, ".git"))) {
-    const r = await deps.run(["git", "pull", "--ff-only"], { cwd: dir });
+    const r = await deps.run(["git", "pull", "--ff-only"], { cwd: dir, env: noGitPrompt(deps.env) });
     if (r.exitCode !== 0) throw new PullFailed(dir, r.stderr || r.stdout);
     return "updated";
   }
   await mkdir(resolve(dir, ".."), { recursive: true });
-  const r = await deps.run(["git", "clone", PLUGIN_REPO, dir]);
+  const r = await deps.run(["git", "clone", PLUGIN_REPO, dir], { env: noGitPrompt(deps.env) });
   if (r.exitCode !== 0) {
     throw new Error(`git clone failed: ${(r.stderr || r.stdout).trim()}`);
   }
