@@ -9,7 +9,6 @@ import {
   AGENT,
   DEV_CHANNEL_ARGS,
   SKIP_PERMISSIONS_ARG,
-  CONTINUE_ARG,
   suiteArgs,
   NESTED_REFUSAL_EXIT,
   NOTICE_BODY,
@@ -21,6 +20,7 @@ import {
   parseState,
   readState,
   runClaude,
+  CONTINUE_ARG,
   SESSION_DIED_EXIT,
   stripTerminator,
   uniqueSessionName,
@@ -853,6 +853,89 @@ describe("a session that is created and does not survive", () => {
 
     expect(await runClaude(r.deps, { userArgs: [], force: false })).toBe(SESSION_DIED_EXIT);
     expect([...r.out, ...r.err].join("\n")).not.toContain("survives this terminal");
+  });
+
+  /**
+   * A FIRST RUN HAS NOTHING TO CONTINUE.
+   *
+   * `suiteArgs` injects `--continue` so a restarted agent resumes. In a
+   * directory that has never held a conversation Claude answers "No
+   * conversation found to continue" and exits 1 — so the very first launch of
+   * every new agent died. Reproduced in a real agent's directory, where the
+   * identical command without `--continue` stayed up.
+   */
+  test("retries without --continue when the first launch had nothing to resume", async () => {
+    let session: string | null = null;
+    let attempts = 0;
+    const written: string[] = [];
+    const r = recorder(
+      {
+        restore: {
+          tmux: { env: {}, which: () => "/usr/bin/tmux", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+          readRoster: () => null,
+          writeRoster: (_p, c) => void written.push(c),
+          now: () => new Date("2026-09-08T00:00:00.000Z"),
+          log: () => {},
+        },
+      },
+      async (argv) => {
+        if (argv.includes("new-session")) {
+          attempts += 1;
+          const i = argv.indexOf("-s");
+          session = argv[i + 1] ?? null;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv.includes("list-panes")) {
+          return { exitCode: 0, stdout: session === null ? "" : `${session}\t4242\tzsh\n`, stderr: "" };
+        }
+        if (argv[0] === "ps") {
+          // The agent survives only the attempt that omitted --continue.
+          const alive = attempts >= 2;
+          return {
+            exitCode: 0,
+            stdout: alive
+              ? "  4242     1 zsh              -zsh\n  4243  4242 claude           claude\n"
+              : "  4242     1 zsh              -zsh\n",
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    );
+
+    const code = await runClaude(r.deps, { userArgs: [], force: false });
+    expect(code).not.toBe(SESSION_DIED_EXIT);
+
+    const creates = r.ran.filter((a) => a.includes("new-session"));
+    expect(creates).toHaveLength(2);
+    expect(creates[0]).toContain(CONTINUE_ARG);
+    expect(creates[1]).not.toContain(CONTINUE_ARG);
+    expect([...r.out, ...r.err].join("\n")).toContain("no previous conversation");
+
+    // The ROSTER must hold what actually worked. Recording the --continue form
+    // would make restore-on-boot replay the command that just failed.
+    expect(written.join("")).not.toContain(CONTINUE_ARG);
+  });
+
+  test("does not retry when --continue was not the wrapper's idea", async () => {
+    let session: string | null = null;
+    const r = recorder({}, async (argv) => {
+      if (argv.includes("new-session")) {
+        const i = argv.indexOf("-s");
+        session = argv[i + 1] ?? null;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (argv.includes("list-panes")) {
+        return { exitCode: 0, stdout: session === null ? "" : `${session}\t4242\tzsh\n`, stderr: "" };
+      }
+      if (argv[0] === "ps") return { exitCode: 0, stdout: "  4242     1 zsh              -zsh\n", stderr: "" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    // `--resume` is a session selector, so suiteArgs adds no --continue and
+    // there is nothing to strip; a dead session is simply dead.
+    expect(await runClaude(r.deps, { userArgs: ["--resume"], force: false })).toBe(SESSION_DIED_EXIT);
+    expect(r.ran.filter((a) => a.includes("new-session"))).toHaveLength(1);
   });
 
   test("CONTROL: a session that IS alive is reported started and recorded", async () => {

@@ -575,6 +575,11 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
 
   if (plan.kill !== undefined) await deps.tmux.run(plan.kill);
   if (plan.create !== undefined) {
+    // What actually launched. Diverges from `plan.create` only on the
+    // no-conversation-to-continue retry below, and it is what gets recorded for
+    // restore-on-boot — replaying a command that did not work is worse than
+    // replaying none.
+    let launched = plan.create;
     const created = await deps.tmux.run(plan.create);
     if (created.exitCode !== 0) {
       deps.err(`tmux could not create ${session}: ${created.stderr.trim()}`);
@@ -611,14 +616,42 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     // startup failure; an agent that dies an hour later is the watchdog's job,
     // not this one's.
     await (deps.sleep ?? realSleep)(SETTLE_MS);
-    const state = await detectState(session, deps.tmux);
+    let state = await detectState(session, deps.tmux);
+
+    // A FIRST RUN HAS NOTHING TO CONTINUE.
+    //
+    // `suiteArgs` injects `--continue` so a restarted agent picks up where it
+    // left off. In a directory that has never held a conversation Claude
+    // answers "No conversation found to continue" and exits 1, so the very
+    // first launch of every new agent died — reproduced in the directory of a
+    // real one, where the identical command without `--continue` stayed up.
+    //
+    // Retrying WITHOUT the flag rather than predicting when it is safe: the
+    // question "is there a resumable conversation" is Claude's to answer, and
+    // any rule we invent here (a transcript file exists, a lastSessionId is
+    // recorded) is a guess about someone else's state that will be wrong in
+    // some case we have not seen. Asking, failing, and adapting is correct for
+    // all of them.
+    if (state !== "live" && launched.includes(CONTINUE_ARG)) {
+      const withoutContinue = launched.filter((a) => a !== CONTINUE_ARG);
+      const retried = await deps.tmux.run(withoutContinue);
+      if (retried.exitCode === 0) {
+        await (deps.sleep ?? realSleep)(SETTLE_MS);
+        state = await detectState(session, deps.tmux);
+        if (state === "live") {
+          deps.out(`${session}: started fresh — there was no previous conversation to continue.`);
+          launched = withoutContinue;
+        }
+      }
+    }
+
     if (state !== "live") {
       deps.err(
         [
           `${session} was created and exited immediately — the agent did not stay up.`,
           `  Nothing was recorded for restore-on-boot, because there is nothing running to restore.`,
           `  Run the command by hand in this directory to see what it printed:`,
-          `    ${plan.create.slice(plan.create.indexOf("-c") + 2).join(" ")}`,
+          `    ${launched.slice(launched.indexOf("-c") + 2).join(" ")}`,
           `  If it says the working directory was deleted, the tmux SERVER's own cwd is gone —`,
           `  every new pane inherits it. \`tmux kill-server\` fixes that, and kills every session on this box.`,
         ].join("\n"),
@@ -635,7 +668,7 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     if (deps.restore) {
       recordLaunch(deps.restore, deps.env.HOME ?? "", {
         session,
-        command: plan.create,
+        command: launched,
         cwd: deps.cwd,
         kind: "claude",
       });
