@@ -26,6 +26,7 @@
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { readConfig, emptyConfig, type SuiteConfig } from "../config.ts";
+import { resolveTmux } from "../halt.ts";
 import { statePath } from "../paths.ts";
 import { createStore, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
 import { type RestoreDeps, liveRestoreDeps, recordLaunch } from "./restore.ts";
@@ -37,6 +38,7 @@ import {
   attachArgv,
   composeNewSession,
   detectState,
+  hasSessionArgv,
   killSessionArgv,
   liveTmuxDeps,
   nestingPlan,
@@ -94,6 +96,9 @@ export function missingClaudeInstallTools(deps: Pick<ClaudeDeps, "tmux">): strin
 
 /** Exit code when the agent is missing and was not installed. Non-zero, always. */
 export const MISSING_AGENT_EXIT = 4;
+
+/** The session was created and did not survive. Distinct so scripts can tell. */
+export const SESSION_DIED_EXIT = 5;
 
 /**
  * The offer, printed BEFORE the question — so a user who declines has already
@@ -379,6 +384,8 @@ export interface DecideInput {
 export interface ClaudePlan {
   /** Lines printed on stdout before anything runs. Never empty for STALE. */
   notes: string[];
+  /** Printed only once the created session is confirmed alive. */
+  created?: string;
   /** `tmux kill-session` argv, when a stale session is recycled. */
   kill?: string[];
   /** `tmux new-session -d` argv, when a session must be created. */
@@ -434,10 +441,15 @@ export function decide(input: DecideInput, deps: TmuxDeps): ClaudePlan {
     return { notes, kill, direct: launch.argv, warning: launch.warning };
   }
 
-  notes.push(createdNotice(input.session));
+  // NOT pushed into `notes`. Notes are printed before the plan is executed, so
+  // announcing the start there says "started" before anything has been tried —
+  // which is how a real host got "started suite-… — it survives this terminal"
+  // one line above tmux reporting no such session. This one is held back until
+  // the session is confirmed to exist.
   return {
     notes,
     kill,
+    created: createdNotice(input.session),
     create: launch.argv,
     configure: sessionOptionsArgv(input.session),
     enter: nestingPlan(input.session, input.env),
@@ -552,6 +564,36 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
       deps.err(`tmux could not create ${session}: ${created.stderr.trim()}`);
       return created.exitCode;
     }
+
+    // A ZERO FROM `new-session` IS NOT A SESSION. tmux reports success once it
+    // has forked and exec'd; if the agent then exits immediately the session is
+    // gone a moment later, and everything after this point — the roster entry,
+    // the notice, the mouse option — is written about something that no longer
+    // exists. Observed on a real host as:
+    //
+    //     started suite-chabrielle-ecb3ba97 — it survives this terminal
+    //     tmux could not apply mouse on: no such session
+    //     can't find session: suite-chabrielle-ecb3ba97
+    //
+    // Three lines, the first of which was a lie. The cause there was a tmux
+    // SERVER whose own working directory had been deleted, so every new pane
+    // was born unable to getcwd() and Claude refused to start — a condition no
+    // exit code from `new-session` will ever report.
+    const alive = await deps.tmux.run(hasSessionArgv(session, resolveTmux(deps.tmux.which)));
+    if (alive.exitCode !== 0) {
+      deps.err(
+        [
+          `${session} was created and exited immediately — the agent did not stay up.`,
+          `  Nothing was recorded for restore-on-boot, because there is nothing running to restore.`,
+          `  Run the command by hand in this directory to see what it printed:`,
+          `    ${plan.create.slice(plan.create.indexOf("-c") + 2).join(" ")}`,
+          `  If it says the working directory was deleted, the tmux SERVER's own cwd is gone —`,
+          `  every new pane inherits it. \`tmux kill-server\` fixes that, and kills every session on this box.`,
+        ].join("\n"),
+      );
+      return SESSION_DIED_EXIT;
+    }
+    if (plan.created !== undefined) deps.out(plan.created);
     // Record for restore-on-boot. A by-product of launching, never a list the
     // operator maintains — a hand-curated roster is wrong exactly when needed.
     //
