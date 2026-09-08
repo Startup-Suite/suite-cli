@@ -713,6 +713,50 @@ describe("url derivation", () => {
   test("the tools entry is /mcp on the same host", () => {
     expect(toolsHttpUrl("https://suite.example.invalid/anything")).toBe("https://suite.example.invalid/mcp");
   });
+
+  /**
+   * THE FAILURE THIS EXISTS FOR, from a real setup.
+   *
+   * The operator pasted the runtime URL — a reasonable reading of "the Suite
+   * URL", and the value Suite itself shows you. `toolsHttpUrl` left the scheme
+   * alone, so `wss://` went into the HTTP MCP slot and the client refused it
+   * with `ERR_INVALID_ARG_VALUE: protocol must be http:, https: or s3:`, an
+   * error naming neither Suite nor the URL behind it.
+   */
+  test("a pasted wss:// runtime URL still yields an http(s) tools entry", () => {
+    expect(toolsHttpUrl("wss://suite.example.invalid/runtime/ws")).toBe(
+      "https://suite.example.invalid/mcp",
+    );
+    expect(toolsHttpUrl("ws://127.0.0.1:4000/runtime/ws")).toBe("http://127.0.0.1:4000/mcp");
+  });
+
+  test("a pasted wss:// runtime URL still yields a ws(s) channel entry", () => {
+    expect(channelWsUrl("wss://suite.example.invalid/runtime/ws")).toBe(
+      "wss://suite.example.invalid/runtime/ws",
+    );
+  });
+
+  /**
+   * The quieter half of the same bug: the old mapping was "http: → ws:,
+   * everything else → wss:", so a deliberate plaintext local runtime URL was
+   * silently upgraded to wss: and could not complete a TLS handshake against a
+   * plain dev server.
+   */
+  test("a plaintext ws:// is NOT silently upgraded to wss://", () => {
+    expect(channelWsUrl("ws://localhost:4000/runtime/ws")).toBe("ws://localhost:4000/runtime/ws");
+  });
+
+  test("either paste of the same Suite produces the same pair", () => {
+    const fromBrowser = "https://suite.example.invalid";
+    const fromRuntime = "wss://suite.example.invalid/runtime/ws";
+    expect(channelWsUrl(fromBrowser)).toBe(channelWsUrl(fromRuntime));
+    expect(toolsHttpUrl(fromBrowser)).toBe(toolsHttpUrl(fromRuntime));
+  });
+
+  test("a scheme that is not a Suite URL is refused by name, not coerced", () => {
+    expect(() => toolsHttpUrl("ftp://suite.example.invalid")).toThrow(/not a Suite URL/);
+    expect(() => channelWsUrl("ftp://suite.example.invalid")).toThrow(/not a Suite URL/);
+  });
 });
 
 describe("mcp add argv", () => {
