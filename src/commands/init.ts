@@ -426,9 +426,42 @@ export function packageCount(bunInstallOutput: string): string {
  * MCP is plain HTTP at `/mcp`. Both are derived from the one URL the user
  * pasted, so they cannot drift apart by a typo in one of them.
  */
+/**
+ * Whether the pasted URL is secure, whichever family it was written in.
+ *
+ * The operator may paste either the browser URL or the runtime WebSocket URL —
+ * both name the same Suite — so both derivations have to work from either, and
+ * neither may inherit the scheme it was handed.
+ *
+ * THIS IS WHAT WENT WRONG. `toolsHttpUrl` used to leave the protocol alone.
+ * Given the runtime URL (`wss://…/runtime/ws`) it emitted `wss://…/mcp` into
+ * the HTTP MCP slot, and the client refused it with
+ * `ERR_INVALID_ARG_VALUE: protocol must be http:, https: or s3:` — an error
+ * naming neither Suite nor the URL that produced it. Observed on a real setup.
+ *
+ * The second bug was quieter and in the other function: `channelWsUrl` mapped
+ * `http:` to `ws:` and EVERYTHING ELSE to `wss:`, so a deliberate local
+ * `ws://localhost:4000` was silently upgraded to `wss://localhost:4000`, which
+ * cannot complete a TLS handshake against a plain dev server.
+ */
+function isSecureScheme(protocol: string): boolean {
+  switch (protocol) {
+    case "https:":
+    case "wss:":
+      return true;
+    case "http:":
+    case "ws:":
+      return false;
+    default:
+      throw new Error(
+        `suite: ${protocol}// is not a Suite URL — paste the https:// address you open in a browser, or the wss:// runtime URL.`,
+      );
+  }
+}
+
 export function channelWsUrl(suiteUrl: string): string {
   const u = new URL(suiteUrl);
-  u.protocol = u.protocol === "http:" ? "ws:" : "wss:";
+  u.protocol = isSecureScheme(u.protocol) ? "wss:" : "ws:";
   u.pathname = "/runtime/ws";
   u.search = "";
   return u.toString();
@@ -436,6 +469,7 @@ export function channelWsUrl(suiteUrl: string): string {
 
 export function toolsHttpUrl(suiteUrl: string): string {
   const u = new URL(suiteUrl);
+  u.protocol = isSecureScheme(u.protocol) ? "https:" : "http:";
   u.pathname = "/mcp";
   u.search = "";
   return u.toString();
