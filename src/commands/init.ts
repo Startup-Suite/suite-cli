@@ -516,6 +516,17 @@ export function channelAddArgs(entry: ChannelEntry): string[] {
   ];
 }
 
+/**
+ * Did `claude mcp add` refuse because the name is already registered?
+ *
+ * Matched on the message rather than the exit code, because exit 1 is also how
+ * every other failure arrives — a bad flag, an unwritable config — and those
+ * must NOT be answered by deleting the operator's entry and trying again.
+ */
+export function alreadyRegistered(output: string): boolean {
+  return /already exists/i.test(output);
+}
+
 /** argv for the HTTP tools entry, with one `-H` per solicited header. */
 export function toolsAddArgs(
   suiteUrl: string,
@@ -796,9 +807,31 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
     // command line is gone before anyone can read it out of `ps`. This is the
     // one place stage 2 sanctions a secret in argv, and the constructed command
     // line is NEVER logged — it carries the token.
-    const r = await deps.run(argv, { allowSecretsInArgv: true });
+    let r = await deps.run(argv, { allowSecretsInArgv: true });
+
+    // A SECOND `suite init` MUST CONVERGE, NOT FAIL. `claude mcp add` refuses a
+    // name that is already registered, so once init had succeeded it could
+    // never be run again — which is precisely when you run it: after fixing a
+    // URL, rotating a token, or moving the checkout. Re-registering is this
+    // command's whole job, and the values were just re-collected from the
+    // operator, so replacing our own two entries is the intended outcome.
+    if (r.exitCode !== 0 && alreadyRegistered(r.stderr || r.stdout)) {
+      const name = argv[3] as string;
+      await deps.run(["claude", "mcp", "remove", name, "-s", "user"]);
+      r = await deps.run(argv, { allowSecretsInArgv: true });
+      if (r.exitCode === 0) say(row(name, "replaced", "an entry was already registered"));
+    }
+
     if (r.exitCode !== 0) {
-      throw new Error(`claude mcp add ${argv[3]} failed with exit ${r.exitCode}`);
+      // The argv is unlogged because it carries the token; claude's own stderr
+      // does not, and it is the only thing that says WHY. Reporting the exit
+      // code alone hands the operator a number and no next step — which is what
+      // `claude mcp add suite-channel failed with exit 1` did on a real host.
+      throw new Error(
+        [`claude mcp add ${argv[3]} failed with exit ${r.exitCode}:`, (r.stderr || r.stdout).trim()]
+          .filter((l) => l !== "")
+          .join("\n"),
+      );
     }
   }
   say(row(CHANNEL_SERVER, "registered", "user scope"));

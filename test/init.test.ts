@@ -6,6 +6,7 @@ import {
   CHANNEL_SERVER,
   ENV_INTERPOLATION_SUPPORTED,
   PullFailed,
+  alreadyRegistered,
   classifyPullFailure,
   noGitPrompt,
   pullRemedyLines,
@@ -701,6 +702,107 @@ describe("parseServerStatus", () => {
         { name: "b", state: "not-connected", raw: "" },
       ]).ok,
     ).toBe(false);
+  });
+});
+
+/**
+ * A SECOND `suite init` MUST CONVERGE. `claude mcp add` refuses a name that is
+ * already registered, so once init had succeeded it could never be run again —
+ * which is exactly when it gets run: after fixing a URL, rotating a token, or
+ * moving the checkout. Observed on a real host as
+ * `claude mcp add suite-channel failed with exit 1`, a number with no cause
+ * attached because the argv is deliberately unlogged (it carries the token).
+ */
+describe("re-running init over entries it already registered", () => {
+  test("the discriminator is the message, not the exit code", () => {
+    expect(alreadyRegistered("MCP server suite-channel already exists in user config")).toBe(true);
+    // Everything else also exits 1, and must NOT be answered by deleting the
+    // operator's entry and trying again.
+    expect(alreadyRegistered("error: unknown flag --nope")).toBe(false);
+    expect(alreadyRegistered("EACCES: permission denied, open '/Users/x/.claude.json'")).toBe(false);
+    expect(alreadyRegistered("")).toBe(false);
+  });
+
+  test("an already-registered entry is removed and re-added, and init still succeeds", async () => {
+    const fx = makeFixture();
+    const store = createStore();
+    const calls: string[][] = [];
+    const failedOnce = new Set<string>();
+
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      store,
+      run: async (argv, opts) => {
+        calls.push(argv);
+        if (argv[1] === "mcp" && argv[2] === "add") {
+          const name = argv[3] as string;
+          // Fail only the FIRST attempt for each server, the way a real second
+          // run does — the retry after the remove must succeed.
+          if (!failedOnce.has(name)) {
+            failedOnce.add(name);
+            return {
+              exitCode: 1,
+              stdout: "",
+              stderr: `MCP server ${argv[3]} already exists in user config`,
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return spawnWithSecrets(argv, store, { ...opts, env: fx.env });
+      },
+    });
+
+    await runInit(deps);
+
+    const removes = calls.filter((c) => c[1] === "mcp" && c[2] === "remove");
+    expect(removes.map((c) => c[3]).sort()).toEqual([CHANNEL_SERVER, TOOLS_SERVER].sort());
+    // Removed at USER scope — the scope the entry was registered in. A remove
+    // at the default scope silently deletes nothing and the retry fails again.
+    for (const r of removes) expect(r.slice(4)).toEqual(["-s", "user"]);
+    expect(calls.filter((c) => c[1] === "mcp" && c[2] === "add")).toHaveLength(4);
+  });
+
+  test("a failure that is NOT a name clash deletes nothing and reports the reason", async () => {
+    const fx = makeFixture();
+    const store = createStore();
+    const calls: string[][] = [];
+
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      store,
+      run: async (argv, opts) => {
+        calls.push(argv);
+        if (argv[1] === "mcp" && argv[2] === "add") {
+          return { exitCode: 1, stdout: "", stderr: "EACCES: permission denied" };
+        }
+        return spawnWithSecrets(argv, store, { ...opts, env: fx.env });
+      },
+    });
+
+    // The cause travels with the error; an exit code alone is not a next step.
+    await expect(runInit(deps)).rejects.toThrow(/permission denied/);
+    expect(calls.filter((c) => c[1] === "mcp" && c[2] === "remove")).toHaveLength(0);
+  });
+
+  test("the thrown error never carries the token", async () => {
+    const fx = makeFixture();
+    const store = createStore();
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      store,
+      run: async (argv, opts) => {
+        if (argv[1] === "mcp" && argv[2] === "add") {
+          return { exitCode: 1, stdout: "", stderr: "EACCES: permission denied" };
+        }
+        return spawnWithSecrets(argv, store, { ...opts, env: fx.env });
+      },
+    });
+
+    let message = "";
+    try {
+      await runInit(deps);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).not.toBe("");
+    expect(message).not.toContain(TOKEN);
   });
 });
 
