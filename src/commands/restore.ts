@@ -101,14 +101,29 @@ export async function liveSessions(deps: RestoreDeps): Promise<string[]> {
  * agent is a CHILD of it — so the process table is walked for a descendant that
  * looks like an agent. This is the same trap `detectState` documents.
  */
-export async function runningSessions(deps: RestoreDeps): Promise<RunningSession[]> {
+export async function runningSessions(
+  deps: RestoreDeps,
+  prefix = "suite-",
+): Promise<RunningSession[]> {
   const tmux = resolveTmux(deps.tmux.which);
   const panes = await deps.tmux.run([
     tmux,
     "list-panes",
     "-a",
     "-F",
-    "#{session_name}\t#{pane_pid}\t#{pane_current_path}",
+    // START path first, CURRENT path only as a fallback.
+    //
+    // Two reasons, and the second is why adoption silently found nothing on a
+    // real host. (1) The roster records where an agent was STARTED, which is
+    // what `-c` must replay; `pane_current_path` is wherever that pane's shell
+    // has since cd'd to, so replaying it would resurrect the agent in a
+    // directory it merely wandered into. (2) On macOS `pane_current_path` came
+    // back EMPTY for every pane — tmux could not read the process's cwd, the
+    // agents living on an external volume — while `pane_start_path` was
+    // populated. The old code skipped any pane with no cwd and then reported
+    // "no unrecorded agent sessions found", which reads as "nothing to do"
+    // and was in fact "I could not see two live agents I own".
+    "#{session_name}\t#{pane_pid}\t#{pane_start_path}\t#{pane_current_path}",
   ]);
   // FOUR columns, because that is what `parseProcesses` parses. This read
   // `pid=,ppid=,args=` and the mismatch was silent in the worst direction: the
@@ -123,9 +138,21 @@ export async function runningSessions(deps: RestoreDeps): Promise<RunningSession
   const out: RunningSession[] = [];
   const seen = new Set<string>();
   for (const line of panes.stdout.split("\n")) {
-    const [session, pid, cwd] = line.split("\t");
-    if (!session || !pid || !cwd || seen.has(session)) continue;
+    const [session, pid, startPath, currentPath] = line.split("\t");
+    if (!session || !pid || seen.has(session)) continue;
     seen.add(session);
+    const cwd = (startPath ?? "").trim() || (currentPath ?? "").trim();
+    if (cwd === "") {
+      // NEVER a silent skip for a session we own. A pane whose directory we
+      // cannot read is exactly the case that must be said out loud, because
+      // the alternative is a sweep that reports success having seen nothing.
+      if (session.startsWith(prefix)) {
+        deps.log(
+          `${session}: cannot determine its working directory (tmux reported neither a start nor a current path) — not adopted`,
+        );
+      }
+      continue;
+    }
     const kids = descendants(procs, [Number(pid)]);
     const agent = kids.find((k) => looksLikeAgent(k)) ?? kids.find((k) => k.args.includes("dsh"));
     if (!agent) continue;

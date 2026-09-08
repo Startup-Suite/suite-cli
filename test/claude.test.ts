@@ -21,6 +21,7 @@ import {
   parseState,
   readState,
   runClaude,
+  SESSION_DIED_EXIT,
   stripTerminator,
   uniqueSessionName,
   writeState,
@@ -708,5 +709,83 @@ describe("supervision on session create", () => {
       platform: "linux", home: "/home/q", binary: "/b/suite", intervalSeconds: 60,
     });
     expect(res.watchdog).toContain("NOT running");
+  });
+});
+
+
+/**
+ * A ZERO FROM `new-session` IS NOT A SESSION.
+ *
+ * On a real host `suite claude` printed "started suite-chabrielle-ecb3ba97 — it
+ * survives this terminal", immediately followed by tmux saying there was no
+ * such session. tmux exits 0 once it has forked and exec'd; the agent then died
+ * on startup and everything after that point was written about something that
+ * no longer existed. (The cause there was a tmux SERVER whose own cwd had been
+ * deleted, so every new pane was born unable to getcwd().)
+ */
+describe("a session that is created and does not survive", () => {
+  function deadSessionRun(ran: string[][]) {
+    return async (argv: string[]): Promise<RunResult> => {
+      // tmux is happy to CREATE it...
+      if (argv.includes("new-session")) return { exitCode: 0, stdout: "", stderr: "" };
+      // ...and a moment later it is not there.
+      if (argv.includes("has-session")) return { exitCode: 1, stdout: "", stderr: "" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+  }
+
+  test("is reported as died, not as started", async () => {
+    const r = recorder({}, deadSessionRun([]));
+    const code = await runClaude(r.deps, { userArgs: [], force: false });
+    expect(code).toBe(SESSION_DIED_EXIT);
+    const said = [...r.out, ...r.err].join("\n");
+    expect(said).toContain("exited immediately");
+    expect(said).not.toContain("survives this terminal");
+  });
+
+  test("names the tmux-server cause, which no exit code will ever report", async () => {
+    const r = recorder({}, deadSessionRun([]));
+    await runClaude(r.deps, { userArgs: [], force: false });
+    expect(r.err.join("\n")).toContain("kill-server");
+  });
+
+  test("records nothing for restore-on-boot", async () => {
+    const written: string[] = [];
+    const r = recorder(
+      {
+        restore: {
+          tmux: { env: {}, which: () => "/usr/bin/tmux", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+          readRoster: () => null,
+          writeRoster: (_p, c) => void written.push(c),
+          now: () => new Date("2026-09-08T00:00:00.000Z"),
+          log: () => {},
+        },
+      },
+      deadSessionRun([]),
+    );
+    await runClaude(r.deps, { userArgs: [], force: false });
+    // A roster entry for a session that is already gone is exactly the row that
+    // makes restore-on-boot replay something which cannot work.
+    expect(written).toEqual([]);
+  });
+
+  test("CONTROL: a session that IS alive is reported started and recorded", async () => {
+    const written: string[] = [];
+    const r = recorder(
+      {
+        restore: {
+          tmux: { env: {}, which: () => "/usr/bin/tmux", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+          readRoster: () => null,
+          writeRoster: (_p, c) => void written.push(c),
+          now: () => new Date("2026-09-08T00:00:00.000Z"),
+          log: () => {},
+        },
+      },
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+    );
+    const code = await runClaude(r.deps, { userArgs: [], force: false });
+    expect(code).not.toBe(SESSION_DIED_EXIT);
+    expect([...r.out, ...r.err].join("\n")).toContain("survives this terminal");
+    expect(written.length).toBeGreaterThan(0);
   });
 });
