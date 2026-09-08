@@ -101,6 +101,17 @@ export const MISSING_AGENT_EXIT = 4;
 export const SESSION_DIED_EXIT = 5;
 
 /**
+ * How long to let a freshly created agent settle before judging it.
+ *
+ * Measured against the real failure: Claude printed its refusal and exited
+ * about half a second in. A check with no wait at all reads the pane during the
+ * window where every launch looks identical.
+ */
+export const SETTLE_MS = 1500;
+
+const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/**
  * The offer, printed BEFORE the question — so a user who declines has already
  * read it.
  *
@@ -487,6 +498,11 @@ export interface ClaudeDeps {
   platform: string;
   /** Used ONLY by the install offer. Claude Code's own login is never prompted here. */
   prompter: Prompter;
+  /**
+   * Injected so the settle wait is instant in tests and real on a machine.
+   * Optional: a caller that supplies nothing gets the real one.
+   */
+  sleep?(ms: number): Promise<void>;
   out(line: string): void;
   err(line: string): void;
   /**
@@ -579,8 +595,24 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     // SERVER whose own working directory had been deleted, so every new pane
     // was born unable to getcwd() and Claude refused to start — a condition no
     // exit code from `new-session` will ever report.
-    const alive = await deps.tmux.run(hasSessionArgv(session, resolveTmux(deps.tmux.which)));
-    if (alive.exitCode !== 0) {
+    // SETTLE BEFORE ASKING, or the check proves nothing.
+    //
+    // The first version of this guard ran `has-session` immediately after
+    // `new-session` and therefore always passed: tmux has forked, the pane
+    // exists, and the agent has not got as far as failing yet. It shipped, and
+    // the very next run on the affected host printed "started … survives this
+    // terminal" exactly as before — a guard that fires green while the thing it
+    // guards against is happening in front of it.
+    //
+    // So: wait, then ask whether the AGENT is running, not merely whether a
+    // pane exists. `detectState` already draws that distinction — a session
+    // whose agent has exited reads "stale", and a session started with a
+    // command that died instantly reads "stale" or "none". This catches a
+    // startup failure; an agent that dies an hour later is the watchdog's job,
+    // not this one's.
+    await (deps.sleep ?? realSleep)(SETTLE_MS);
+    const state = await detectState(session, deps.tmux);
+    if (state !== "live") {
       deps.err(
         [
           `${session} was created and exited immediately — the agent did not stay up.`,
