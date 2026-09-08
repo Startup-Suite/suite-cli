@@ -6,6 +6,9 @@ import {
   CHANNEL_SERVER,
   ENV_INTERPOLATION_SUPPORTED,
   PullFailed,
+  classifyPullFailure,
+  noGitPrompt,
+  pullRemedyLines,
   TOOLS_SERVER,
   bunInstallPlan,
   channelAddArgs,
@@ -499,6 +502,67 @@ describe("init on a machine where nothing is installed", () => {
     expect(result.tmuxMissing).toBe(false);
     expect(prompter.asked.some((q) => /tmux is not installed/.test(q))).toBe(false);
     expect(deps.lines.join("\n")).toContain("3.5a");
+  });
+});
+
+/**
+ * THE FAILURE THIS EXISTS FOR, observed on a real host.
+ *
+ * `suite init` on a box whose plugin checkout was clean and exactly level with
+ * origin (0 ahead, 0 behind) printed git's own "Authentication failed" and then
+ * told the operator the checkout "has local commits or a diverged history".
+ * Both halves were in the same message and they contradicted each other. The
+ * remedy named was for a state that did not exist.
+ */
+describe("a failed pull says what actually went wrong", () => {
+  const AUTH = [
+    "remote: Invalid username or token. Password authentication is not supported for Git operations.",
+    "fatal: Authentication failed for 'https://github.com/Startup-Suite/claude-code-suite-channel.git/'",
+  ].join("\n");
+
+  const DIVERGED =
+    "fatal: Not possible to fast-forward, aborting.";
+
+  test("an auth failure is not reported as a diverged history", () => {
+    expect(classifyPullFailure(AUTH)).toBe("auth");
+    const msg = new PullFailed("/co", AUTH).message;
+    expect(msg).not.toContain("diverged history");
+    expect(msg).not.toContain("local commits");
+    expect(msg).toContain("could not authenticate");
+  });
+
+  test("the auth remedy is a command the operator can run", () => {
+    const lines = pullRemedyLines("auth", "/co").join("\n");
+    expect(lines).toContain("gh auth setup-git");
+    expect(lines).toContain("remote set-url origin git@github.com:");
+  });
+
+  test("CONTROL: a real divergence still says diverged, and keeps the no-force promise", () => {
+    expect(classifyPullFailure(DIVERGED)).toBe("diverged");
+    const msg = new PullFailed("/co", DIVERGED).message;
+    expect(msg).toContain("diverged history");
+    expect(msg).toContain("will not force, reset or delete");
+  });
+
+  test("an unrecognised failure guesses at nothing", () => {
+    const msg = new PullFailed("/co", "fatal: the disk caught fire").message;
+    expect(classifyPullFailure("fatal: the disk caught fire")).toBe("unknown");
+    expect(msg).not.toContain("diverged history");
+    expect(msg).not.toContain("could not authenticate");
+    expect(msg).toContain("not guessing");
+  });
+
+  /**
+   * The prompt is disabled by MERGING, not replacing. `spawnWithSecrets` treats
+   * `options.env` as the entire environment, so a bare `{GIT_TERMINAL_PROMPT}`
+   * would strip PATH and HOME and take git's credential helper and SSH config
+   * with them — trading a readable auth error for an inexplicable one.
+   */
+  test("disabling git's prompt keeps the rest of the environment", () => {
+    const merged = noGitPrompt({ PATH: "/usr/bin", HOME: "/home/q" });
+    expect(merged.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(merged.PATH).toBe("/usr/bin");
+    expect(merged.HOME).toBe("/home/q");
   });
 });
 
