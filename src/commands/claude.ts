@@ -26,8 +26,11 @@
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
 import { readConfig, emptyConfig, type SuiteConfig } from "../config.ts";
+import { resolveTmux } from "../halt.ts";
 import { statePath } from "../paths.ts";
 import { createStore, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
+import { type RestoreDeps, liveRestoreDeps, recordLaunch } from "./restore.ts";
+import { type SupervisorIo, ensureSupervision, liveSupervisorIo } from "../supervisor.ts";
 import { confirm, type InstallPlan } from "./init.ts";
 import { CLAUDE_CODE_URL } from "./doctor.ts";
 import { colorEnabled } from "../ui.ts";
@@ -35,6 +38,7 @@ import {
   attachArgv,
   composeNewSession,
   detectState,
+  hasSessionArgv,
   killSessionArgv,
   liveTmuxDeps,
   nestingPlan,
@@ -92,6 +96,20 @@ export function missingClaudeInstallTools(deps: Pick<ClaudeDeps, "tmux">): strin
 
 /** Exit code when the agent is missing and was not installed. Non-zero, always. */
 export const MISSING_AGENT_EXIT = 4;
+
+/** The session was created and did not survive. Distinct so scripts can tell. */
+export const SESSION_DIED_EXIT = 5;
+
+/**
+ * How long to let a freshly created agent settle before judging it.
+ *
+ * Measured against the real failure: Claude printed its refusal and exited
+ * about half a second in. A check with no wait at all reads the pane during the
+ * window where every launch looks identical.
+ */
+export const SETTLE_MS = 1500;
+
+const realSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 /**
  * The offer, printed BEFORE the question — so a user who declines has already
@@ -377,6 +395,8 @@ export interface DecideInput {
 export interface ClaudePlan {
   /** Lines printed on stdout before anything runs. Never empty for STALE. */
   notes: string[];
+  /** Printed only once the created session is confirmed alive. */
+  created?: string;
   /** `tmux kill-session` argv, when a stale session is recycled. */
   kill?: string[];
   /** `tmux new-session -d` argv, when a session must be created. */
@@ -432,10 +452,15 @@ export function decide(input: DecideInput, deps: TmuxDeps): ClaudePlan {
     return { notes, kill, direct: launch.argv, warning: launch.warning };
   }
 
-  notes.push(createdNotice(input.session));
+  // NOT pushed into `notes`. Notes are printed before the plan is executed, so
+  // announcing the start there says "started" before anything has been tried —
+  // which is how a real host got "started suite-… — it survives this terminal"
+  // one line above tmux reporting no such session. This one is held back until
+  // the session is confirmed to exist.
   return {
     notes,
     kill,
+    created: createdNotice(input.session),
     create: launch.argv,
     configure: sessionOptionsArgv(input.session),
     enter: nestingPlan(input.session, input.env),
@@ -453,6 +478,18 @@ export interface ClaudeDeps {
   tmux: TmuxDeps;
   env: Record<string, string | undefined>;
   cwd: string;
+  /**
+   * How launches are recorded for restore-on-boot. Optional by construction:
+   * a caller that supplies nothing records nothing, which is what keeps the
+   * test suite from writing a real roster into a developer's home directory.
+   */
+  restore?: RestoreDeps;
+  /**
+   * How supervision reaches the filesystem and service manager. Optional for
+   * the same reason `restore` is: a caller that supplies nothing installs
+   * nothing, which is what keeps the test suite from writing real units.
+   */
+  supervisorIo?: SupervisorIo;
   store: CredentialStore;
   config: SuiteConfig;
   statePath: string;
@@ -461,6 +498,11 @@ export interface ClaudeDeps {
   platform: string;
   /** Used ONLY by the install offer. Claude Code's own login is never prompted here. */
   prompter: Prompter;
+  /**
+   * Injected so the settle wait is instant in tests and real on a machine.
+   * Optional: a caller that supplies nothing gets the real one.
+   */
+  sleep?(ms: number): Promise<void>;
   out(line: string): void;
   err(line: string): void;
   /**
@@ -533,10 +575,123 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
 
   if (plan.kill !== undefined) await deps.tmux.run(plan.kill);
   if (plan.create !== undefined) {
+    // What actually launched. Diverges from `plan.create` only on the
+    // no-conversation-to-continue retry below, and it is what gets recorded for
+    // restore-on-boot — replaying a command that did not work is worse than
+    // replaying none.
+    let launched = plan.create;
     const created = await deps.tmux.run(plan.create);
     if (created.exitCode !== 0) {
       deps.err(`tmux could not create ${session}: ${created.stderr.trim()}`);
       return created.exitCode;
+    }
+
+    // A ZERO FROM `new-session` IS NOT A SESSION. tmux reports success once it
+    // has forked and exec'd; if the agent then exits immediately the session is
+    // gone a moment later, and everything after this point — the roster entry,
+    // the notice, the mouse option — is written about something that no longer
+    // exists. Observed on a real host as:
+    //
+    //     started suite-chabrielle-ecb3ba97 — it survives this terminal
+    //     tmux could not apply mouse on: no such session
+    //     can't find session: suite-chabrielle-ecb3ba97
+    //
+    // Three lines, the first of which was a lie. The cause there was a tmux
+    // SERVER whose own working directory had been deleted, so every new pane
+    // was born unable to getcwd() and Claude refused to start — a condition no
+    // exit code from `new-session` will ever report.
+    // SETTLE BEFORE ASKING, or the check proves nothing.
+    //
+    // The first version of this guard ran `has-session` immediately after
+    // `new-session` and therefore always passed: tmux has forked, the pane
+    // exists, and the agent has not got as far as failing yet. It shipped, and
+    // the very next run on the affected host printed "started … survives this
+    // terminal" exactly as before — a guard that fires green while the thing it
+    // guards against is happening in front of it.
+    //
+    // So: wait, then ask whether the AGENT is running, not merely whether a
+    // pane exists. `detectState` already draws that distinction — a session
+    // whose agent has exited reads "stale", and a session started with a
+    // command that died instantly reads "stale" or "none". This catches a
+    // startup failure; an agent that dies an hour later is the watchdog's job,
+    // not this one's.
+    await (deps.sleep ?? realSleep)(SETTLE_MS);
+    let state = await detectState(session, deps.tmux);
+
+    // A FIRST RUN HAS NOTHING TO CONTINUE.
+    //
+    // `suiteArgs` injects `--continue` so a restarted agent picks up where it
+    // left off. In a directory that has never held a conversation Claude
+    // answers "No conversation found to continue" and exits 1, so the very
+    // first launch of every new agent died — reproduced in the directory of a
+    // real one, where the identical command without `--continue` stayed up.
+    //
+    // Retrying WITHOUT the flag rather than predicting when it is safe: the
+    // question "is there a resumable conversation" is Claude's to answer, and
+    // any rule we invent here (a transcript file exists, a lastSessionId is
+    // recorded) is a guess about someone else's state that will be wrong in
+    // some case we have not seen. Asking, failing, and adapting is correct for
+    // all of them.
+    if (state !== "live" && launched.includes(CONTINUE_ARG)) {
+      const withoutContinue = launched.filter((a) => a !== CONTINUE_ARG);
+      const retried = await deps.tmux.run(withoutContinue);
+      if (retried.exitCode === 0) {
+        await (deps.sleep ?? realSleep)(SETTLE_MS);
+        state = await detectState(session, deps.tmux);
+        if (state === "live") {
+          deps.out(`${session}: started fresh — there was no previous conversation to continue.`);
+          launched = withoutContinue;
+        }
+      }
+    }
+
+    if (state !== "live") {
+      deps.err(
+        [
+          `${session} was created and exited immediately — the agent did not stay up.`,
+          `  Nothing was recorded for restore-on-boot, because there is nothing running to restore.`,
+          `  Run the command by hand in this directory to see what it printed:`,
+          `    ${launched.slice(launched.indexOf("-c") + 2).join(" ")}`,
+          `  If it says the working directory was deleted, the tmux SERVER's own cwd is gone —`,
+          `  every new pane inherits it. \`tmux kill-server\` fixes that, and kills every session on this box.`,
+        ].join("\n"),
+      );
+      return SESSION_DIED_EXIT;
+    }
+    if (plan.created !== undefined) deps.out(plan.created);
+    // Record for restore-on-boot. A by-product of launching, never a list the
+    // operator maintains — a hand-curated roster is wrong exactly when needed.
+    //
+    // INJECTED, not imported: a caller that supplies no restore deps records
+    // nothing. That is what stops the test suite writing a real roster into the
+    // developer's home directory, which is exactly what it did before this.
+    if (deps.restore) {
+      recordLaunch(deps.restore, deps.env.HOME ?? "", {
+        session,
+        command: launched,
+        cwd: deps.cwd,
+        kind: "claude",
+      });
+    }
+
+    // A session started on an unsupervised box is the one that dies quietly
+    // overnight, so creating one also guarantees the watchdog exists. Only on
+    // CREATE — re-attaching to a live session changes nothing about the host.
+    if (deps.supervisorIo) {
+      const home = deps.env.HOME ?? "";
+      const sup = await ensureSupervision(deps.supervisorIo, {
+        // ClaudeDeps types platform as a plain string (it is injected in tests
+        // as arbitrary values); supervisorPlan only branches on darwin/linux
+        // and treats anything else as unsupported, so narrowing here is safe.
+        platform: deps.platform as NodeJS.Platform,
+        home,
+        binary: `${home}/.local/bin/suite`,
+        inheritedPath: deps.env.PATH,
+        inheritedLocale: deps.env.LANG ?? deps.env.LC_ALL,
+        intervalSeconds: 60,
+      });
+      deps.err(`watchdog: ${sup.watchdog}`);
+      if (sup.restore) deps.err(`restore-on-boot written (not enabled): ${sup.restore}`);
     }
     /*
      * A display option that will not apply is not a reason to refuse the agent
@@ -570,6 +725,8 @@ export async function liveClaudeDeps(
 ): Promise<ClaudeDeps> {
   const config = (await readConfig({ env })) ?? emptyConfig();
   return {
+    restore: liveRestoreDeps(),
+    supervisorIo: liveSupervisorIo(),
     tmux: liveTmuxDeps(env),
     platform: process.platform,
     prompter,

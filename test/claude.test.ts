@@ -9,7 +9,6 @@ import {
   AGENT,
   DEV_CHANNEL_ARGS,
   SKIP_PERMISSIONS_ARG,
-  CONTINUE_ARG,
   suiteArgs,
   NESTED_REFUSAL_EXIT,
   NOTICE_BODY,
@@ -21,6 +20,8 @@ import {
   parseState,
   readState,
   runClaude,
+  CONTINUE_ARG,
+  SESSION_DIED_EXIT,
   stripTerminator,
   uniqueSessionName,
   writeState,
@@ -33,6 +34,7 @@ import {
 import { CLAUDE_CODE_URL } from "../src/commands/doctor.ts";
 import type { Prompter } from "../src/secrets.ts";
 import { sessionNameFromConfig } from "../src/tmux.ts";
+import { ensureSupervision } from "../src/supervisor.ts";
 
 /* ------------------------------------------------------------------------- */
 /* Scratch HOME. Nothing in this file touches the real config dir.            */
@@ -402,6 +404,41 @@ function fakePrompter(answer: string, asked: string[] = []): Prompter {
   };
 }
 
+/**
+ * A tmux that has no session until one is created, and then does.
+ *
+ * Statefulness is the point: `detectState` is consulted BEFORE a create to
+ * decide whether to attach, and AFTER it to decide whether the agent stayed up.
+ * A fake that answers identically both times either never creates anything or
+ * never checks anything. The session name is taken from the create argv rather
+ * than hardcoded, so a test that changes cwd does not silently stop modelling
+ * its own session.
+ */
+const PS_WITH_AGENT = "  4242     1 zsh              -zsh\n  4243  4242 claude           claude --continue\n";
+const PS_WITHOUT_AGENT = "  4242     1 zsh              -zsh\n";
+
+function statefulTmux(agentSurvives = true) {
+  let session: string | null = null;
+  return async (argv: string[]): Promise<RunResult> => {
+    if (argv.includes("new-session")) {
+      const i = argv.indexOf("-s");
+      session = i >= 0 ? (argv[i + 1] ?? null) : null;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    }
+    if (argv.includes("list-panes")) {
+      return { exitCode: 0, stdout: session === null ? "" : `${session}\t4242\tzsh\n`, stderr: "" };
+    }
+    if (argv[0] === "ps") {
+      return {
+        exitCode: 0,
+        stdout: session !== null && agentSurvives ? PS_WITH_AGENT : PS_WITHOUT_AGENT,
+        stderr: "",
+      };
+    }
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+}
+
 function recorder(
   over: Partial<ClaudeDeps> = {},
   run?: (argv: string[]) => Promise<RunResult>,
@@ -411,16 +448,18 @@ function recorder(
   const err: string[] = [];
   const execed: string[][] = [];
   const ran: string[][] = [];
+  const fallback = statefulTmux(true);
   const deps: ClaudeDeps = {
     tmux: fakeTmux({
       which: which ?? (() => "/usr/bin/tmux"),
       run: async (argv) => {
         ran.push(argv);
-        return run !== undefined ? run(argv) : { exitCode: 0, stdout: "", stderr: "" };
+        return run !== undefined ? run(argv) : fallback(argv);
       },
     }),
     platform: "darwin",
     prompter: fakePrompter("n"),
+    sleep: async () => {},
     env: {},
     cwd: "/projects/ledger",
     store: createStore(),
@@ -525,11 +564,20 @@ describe("runClaude", () => {
     const state = { installed: false };
     const r = recorder(
       { prompter: fakePrompter("y") },
-      async (argv) => {
-        // The install is the thing that makes claude appear.
-        if (argv[0] === "sh") state.installed = true;
-        return { exitCode: 0, stdout: "", stderr: "" };
-      },
+      (() => {
+        // Delegates to the stateful tmux so the created session reads as LIVE
+        // afterwards; without that the post-create check correctly reports a
+        // session that never came up, and this test is about the install path.
+        const tmux = statefulTmux(true);
+        return async (argv: string[]) => {
+          // The install is the thing that makes claude appear.
+          if (argv[0] === "sh") {
+            state.installed = true;
+            return { exitCode: 0, stdout: "", stderr: "" };
+          }
+          return tmux(argv);
+        };
+      })(),
       whichWithout(state),
     );
 
@@ -661,5 +709,252 @@ describe("runClaude", () => {
     expect(
       await listSessionNames(fakeTmux({ run: async () => ({ exitCode: 0, stdout: "a\nb\n", stderr: "" }) })),
     ).toEqual(["a", "b"]);
+  });
+});
+
+describe("supervision on session create", () => {
+  /**
+   * A session started on an unsupervised box is the one that dies quietly
+   * overnight. Creating one therefore guarantees the watchdog exists, rather
+   * than assuming somebody ran `suite init` on this host first.
+   *
+   * Injected, so a caller that supplies no supervisorIo installs nothing —
+   * which is what keeps this suite from writing real units.
+   */
+  test("ensureSupervision writes a unit and activates it", async () => {
+    const calls: string[] = [];
+    const io = {
+      mkdirp: (d: string) => calls.push(`mkdirp ${d}`),
+      writeFile: (p: string) => calls.push(`write ${p}`),
+      run: async (argv: string[]) => {
+        calls.push(argv.join(" "));
+        return { exitCode: 0 };
+      },
+    };
+    const res = await ensureSupervision(io, {
+      platform: "linux",
+      home: "/home/q",
+      binary: "/home/q/.local/bin/suite",
+      intervalSeconds: 60,
+    });
+    expect(res.watchdog).toContain("suite-watch");
+    expect(calls.some((c) => c.includes("suite-watch.service"))).toBe(true);
+    // Restore unit written but NOT enabled — the operator opts in.
+    expect(calls.some((c) => c.includes("suite-agents.service"))).toBe(true);
+    expect(calls.some((c) => c.includes("enable") && c.includes("suite-agents"))).toBe(false);
+  });
+
+  /** Supervision is insurance; the agent is the point. A failure must not throw. */
+  test("a service manager that refuses does not throw", async () => {
+    const io = {
+      mkdirp: () => {},
+      writeFile: () => {},
+      run: async () => ({ exitCode: 1 }),
+    };
+    const res = await ensureSupervision(io, {
+      platform: "linux", home: "/home/q", binary: "/b/suite", intervalSeconds: 60,
+    });
+    expect(res.watchdog).toContain("NOT running");
+  });
+});
+
+
+/**
+ * A ZERO FROM `new-session` IS NOT A SESSION.
+ *
+ * On a real host `suite claude` printed "started suite-chabrielle-ecb3ba97 — it
+ * survives this terminal", immediately followed by tmux saying there was no
+ * such session. tmux exits 0 once it has forked and exec'd; the agent then died
+ * on startup and everything after that point was written about something that
+ * no longer existed. (The cause there was a tmux SERVER whose own cwd had been
+ * deleted, so every new pane was born unable to getcwd().)
+ */
+describe("a session that is created and does not survive", () => {
+  /** Created, and the agent is not running a moment later. */
+  const deadSessionRun = () => statefulTmux(false);
+  /** Created, and the agent is up. */
+  const liveSessionRun = () => statefulTmux(true);
+
+  test("is reported as died, not as started", async () => {
+    const r = recorder({}, deadSessionRun());
+    const code = await runClaude(r.deps, { userArgs: [], force: false });
+    expect(code).toBe(SESSION_DIED_EXIT);
+    const said = [...r.out, ...r.err].join("\n");
+    expect(said).toContain("exited immediately");
+    expect(said).not.toContain("survives this terminal");
+  });
+
+  test("names the tmux-server cause, which no exit code will ever report", async () => {
+    const r = recorder({}, deadSessionRun());
+    await runClaude(r.deps, { userArgs: [], force: false });
+    expect(r.err.join("\n")).toContain("kill-server");
+  });
+
+  test("records nothing for restore-on-boot", async () => {
+    const written: string[] = [];
+    const r = recorder(
+      {
+        restore: {
+          tmux: { env: {}, which: () => "/usr/bin/tmux", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+          readRoster: () => null,
+          writeRoster: (_p, c) => void written.push(c),
+          now: () => new Date("2026-09-08T00:00:00.000Z"),
+          log: () => {},
+        },
+      },
+      deadSessionRun(),
+    );
+    await runClaude(r.deps, { userArgs: [], force: false });
+    // A roster entry for a session that is already gone is exactly the row that
+    // makes restore-on-boot replay something which cannot work.
+    expect(written).toEqual([]);
+  });
+
+  /**
+   * THE WAIT IS LOAD-BEARING, and this is what proves it.
+   *
+   * The first version of this guard asked immediately after `new-session` and
+   * therefore always passed: tmux has forked, the pane is there, and the agent
+   * has not got as far as failing yet. It shipped, and the next real run
+   * printed "started … survives this terminal" exactly as before — a guard
+   * reporting green while the thing it guards against happened in front of it.
+   *
+   * Here the agent is alive at t=0 and gone once the settle wait has elapsed,
+   * which is the real shape. Without the wait the check reads the healthy
+   * instant and passes.
+   */
+  test("catches an agent that is up at create and gone a moment later", async () => {
+    let settled = false;
+    let session: string | null = null;
+    const r = recorder(
+      { sleep: async () => void (settled = true) },
+      async (argv) => {
+        if (argv.includes("new-session")) {
+          const i = argv.indexOf("-s");
+          session = argv[i + 1] ?? null;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv.includes("list-panes")) {
+          return { exitCode: 0, stdout: session === null ? "" : `${session}\t4242\tzsh\n`, stderr: "" };
+        }
+        if (argv[0] === "ps") {
+          // Alive until the settle wait happens, then gone.
+          return {
+            exitCode: 0,
+            stdout: settled
+              ? "  4242     1 zsh              -zsh\n"
+              : "  4242     1 zsh              -zsh\n  4243  4242 claude           claude\n",
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    );
+
+    expect(await runClaude(r.deps, { userArgs: [], force: false })).toBe(SESSION_DIED_EXIT);
+    expect([...r.out, ...r.err].join("\n")).not.toContain("survives this terminal");
+  });
+
+  /**
+   * A FIRST RUN HAS NOTHING TO CONTINUE.
+   *
+   * `suiteArgs` injects `--continue` so a restarted agent resumes. In a
+   * directory that has never held a conversation Claude answers "No
+   * conversation found to continue" and exits 1 — so the very first launch of
+   * every new agent died. Reproduced in a real agent's directory, where the
+   * identical command without `--continue` stayed up.
+   */
+  test("retries without --continue when the first launch had nothing to resume", async () => {
+    let session: string | null = null;
+    let attempts = 0;
+    const written: string[] = [];
+    const r = recorder(
+      {
+        restore: {
+          tmux: { env: {}, which: () => "/usr/bin/tmux", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+          readRoster: () => null,
+          writeRoster: (_p, c) => void written.push(c),
+          now: () => new Date("2026-09-08T00:00:00.000Z"),
+          log: () => {},
+        },
+      },
+      async (argv) => {
+        if (argv.includes("new-session")) {
+          attempts += 1;
+          const i = argv.indexOf("-s");
+          session = argv[i + 1] ?? null;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        if (argv.includes("list-panes")) {
+          return { exitCode: 0, stdout: session === null ? "" : `${session}\t4242\tzsh\n`, stderr: "" };
+        }
+        if (argv[0] === "ps") {
+          // The agent survives only the attempt that omitted --continue.
+          const alive = attempts >= 2;
+          return {
+            exitCode: 0,
+            stdout: alive
+              ? "  4242     1 zsh              -zsh\n  4243  4242 claude           claude\n"
+              : "  4242     1 zsh              -zsh\n",
+            stderr: "",
+          };
+        }
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    );
+
+    const code = await runClaude(r.deps, { userArgs: [], force: false });
+    expect(code).not.toBe(SESSION_DIED_EXIT);
+
+    const creates = r.ran.filter((a) => a.includes("new-session"));
+    expect(creates).toHaveLength(2);
+    expect(creates[0]).toContain(CONTINUE_ARG);
+    expect(creates[1]).not.toContain(CONTINUE_ARG);
+    expect([...r.out, ...r.err].join("\n")).toContain("no previous conversation");
+
+    // The ROSTER must hold what actually worked. Recording the --continue form
+    // would make restore-on-boot replay the command that just failed.
+    expect(written.join("")).not.toContain(CONTINUE_ARG);
+  });
+
+  test("does not retry when --continue was not the wrapper's idea", async () => {
+    let session: string | null = null;
+    const r = recorder({}, async (argv) => {
+      if (argv.includes("new-session")) {
+        const i = argv.indexOf("-s");
+        session = argv[i + 1] ?? null;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      }
+      if (argv.includes("list-panes")) {
+        return { exitCode: 0, stdout: session === null ? "" : `${session}\t4242\tzsh\n`, stderr: "" };
+      }
+      if (argv[0] === "ps") return { exitCode: 0, stdout: "  4242     1 zsh              -zsh\n", stderr: "" };
+      return { exitCode: 0, stdout: "", stderr: "" };
+    });
+
+    // `--resume` is a session selector, so suiteArgs adds no --continue and
+    // there is nothing to strip; a dead session is simply dead.
+    expect(await runClaude(r.deps, { userArgs: ["--resume"], force: false })).toBe(SESSION_DIED_EXIT);
+    expect(r.ran.filter((a) => a.includes("new-session"))).toHaveLength(1);
+  });
+
+  test("CONTROL: a session that IS alive is reported started and recorded", async () => {
+    const written: string[] = [];
+    const r = recorder(
+      {
+        restore: {
+          tmux: { env: {}, which: () => "/usr/bin/tmux", run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+          readRoster: () => null,
+          writeRoster: (_p, c) => void written.push(c),
+          now: () => new Date("2026-09-08T00:00:00.000Z"),
+          log: () => {},
+        },
+      },
+      liveSessionRun(),
+    );
+    const code = await runClaude(r.deps, { userArgs: [], force: false });
+    expect(code).not.toBe(SESSION_DIED_EXIT);
+    expect([...r.out, ...r.err].join("\n")).toContain("survives this terminal");
+    expect(written.length).toBeGreaterThan(0);
   });
 });

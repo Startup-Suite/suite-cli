@@ -24,7 +24,7 @@
  *     prints the raw line — never a false green.
  */
 import { resolve } from "node:path";
-import { existsSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import {
   createStore,
@@ -47,6 +47,14 @@ import {
 } from "../claude_md.ts";
 import { readConfig, writeConfig, type SuiteConfig } from "../config.ts";
 import { nextCommand, row } from "../ui.ts";
+import {
+  type SupervisorIo,
+  type SupervisorResult,
+  installSupervisor,
+  restoreUnitPlan,
+  supervisorPlan,
+  writeRestoreUnit,
+} from "../supervisor.ts";
 
 /* ------------------------------------------------------------------------- */
 /* Empirical finding — ${ENV_VAR} interpolation                               */
@@ -84,7 +92,7 @@ export function envReference(variable: string): string {
 
 export type Runner = (
   argv: string[],
-  options?: { cwd?: string; allowSecretsInArgv?: boolean },
+  options?: { cwd?: string; allowSecretsInArgv?: boolean; env?: Record<string, string | undefined> },
 ) => Promise<SpawnResult>;
 
 export interface InitDeps {
@@ -96,6 +104,15 @@ export interface InitDeps {
   isTTY: boolean;
   /** Where a starting CLAUDE.md is written. The agent's working directory. */
   cwd: string;
+  /**
+   * How the session watchdog reaches the filesystem and the service manager.
+   *
+   * Injected rather than imported so `init` has no unmockable side effect: a
+   * caller that supplies nothing installs nothing. That is what keeps the test
+   * suite from writing real unit files and shelling out to systemctl, and it is
+   * why this is optional rather than defaulted to the live implementation.
+   */
+  supervisorIo?: SupervisorIo;
   out(line: string): void;
 }
 
@@ -107,6 +124,15 @@ export interface InitOptions {
    * {@link ENV_INTERPOLATION_SUPPORTED} for why this is not the default.
    */
   tokenFromEnv?: string;
+  /**
+   * Skip installing the session watchdog.
+   *
+   * Installing is the DEFAULT and that is the whole point: a watchdog an
+   * operator has to find out about is one that is not running on the morning it
+   * was needed. This flag exists for boxes where clearing a session
+   * automatically is not wanted, not as a way to defer the decision.
+   */
+  noSupervisor?: boolean;
 }
 
 export const PLUGIN_REPO = "https://github.com/Startup-Suite/claude-code-suite-channel.git";
@@ -273,22 +299,96 @@ export function spinner(label: string, deps: Pick<InitDeps, "isTTY">): { stop():
 /* The plugin checkout                                                        */
 /* ------------------------------------------------------------------------- */
 
+/**
+ * Why a `git pull --ff-only` failed, as far as its own output will say.
+ *
+ * THE MESSAGE MUST NOT ASSERT A CAUSE IT DID NOT DETERMINE. The first version
+ * of this error printed git's stderr and then, unconditionally, "it has local
+ * commits or a diverged history". On a real host that line was false: the
+ * checkout was clean and exactly level with origin, and the pull had failed
+ * because the HTTPS remote had no usable credential. The operator was handed
+ * git's own "Authentication failed" and a sentence telling them to go resolve a
+ * divergence that did not exist.
+ */
+export type PullFailureKind = "auth" | "diverged" | "unknown";
+
+export function classifyPullFailure(detail: string): PullFailureKind {
+  const d = detail.toLowerCase();
+  if (
+    d.includes("authentication failed") ||
+    d.includes("invalid username or token") ||
+    d.includes("could not read username") ||
+    d.includes("permission denied (publickey)") ||
+    d.includes("terminal prompts disabled")
+  ) {
+    return "auth";
+  }
+  if (d.includes("non-fast-forward") || d.includes("diverged") || d.includes("not possible to fast-forward")) {
+    return "diverged";
+  }
+  return "unknown";
+}
+
+/** What to tell the operator to do, given what actually went wrong. */
+export function pullRemedyLines(kind: PullFailureKind, dir: string): string[] {
+  switch (kind) {
+    case "auth":
+      return [
+        `  git could not authenticate to the remote. The checkout itself is probably fine.`,
+        `  Either give git a credential — \`gh auth setup-git\` — or point it at SSH:`,
+        `    git -C ${dir} remote set-url origin git@github.com:Startup-Suite/claude-code-suite-channel.git`,
+      ];
+    case "diverged":
+      return [
+        `  it has local commits or a diverged history. Resolve it there, or move it aside.`,
+        `  init will not force, reset or delete a checkout it did not create.`,
+      ];
+    default:
+      return [
+        `  init could not tell why from git's output above, so it is not guessing.`,
+        `  init will not force, reset or delete a checkout it did not create.`,
+      ];
+  }
+}
+
 export class PullFailed extends Error {
   readonly exitCode = 4;
+  readonly kind: PullFailureKind;
   constructor(dir: string, detail: string) {
+    const kind = classifyPullFailure(detail);
     super(
       [
         `the plugin checkout at ${dir} could not be fast-forwarded:`,
         detail.trim(),
-        `  it has local commits or a diverged history. Resolve it there, or move it aside.`,
-        `  init will not force, reset or delete a checkout it did not create.`,
+        ...pullRemedyLines(kind, dir),
       ].join("\n"),
     );
     this.name = "PullFailed";
+    this.kind = kind;
   }
 }
 
 export type CheckoutOutcome = "cloned" | "updated";
+
+/**
+ * Never let git ask the operator a question here.
+ *
+ * These git calls run underneath a spinner. When the remote wants credentials
+ * git writes "Username for 'https://github.com':" straight to the terminal, the
+ * spinner repaints over it, and what the operator sees is a corrupted line —
+ * observed for real as `plugin  ⠹anername for 'https://github.com':`. A prompt
+ * nobody can read is worse than a refusal: with the prompt disabled git fails
+ * immediately and says why, which `classifyPullFailure` can then act on.
+ */
+export function noGitPrompt(
+  env: Record<string, string | undefined>,
+): Record<string, string | undefined> {
+  // MERGED, not replaced. `spawnWithSecrets` uses `options.env` as the whole
+  // environment rather than an overlay, so handing it the one variable would
+  // run git with no PATH, no HOME and therefore no credential helper or SSH
+  // config — turning "cannot authenticate" into a different, stranger failure.
+  return { ...env, GIT_TERMINAL_PROMPT: "0" };
+}
 
 /**
  * Clone the plugin, or fast-forward an existing checkout.
@@ -299,12 +399,12 @@ export type CheckoutOutcome = "cloned" | "updated";
  */
 export async function cloneOrUpdate(dir: string, deps: InitDeps): Promise<CheckoutOutcome> {
   if (existsSync(resolve(dir, ".git"))) {
-    const r = await deps.run(["git", "pull", "--ff-only"], { cwd: dir });
+    const r = await deps.run(["git", "pull", "--ff-only"], { cwd: dir, env: noGitPrompt(deps.env) });
     if (r.exitCode !== 0) throw new PullFailed(dir, r.stderr || r.stdout);
     return "updated";
   }
   await mkdir(resolve(dir, ".."), { recursive: true });
-  const r = await deps.run(["git", "clone", PLUGIN_REPO, dir]);
+  const r = await deps.run(["git", "clone", PLUGIN_REPO, dir], { env: noGitPrompt(deps.env) });
   if (r.exitCode !== 0) {
     throw new Error(`git clone failed: ${(r.stderr || r.stdout).trim()}`);
   }
@@ -326,9 +426,42 @@ export function packageCount(bunInstallOutput: string): string {
  * MCP is plain HTTP at `/mcp`. Both are derived from the one URL the user
  * pasted, so they cannot drift apart by a typo in one of them.
  */
+/**
+ * Whether the pasted URL is secure, whichever family it was written in.
+ *
+ * The operator may paste either the browser URL or the runtime WebSocket URL —
+ * both name the same Suite — so both derivations have to work from either, and
+ * neither may inherit the scheme it was handed.
+ *
+ * THIS IS WHAT WENT WRONG. `toolsHttpUrl` used to leave the protocol alone.
+ * Given the runtime URL (`wss://…/runtime/ws`) it emitted `wss://…/mcp` into
+ * the HTTP MCP slot, and the client refused it with
+ * `ERR_INVALID_ARG_VALUE: protocol must be http:, https: or s3:` — an error
+ * naming neither Suite nor the URL that produced it. Observed on a real setup.
+ *
+ * The second bug was quieter and in the other function: `channelWsUrl` mapped
+ * `http:` to `ws:` and EVERYTHING ELSE to `wss:`, so a deliberate local
+ * `ws://localhost:4000` was silently upgraded to `wss://localhost:4000`, which
+ * cannot complete a TLS handshake against a plain dev server.
+ */
+function isSecureScheme(protocol: string): boolean {
+  switch (protocol) {
+    case "https:":
+    case "wss:":
+      return true;
+    case "http:":
+    case "ws:":
+      return false;
+    default:
+      throw new Error(
+        `suite: ${protocol}// is not a Suite URL — paste the https:// address you open in a browser, or the wss:// runtime URL.`,
+      );
+  }
+}
+
 export function channelWsUrl(suiteUrl: string): string {
   const u = new URL(suiteUrl);
-  u.protocol = u.protocol === "http:" ? "ws:" : "wss:";
+  u.protocol = isSecureScheme(u.protocol) ? "wss:" : "ws:";
   u.pathname = "/runtime/ws";
   u.search = "";
   return u.toString();
@@ -336,6 +469,7 @@ export function channelWsUrl(suiteUrl: string): string {
 
 export function toolsHttpUrl(suiteUrl: string): string {
   const u = new URL(suiteUrl);
+  u.protocol = isSecureScheme(u.protocol) ? "https:" : "http:";
   u.pathname = "/mcp";
   u.search = "";
   return u.toString();
@@ -380,6 +514,17 @@ export function channelAddArgs(entry: ChannelEntry): string[] {
     "bun",
     entry.indexPath,
   ];
+}
+
+/**
+ * Did `claude mcp add` refuse because the name is already registered?
+ *
+ * Matched on the message rather than the exit code, because exit 1 is also how
+ * every other failure arrives — a bad flag, an unwritable config — and those
+ * must NOT be answered by deleting the operator's entry and trying again.
+ */
+export function alreadyRegistered(output: string): boolean {
+  return /already exists/i.test(output);
 }
 
 /** argv for the HTTP tools entry, with one `-H` per solicited header. */
@@ -509,6 +654,8 @@ export const FEDERATE_HINT = [
 ].join("\n");
 
 export interface InitResult {
+  /** Null when the operator declined with --no-supervisor. */
+  supervisor?: SupervisorResult | null;
   exitCode: number;
   /** True when tmux is unavailable — sessions will not outlive a terminal. */
   tmuxMissing: boolean;
@@ -660,9 +807,31 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
     // command line is gone before anyone can read it out of `ps`. This is the
     // one place stage 2 sanctions a secret in argv, and the constructed command
     // line is NEVER logged — it carries the token.
-    const r = await deps.run(argv, { allowSecretsInArgv: true });
+    let r = await deps.run(argv, { allowSecretsInArgv: true });
+
+    // A SECOND `suite init` MUST CONVERGE, NOT FAIL. `claude mcp add` refuses a
+    // name that is already registered, so once init had succeeded it could
+    // never be run again — which is precisely when you run it: after fixing a
+    // URL, rotating a token, or moving the checkout. Re-registering is this
+    // command's whole job, and the values were just re-collected from the
+    // operator, so replacing our own two entries is the intended outcome.
+    if (r.exitCode !== 0 && alreadyRegistered(r.stderr || r.stdout)) {
+      const name = argv[3] as string;
+      await deps.run(["claude", "mcp", "remove", name, "-s", "user"]);
+      r = await deps.run(argv, { allowSecretsInArgv: true });
+      if (r.exitCode === 0) say(row(name, "replaced", "an entry was already registered"));
+    }
+
     if (r.exitCode !== 0) {
-      throw new Error(`claude mcp add ${argv[3]} failed with exit ${r.exitCode}`);
+      // The argv is unlogged because it carries the token; claude's own stderr
+      // does not, and it is the only thing that says WHY. Reporting the exit
+      // code alone hands the operator a number and no next step — which is what
+      // `claude mcp add suite-channel failed with exit 1` did on a real host.
+      throw new Error(
+        [`claude mcp add ${argv[3]} failed with exit ${r.exitCode}:`, (r.stderr || r.stdout).trim()]
+          .filter((l) => l !== "")
+          .join("\n"),
+      );
     }
   }
   say(row(CHANNEL_SERVER, "registered", "user scope"));
@@ -676,10 +845,49 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
   const report = connectionReport(statuses);
   for (const line of report.lines) say(line);
 
+  // The watchdog, installed unless explicitly declined.
+  let supervisor: SupervisorResult | null = null;
+  if (!options.noSupervisor && deps.supervisorIo) {
+    const home = deps.env.HOME ?? "";
+    const plan = supervisorPlan({
+      platform: deps.platform,
+      home,
+      // Absolute path: a service inherits a minimal PATH, and a bare name there
+      // fails to start with no useful signal.
+      binary: `${home}/.local/bin/suite`,
+      inheritedPath: deps.env.PATH,
+      inheritedLocale: deps.env.LANG ?? deps.env.LC_ALL,
+      intervalSeconds: 60,
+    });
+    supervisor = await installSupervisor(deps.supervisorIo, plan);
+    say(
+      supervisor.installed
+        ? `watchdog: ${supervisor.summary}`
+        : `watchdog NOT running: ${supervisor.summary}`,
+    );
+
+    // Agent restore-on-boot: written, deliberately NOT enabled. An operator
+    // opts in per machine; a host that silently starts agents after a reboot
+    // would be a worse surprise than the missing agent this fixes.
+    const restore = restoreUnitPlan({
+      platform: deps.platform,
+      home,
+      binary: `${home}/.local/bin/suite`,
+      inheritedPath: deps.env.PATH,
+      intervalSeconds: 60,
+    });
+    if (restore) {
+      writeRestoreUnit(deps.supervisorIo, restore);
+      say(`agent restore-on-boot written (NOT enabled). To turn it on:`);
+      say(`  ${restore.enableHint}`);
+    }
+  }
+
   say("");
   say(nextCommand("suite claude"));
 
   return {
+    supervisor,
     exitCode: report.ok ? 0 : 1,
     tmuxMissing: !tmux.present,
     checkout: outcome,
@@ -700,5 +908,10 @@ export function liveDeps(prompter: Prompter, store: CredentialStore = createStor
     cwd: process.cwd(),
     out: (line) => void process.stdout.write(`${line}\n`),
     run: (argv, options) => spawnWithSecrets(argv, store, options),
+    supervisorIo: {
+      mkdirp: (dir) => void mkdirSync(dir, { recursive: true }),
+      writeFile: (path, contents) => void writeFileSync(path, contents),
+      run: async (argv) => ({ exitCode: (await spawnWithSecrets(argv, store)).exitCode }),
+    },
   };
 }

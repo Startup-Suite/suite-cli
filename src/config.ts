@@ -33,12 +33,27 @@ export interface SuiteConfig {
    */
   headerNames: string[];
   sessionNaming: SessionNaming;
+  /**
+   * Where halt telemetry is shipped, if anywhere. Optional by construction:
+   * an install that never sets it simply emits nothing, so this cannot break
+   * an existing box or make the CLI depend on one operator's observability
+   * stack. Contains no credential — the token lives in the secret store, the
+   * same split the rest of this config uses.
+   */
+  telemetry?: TelemetrySinkConfig;
+}
+
+export interface TelemetrySinkConfig {
+  /** Base URL of the collector, e.g. https://observe.example.invalid:5080 */
+  endpoint: string;
+  org: string;
+  stream: string;
 }
 
 export const DEFAULT_SESSION_NAMING: SessionNaming = "cwd";
 
 /** Keys permitted in the serialised document. Anything else is dropped. */
-const ALLOWED_KEYS = ["suiteUrl", "runtimeId", "headerNames", "sessionNaming"] as const;
+const ALLOWED_KEYS = ["suiteUrl", "runtimeId", "headerNames", "sessionNaming", "telemetry"] as const;
 
 export function emptyConfig(): SuiteConfig {
   return { suiteUrl: "", runtimeId: "", headerNames: [], sessionNaming: DEFAULT_SESSION_NAMING };
@@ -53,6 +68,10 @@ export function serializeConfig(config: SuiteConfig): string {
   for (const key of ALLOWED_KEYS) {
     if (key === "headerNames") {
       out[key] = [...config.headerNames].map((n) => n.trim()).filter((n) => n !== "");
+    } else if (key === "telemetry") {
+      // Omit entirely when unset, so an untouched config is byte-identical to
+      // what it was before this feature existed.
+      if (config.telemetry) out[key] = config.telemetry;
     } else {
       out[key] = config[key];
     }
@@ -69,7 +88,18 @@ export function parseConfig(text: string): SuiteConfig {
     runtimeId: typeof raw.runtimeId === "string" ? raw.runtimeId : base.runtimeId,
     headerNames: Array.isArray(names) ? names.filter((n): n is string => typeof n === "string") : [],
     sessionNaming: raw.sessionNaming === "runtime" ? "runtime" : base.sessionNaming,
+    ...parseTelemetry(raw.telemetry),
   };
+}
+
+/** Accept a telemetry block only when all three fields are real strings. */
+function parseTelemetry(raw: unknown): { telemetry?: TelemetrySinkConfig } {
+  if (typeof raw !== "object" || raw === null) return {};
+  const r = raw as Record<string, unknown>;
+  const { endpoint, org, stream } = r;
+  if (typeof endpoint !== "string" || typeof org !== "string" || typeof stream !== "string") return {};
+  if (endpoint === "" || org === "" || stream === "") return {};
+  return { telemetry: { endpoint, org, stream } };
 }
 
 export interface WriteOptions {

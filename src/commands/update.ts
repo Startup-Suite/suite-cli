@@ -178,7 +178,45 @@ export async function runUpdate(deps: UpdateDeps): Promise<number> {
   // 0.1.0 with 0.2.0? [y/N]" prompt. It is NOT auto-answered: an update that
   // silently overwrites is the thing the prompt exists to prevent, and it
   // inherits the terminal, so the user answers it directly.
-  return deps.exec(updateArgv(sha, fetcher));
+  const code = await deps.exec(updateArgv(sha, fetcher));
+  if (code !== 0) for (const line of failureLines(code)) deps.err(line);
+  return code;
+}
+
+/** Exit code of a process killed by SIGPIPE, by the 128+signal convention. */
+export const SIGPIPE_EXIT = 141;
+
+/**
+ * What to say when the installer did not finish.
+ *
+ * ON STDERR, DELIBERATELY. The case that produced this is `suite update | head`
+ * — the reader exits, the installer dies of SIGPIPE partway, and every word we
+ * had written about what we were doing went into the pipe that just closed.
+ * The user is left holding the announcement ("updating suite ... running the
+ * installer from ...") with no ending, which reads exactly like success. Found
+ * by noticing the deployed file did not contain the change that had just been
+ * "installed".
+ *
+ * The install itself is safe — install.sh stages into `<lib>.incoming` and only
+ * then swaps, so a death before the swap leaves the previous version whole
+ * rather than half-written. That is worth saying out loud, because the useful
+ * information is not "it failed" but "you are still on the old version and it
+ * still works".
+ */
+export function failureLines(code: number): string[] {
+  const lines: string[] = [];
+  if (code === SIGPIPE_EXIT) {
+    lines.push(
+      "suite: the installer was cut off because its output had nowhere to go — `suite update` was piped into something that exited first (`| head`, `| grep -q`, a closed pager).",
+    );
+    lines.push("suite: NOTHING WAS INSTALLED. Re-run it without the pipe.");
+  } else {
+    lines.push(`suite: the installer exited ${code} — the update did not complete.`);
+  }
+  lines.push(
+    "suite: your previous version is intact; install.sh stages the new one and swaps only at the end, so a failure here leaves the working install alone.",
+  );
+  return lines;
 }
 
 export function liveUpdateDeps(): UpdateDeps {

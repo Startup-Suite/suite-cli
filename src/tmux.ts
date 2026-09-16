@@ -203,6 +203,17 @@ export function killSessionArgv(session: string): string[] {
 }
 
 /**
+ * Does this session exist right now?
+ *
+ * Used to confirm a creation actually produced something. `new-session` exits 0
+ * once it has forked and exec'd, so its exit code says nothing about whether
+ * the agent stayed up — see the check in `suite claude`.
+ */
+export function hasSessionArgv(session: string, tmux: string = TMUX): string[] {
+  return [tmux, "has-session", "-t", session];
+}
+
+/**
  * Compose a new-session argv and refuse it if it carries a credential.
  *
  * A tmux command line sits in the process table for the life of the agent and

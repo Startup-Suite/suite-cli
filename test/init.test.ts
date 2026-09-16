@@ -6,6 +6,10 @@ import {
   CHANNEL_SERVER,
   ENV_INTERPOLATION_SUPPORTED,
   PullFailed,
+  alreadyRegistered,
+  classifyPullFailure,
+  noGitPrompt,
+  pullRemedyLines,
   TOOLS_SERVER,
   bunInstallPlan,
   channelAddArgs,
@@ -164,6 +168,86 @@ describe("init on a machine where nothing is installed", () => {
     // And the scrubbed PATH really is scrubbed: the code under test cannot
     // reach the machine's own git or bun and quietly do the real thing.
     expect(fx.env.PATH).toBe(fx.bin);
+  });
+
+  /**
+   * The watchdog is only installed when an IO is injected, which is what keeps
+   * the rest of this suite from writing real unit files. That makes it possible
+   * for it to be silently skipped forever, so these two tests exist to prove it
+   * actually fires when wired, and only then.
+   */
+  test("installs the session watchdog by default", async () => {
+    const fx = makeFixture();
+    const calls: string[] = [];
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      platform: "linux",
+      supervisorIo: {
+        mkdirp: (d) => calls.push(`mkdirp ${d}`),
+        writeFile: (path, contents) => calls.push(`write ${path} :: ${contents.length}B`),
+        run: async (argv) => {
+          calls.push(argv.join(" "));
+          return { exitCode: 0 };
+        },
+      },
+    });
+
+    const result = await runInit(deps);
+
+    expect(result.supervisor?.installed).toBe(true);
+    expect(calls.some((c) => c.startsWith("write ") && c.includes("suite-watch.service"))).toBe(true);
+    expect(calls).toContain("systemctl --user enable --now suite-watch.service");
+    expect(deps.lines.some((l) => l.includes("watchdog:"))).toBe(true);
+  });
+
+  /**
+   * Restore-on-boot is WRITTEN but never ENABLED. A host that silently starts
+   * agents after a reboot would be a worse surprise than the missing agent it
+   * fixes, so the operator opts in per machine and init only prints how.
+   */
+  test("writes the agent restore unit but does not enable it", async () => {
+    const fx = makeFixture();
+    const calls: string[] = [];
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      platform: "linux",
+      supervisorIo: {
+        mkdirp: (d) => calls.push(`mkdirp ${d}`),
+        writeFile: (path) => calls.push(`write ${path}`),
+        run: async (argv) => {
+          calls.push(argv.join(" "));
+          return { exitCode: 0 };
+        },
+      },
+    });
+
+    await runInit(deps);
+
+    expect(calls.some((c) => c === "write /home/q/.config/systemd/user/suite-agents.service" ||
+      c.endsWith("suite-agents.service"))).toBe(true);
+    // The watchdog IS enabled; the agent restore is NOT. Assert the absence
+    // specifically, or "we enabled everything" would pass this test.
+    expect(calls.some((c) => c.includes("enable") && c.includes("suite-agents"))).toBe(false);
+    expect(deps.lines.some((l) => l.includes("NOT enabled"))).toBe(true);
+  });
+
+  test("--no-supervisor declines it, and nothing is written", async () => {
+    const fx = makeFixture();
+    const calls: string[] = [];
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      platform: "linux",
+      supervisorIo: {
+        mkdirp: (d) => calls.push(d),
+        writeFile: (p2) => calls.push(p2),
+        run: async (argv) => {
+          calls.push(argv.join(" "));
+          return { exitCode: 0 };
+        },
+      },
+    });
+
+    const result = await runInit(deps, { noSupervisor: true });
+
+    expect(result.supervisor ?? null).toBeNull();
+    expect(calls).toEqual([]);
   });
 
   test("takes the clone path, runs bun install, and registers both entries at user scope", async () => {
@@ -422,6 +506,67 @@ describe("init on a machine where nothing is installed", () => {
   });
 });
 
+/**
+ * THE FAILURE THIS EXISTS FOR, observed on a real host.
+ *
+ * `suite init` on a box whose plugin checkout was clean and exactly level with
+ * origin (0 ahead, 0 behind) printed git's own "Authentication failed" and then
+ * told the operator the checkout "has local commits or a diverged history".
+ * Both halves were in the same message and they contradicted each other. The
+ * remedy named was for a state that did not exist.
+ */
+describe("a failed pull says what actually went wrong", () => {
+  const AUTH = [
+    "remote: Invalid username or token. Password authentication is not supported for Git operations.",
+    "fatal: Authentication failed for 'https://github.com/Startup-Suite/claude-code-suite-channel.git/'",
+  ].join("\n");
+
+  const DIVERGED =
+    "fatal: Not possible to fast-forward, aborting.";
+
+  test("an auth failure is not reported as a diverged history", () => {
+    expect(classifyPullFailure(AUTH)).toBe("auth");
+    const msg = new PullFailed("/co", AUTH).message;
+    expect(msg).not.toContain("diverged history");
+    expect(msg).not.toContain("local commits");
+    expect(msg).toContain("could not authenticate");
+  });
+
+  test("the auth remedy is a command the operator can run", () => {
+    const lines = pullRemedyLines("auth", "/co").join("\n");
+    expect(lines).toContain("gh auth setup-git");
+    expect(lines).toContain("remote set-url origin git@github.com:");
+  });
+
+  test("CONTROL: a real divergence still says diverged, and keeps the no-force promise", () => {
+    expect(classifyPullFailure(DIVERGED)).toBe("diverged");
+    const msg = new PullFailed("/co", DIVERGED).message;
+    expect(msg).toContain("diverged history");
+    expect(msg).toContain("will not force, reset or delete");
+  });
+
+  test("an unrecognised failure guesses at nothing", () => {
+    const msg = new PullFailed("/co", "fatal: the disk caught fire").message;
+    expect(classifyPullFailure("fatal: the disk caught fire")).toBe("unknown");
+    expect(msg).not.toContain("diverged history");
+    expect(msg).not.toContain("could not authenticate");
+    expect(msg).toContain("not guessing");
+  });
+
+  /**
+   * The prompt is disabled by MERGING, not replacing. `spawnWithSecrets` treats
+   * `options.env` as the entire environment, so a bare `{GIT_TERMINAL_PROMPT}`
+   * would strip PATH and HOME and take git's credential helper and SSH config
+   * with them — trading a readable auth error for an inexplicable one.
+   */
+  test("disabling git's prompt keeps the rest of the environment", () => {
+    const merged = noGitPrompt({ PATH: "/usr/bin", HOME: "/home/q" });
+    expect(merged.GIT_TERMINAL_PROMPT).toBe("0");
+    expect(merged.PATH).toBe("/usr/bin");
+    expect(merged.HOME).toBe("/home/q");
+  });
+});
+
 describe("an existing checkout", () => {
   test("is fast-forwarded, not re-cloned", async () => {
     const fx = makeFixture();
@@ -560,6 +705,107 @@ describe("parseServerStatus", () => {
   });
 });
 
+/**
+ * A SECOND `suite init` MUST CONVERGE. `claude mcp add` refuses a name that is
+ * already registered, so once init had succeeded it could never be run again —
+ * which is exactly when it gets run: after fixing a URL, rotating a token, or
+ * moving the checkout. Observed on a real host as
+ * `claude mcp add suite-channel failed with exit 1`, a number with no cause
+ * attached because the argv is deliberately unlogged (it carries the token).
+ */
+describe("re-running init over entries it already registered", () => {
+  test("the discriminator is the message, not the exit code", () => {
+    expect(alreadyRegistered("MCP server suite-channel already exists in user config")).toBe(true);
+    // Everything else also exits 1, and must NOT be answered by deleting the
+    // operator's entry and trying again.
+    expect(alreadyRegistered("error: unknown flag --nope")).toBe(false);
+    expect(alreadyRegistered("EACCES: permission denied, open '/Users/x/.claude.json'")).toBe(false);
+    expect(alreadyRegistered("")).toBe(false);
+  });
+
+  test("an already-registered entry is removed and re-added, and init still succeeds", async () => {
+    const fx = makeFixture();
+    const store = createStore();
+    const calls: string[][] = [];
+    const failedOnce = new Set<string>();
+
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      store,
+      run: async (argv, opts) => {
+        calls.push(argv);
+        if (argv[1] === "mcp" && argv[2] === "add") {
+          const name = argv[3] as string;
+          // Fail only the FIRST attempt for each server, the way a real second
+          // run does — the retry after the remove must succeed.
+          if (!failedOnce.has(name)) {
+            failedOnce.add(name);
+            return {
+              exitCode: 1,
+              stdout: "",
+              stderr: `MCP server ${argv[3]} already exists in user config`,
+            };
+          }
+          return { exitCode: 0, stdout: "", stderr: "" };
+        }
+        return spawnWithSecrets(argv, store, { ...opts, env: fx.env });
+      },
+    });
+
+    await runInit(deps);
+
+    const removes = calls.filter((c) => c[1] === "mcp" && c[2] === "remove");
+    expect(removes.map((c) => c[3]).sort()).toEqual([CHANNEL_SERVER, TOOLS_SERVER].sort());
+    // Removed at USER scope — the scope the entry was registered in. A remove
+    // at the default scope silently deletes nothing and the retry fails again.
+    for (const r of removes) expect(r.slice(4)).toEqual(["-s", "user"]);
+    expect(calls.filter((c) => c[1] === "mcp" && c[2] === "add")).toHaveLength(4);
+  });
+
+  test("a failure that is NOT a name clash deletes nothing and reports the reason", async () => {
+    const fx = makeFixture();
+    const store = createStore();
+    const calls: string[][] = [];
+
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      store,
+      run: async (argv, opts) => {
+        calls.push(argv);
+        if (argv[1] === "mcp" && argv[2] === "add") {
+          return { exitCode: 1, stdout: "", stderr: "EACCES: permission denied" };
+        }
+        return spawnWithSecrets(argv, store, { ...opts, env: fx.env });
+      },
+    });
+
+    // The cause travels with the error; an exit code alone is not a next step.
+    await expect(runInit(deps)).rejects.toThrow(/permission denied/);
+    expect(calls.filter((c) => c[1] === "mcp" && c[2] === "remove")).toHaveLength(0);
+  });
+
+  test("the thrown error never carries the token", async () => {
+    const fx = makeFixture();
+    const store = createStore();
+    const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()), {
+      store,
+      run: async (argv, opts) => {
+        if (argv[1] === "mcp" && argv[2] === "add") {
+          return { exitCode: 1, stdout: "", stderr: "EACCES: permission denied" };
+        }
+        return spawnWithSecrets(argv, store, { ...opts, env: fx.env });
+      },
+    });
+
+    let message = "";
+    try {
+      await runInit(deps);
+    } catch (e) {
+      message = (e as Error).message;
+    }
+    expect(message).not.toBe("");
+    expect(message).not.toContain(TOKEN);
+  });
+});
+
 describe("url derivation", () => {
   test("the channel speaks websocket to the runtime endpoint", () => {
     expect(channelWsUrl("https://suite.example.invalid")).toBe("wss://suite.example.invalid/runtime/ws");
@@ -568,6 +814,50 @@ describe("url derivation", () => {
 
   test("the tools entry is /mcp on the same host", () => {
     expect(toolsHttpUrl("https://suite.example.invalid/anything")).toBe("https://suite.example.invalid/mcp");
+  });
+
+  /**
+   * THE FAILURE THIS EXISTS FOR, from a real setup.
+   *
+   * The operator pasted the runtime URL — a reasonable reading of "the Suite
+   * URL", and the value Suite itself shows you. `toolsHttpUrl` left the scheme
+   * alone, so `wss://` went into the HTTP MCP slot and the client refused it
+   * with `ERR_INVALID_ARG_VALUE: protocol must be http:, https: or s3:`, an
+   * error naming neither Suite nor the URL behind it.
+   */
+  test("a pasted wss:// runtime URL still yields an http(s) tools entry", () => {
+    expect(toolsHttpUrl("wss://suite.example.invalid/runtime/ws")).toBe(
+      "https://suite.example.invalid/mcp",
+    );
+    expect(toolsHttpUrl("ws://127.0.0.1:4000/runtime/ws")).toBe("http://127.0.0.1:4000/mcp");
+  });
+
+  test("a pasted wss:// runtime URL still yields a ws(s) channel entry", () => {
+    expect(channelWsUrl("wss://suite.example.invalid/runtime/ws")).toBe(
+      "wss://suite.example.invalid/runtime/ws",
+    );
+  });
+
+  /**
+   * The quieter half of the same bug: the old mapping was "http: → ws:,
+   * everything else → wss:", so a deliberate plaintext local runtime URL was
+   * silently upgraded to wss: and could not complete a TLS handshake against a
+   * plain dev server.
+   */
+  test("a plaintext ws:// is NOT silently upgraded to wss://", () => {
+    expect(channelWsUrl("ws://localhost:4000/runtime/ws")).toBe("ws://localhost:4000/runtime/ws");
+  });
+
+  test("either paste of the same Suite produces the same pair", () => {
+    const fromBrowser = "https://suite.example.invalid";
+    const fromRuntime = "wss://suite.example.invalid/runtime/ws";
+    expect(channelWsUrl(fromBrowser)).toBe(channelWsUrl(fromRuntime));
+    expect(toolsHttpUrl(fromBrowser)).toBe(toolsHttpUrl(fromRuntime));
+  });
+
+  test("a scheme that is not a Suite URL is refused by name, not coerced", () => {
+    expect(() => toolsHttpUrl("ftp://suite.example.invalid")).toThrow(/not a Suite URL/);
+    expect(() => channelWsUrl("ftp://suite.example.invalid")).toThrow(/not a Suite URL/);
   });
 });
 
