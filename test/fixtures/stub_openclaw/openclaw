@@ -1,0 +1,257 @@
+#!/usr/bin/env bun
+/**
+ * A stand-in `openclaw` for test/openclaw.test.ts.
+ *
+ * Implements the subcommands `suite openclaw` calls, with the argument shapes
+ * and OUTPUT SHAPES of the real CLI at 2026.9.4 (3a9d69d), measured on hive in
+ * a throwaway OPENCLAW_STATE_DIR (see the parsers in src/commands/openclaw.ts):
+ *
+ *   config get <p> --json   exit 0 + the value as JSON (a string too: `"local"`); exit 1 + {"ok":false,
+ *                           "error":{"message":"Config path is valid but unset: <p>. ..."}}
+ *                           or "Unknown config path: <p>. ..." for channels.startup-suite.*
+ *                           before the plugin is linked
+ *   config validate --json  {"valid":true,"path":..,"warnings":[]} exit 0, or
+ *                           {"ok":false,..,"valid":false,..,"issues":[..]} exit 1
+ *                           (a binding naming an agent absent from agents.entries is invalid)
+ *   plugins doctor --json   {"ok":true,"pluginErrors":[],"diagnostics":[],...}
+ *   plugins inspect <id>    {"ok":false,"error":{"message":"Plugin not found: ..."}} when absent
+ *
+ * and the `plugins install` rules READ FROM SOURCE at 3a9d69d: a local path
+ * needs --force when stdin is not a TTY (non-ClawHub acknowledgement), and a
+ * COPY install of a TypeScript extension entry with no built ./dist/*.js is
+ * refused; --link accepts it and appends the path to plugins.load.paths.
+ *
+ * Every call appends one JSON line {argv, env, cwd, stdin} to
+ * $HOME/openclaw-stub.jsonl, where stdin is "devnull", "tty" or "other".
+ * State is $OPENCLAW_CONFIG_PATH as JSON. Knobs: $HOME/openclaw-stub-knobs.json
+ *   version   the --version line
+ *   validate  ok | invalid | garbage
+ *   doctor    ok | error | garbage
+ *   inspect   loaded | error | garbage
+ *   onboard   ok | fail
+ */
+import { appendFileSync, existsSync, fstatSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+
+const HOME = process.env.HOME ?? "";
+const argv = process.argv.slice(2);
+let stdin = "other";
+try {
+  const st = fstatSync(0);
+  if (process.stdin.isTTY) stdin = "tty";
+  else if (st.isCharacterDevice() && st.rdev === statSync("/dev/null").rdev) stdin = "devnull";
+} catch {
+  stdin = "closed";
+}
+appendFileSync(join(HOME, "openclaw-stub.jsonl"), `${JSON.stringify({ argv, env: process.env, cwd: process.cwd(), stdin })}\n`);
+
+const knobsPath = join(HOME, "openclaw-stub-knobs.json");
+const knobs: Record<string, string> = existsSync(knobsPath) ? JSON.parse(readFileSync(knobsPath, "utf8")) : {};
+
+const cfgPath = process.env.OPENCLAW_CONFIG_PATH ?? join(HOME, ".openclaw", "openclaw.json");
+type Obj = Record<string, unknown>;
+const read = (): Obj => (existsSync(cfgPath) ? (JSON.parse(readFileSync(cfgPath, "utf8")) as Obj) : {});
+const write = (d: Obj): void => {
+  mkdirSync(dirname(cfgPath), { recursive: true });
+  writeFileSync(cfgPath, `${JSON.stringify(d, null, 2)}\n`);
+};
+const isObj = (v: unknown): v is Obj => v !== null && typeof v === "object" && !Array.isArray(v);
+const get = (d: Obj, path: string): unknown => {
+  let n: unknown = d;
+  for (const p of path.split(".")) {
+    if (!isObj(n) || !(p in n)) return undefined;
+    n = n[p];
+  }
+  return n;
+};
+const set = (d: Obj, path: string, value: unknown): void => {
+  const parts = path.split(".");
+  let n: Obj = d;
+  for (const p of parts.slice(0, -1)) {
+    if (!isObj(n[p])) n[p] = {};
+    n = n[p] as Obj;
+  }
+  n[parts[parts.length - 1] as string] = value;
+};
+const out = (s: unknown): void => void process.stdout.write(`${typeof s === "string" ? s : JSON.stringify(s, null, 2)}\n`);
+const cliError = (message: string, extra: Obj = {}): never => {
+  out({ ok: false, error: { type: "cli_error", message }, ...extra });
+  process.exit(1);
+};
+const pluginLinked = (d: Obj): boolean => {
+  const paths = get(d, "plugins.load.paths");
+  return Array.isArray(paths) && paths.some((p) => typeof p === "string" && existsSync(join(p, "openclaw.plugin.json")));
+};
+const issues = (d: Obj): Obj[] => {
+  const entries = get(d, "agents.entries");
+  const found: Obj[] = [];
+  const bindings = get(d, "bindings");
+  if (Array.isArray(bindings)) {
+    bindings.forEach((b, i) => {
+      const id = isObj(b) ? b.agentId : undefined;
+      if (!isObj(entries) || typeof id !== "string" || !(id in entries)) {
+        found.push({ path: `bindings.${i}.agentId`, message: `Unknown agent id "${String(id)}" (not in agents.entries).` });
+      }
+    });
+  }
+  return found;
+};
+const flag = (name: string): string | undefined => {
+  const i = argv.indexOf(name);
+  return i >= 0 ? argv[i + 1] : undefined;
+};
+
+const [a0, a1, a2] = argv;
+
+if (a0 === "--version") {
+  out(knobs.version ?? "OpenClaw 2026.9.4 (3a9d69d)");
+  process.exit(0);
+}
+
+if (a0 === "onboard") {
+  if (!argv.includes("--non-interactive")) {
+    out("stub: interactive onboarding reached; a test must never get here");
+    process.exit(99);
+  }
+  if (knobs.onboard === "fail") {
+    process.stderr.write("Error: onboarding failed (stub knob)\n");
+    process.exit(1);
+  }
+  const d = read();
+  const id = (flag("--agent-name") ?? "main").toLowerCase();
+  set(d, "gateway.mode", "local");
+  set(d, "gateway.bind", flag("--gateway-bind") ?? "loopback");
+  set(d, "gateway.port", Number(flag("--gateway-port") ?? "18789"));
+  set(d, `agents.entries.${id}`, { name: flag("--agent-name"), workspace: flag("--workspace") });
+  set(d, "agents.defaults.model", { primary: `custom/${flag("--custom-model-id")}` });
+  set(d, "models.providers.custom", {
+    baseUrl: flag("--custom-base-url"),
+    api: flag("--custom-compatibility"),
+    ...(argv.includes("--secret-input-mode") && flag("--secret-input-mode") === "ref"
+      ? { apiKey: { source: "env", provider: "default", id: "CUSTOM_API_KEY" } }
+      : {}),
+  });
+  write(d);
+  out({ ok: true, mode: "local", agentId: id });
+  process.exit(0);
+}
+
+if (a0 === "config" && a1 === "get") {
+  const d = read();
+  const path = a2 ?? "";
+  if (path.startsWith("channels.startup-suite") && !pluginLinked(d)) {
+    cliError(`Unknown config path: ${path}. Run openclaw config schema to inspect valid paths.`);
+  }
+  const found = issues(d);
+  if (found.length > 0) cliError(`OpenClaw config is invalid: ${cfgPath}`, { issues: found });
+  const v = get(d, path);
+  if (v === undefined) {
+    cliError(`Config path is valid but unset: ${path}. The runtime default applies until you set an authored value with openclaw config set ${path} <value>.`);
+  }
+  // --json prints every value as JSON, strings included (measured: `"local"`).
+  out(JSON.stringify(v, null, 2));
+  process.exit(0);
+}
+
+if (a0 === "config" && a1 === "set") {
+  const path = a2 ?? "";
+  const raw = argv[3] ?? "";
+  const d = read();
+  if (path.startsWith("channels.startup-suite") && !pluginLinked(d)) {
+    cliError(`Unknown config path: ${path}. Run openclaw config schema to inspect valid paths.`);
+  }
+  let value: unknown = raw;
+  if (argv.includes("--strict-json")) value = JSON.parse(raw);
+  set(d, path, value);
+  write(d);
+  out(`Updated ${path}. Restart the gateway to apply.`);
+  process.exit(0);
+}
+
+if (a0 === "config" && a1 === "validate") {
+  const d = read();
+  if (knobs.validate === "garbage") {
+    out("Config looks fine I guess");
+    process.exit(0);
+  }
+  if (!existsSync(cfgPath)) cliError("file not found", { valid: false, path: cfgPath });
+  const found = issues(d);
+  if (knobs.validate === "invalid") found.push({ path: "gateway.port", message: "stub knob: invalid" });
+  if (found.length > 0) {
+    out({ ok: false, error: { type: "cli_error", message: `OpenClaw config is invalid: ${cfgPath}` }, valid: false, path: cfgPath, issues: found });
+    process.exit(1);
+  }
+  out(JSON.stringify({ valid: true, path: cfgPath, warnings: [] }));
+  process.exit(0);
+}
+
+if (a0 === "plugins" && a1 === "install") {
+  const link = argv.includes("--link") || argv.includes("-l");
+  const path = argv.slice(2).find((x) => !x.startsWith("-")) ?? "";
+  if (!argv.includes("--force") && !process.stdin.isTTY) {
+    process.stderr.write("Install cancelled; rerun with --force after reviewing the source.\n");
+    process.exit(1);
+  }
+  if (!argv.includes("--accept-capabilities")) {
+    process.stderr.write("Plugin capability review required; rerun with --accept-capabilities.\n");
+    process.exit(1);
+  }
+  const pkg = JSON.parse(readFileSync(join(path, "package.json"), "utf8")) as { openclaw?: { extensions?: string[] } };
+  const entry = pkg.openclaw?.extensions?.[0] ?? "";
+  if (!link && entry.endsWith(".ts") && !existsSync(join(path, "dist", entry.replace(/^\.\//, "").replace(/\.ts$/, ".js")))) {
+    process.stderr.write(`package install: missing compiled runtime entry for ${entry} (expected ./dist/index.js)\n`);
+    process.exit(1);
+  }
+  if (!existsSync(join(path, "node_modules"))) {
+    process.stderr.write("stub: plugin dependencies are not installed\n");
+    process.exit(1);
+  }
+  const d = read();
+  const paths = (get(d, "plugins.load.paths") as string[] | undefined) ?? [];
+  if (link && !paths.includes(path)) set(d, "plugins.load.paths", [...paths, path]);
+  set(d, "plugins.entries.startup-suite-channel-plugin", { enabled: true });
+  write(d);
+  out(`Linked plugin path: ${path}`);
+  process.exit(0);
+}
+
+if (a0 === "plugins" && a1 === "doctor") {
+  if (knobs.doctor === "garbage") {
+    out("everything is probably fine");
+    process.exit(0);
+  }
+  const errs = knobs.doctor === "error" ? [{ pluginId: "startup-suite-channel-plugin", message: "failed to load" }] : [];
+  out({ ok: errs.length === 0, pluginErrors: errs, diagnostics: [], sourceShadowing: [], compatibility: [], configurationWarnings: [] });
+  process.exit(0);
+}
+
+if (a0 === "plugins" && a1 === "inspect") {
+  const d = read();
+  if (!pluginLinked(d)) {
+    cliError(`Plugin not found: ${a2}. Run \`openclaw plugins list\` to see installed plugins.`);
+  }
+  if (knobs.inspect === "garbage") {
+    out("Startup Suite Channel\nStatus: loaded");
+    process.exit(0);
+  }
+  const status = knobs.inspect === "error" ? "error" : "loaded";
+  out({
+    plugin: {
+      id: a2,
+      name: "Startup Suite Channel",
+      status,
+      enabled: get(d, "plugins.entries.startup-suite-channel-plugin.enabled") === true,
+      ...(status === "error" ? { error: "Cannot find module 'phoenix'" } : {}),
+    },
+    install: { source: "path" },
+  });
+  process.exit(0);
+}
+
+if (a0 === "gateway" && a1 === "run") {
+  out("stub gateway: would run");
+  process.exit(0);
+}
+
+process.stderr.write(`stub openclaw: unhandled ${argv.join(" ")}\n`);
+process.exit(64);

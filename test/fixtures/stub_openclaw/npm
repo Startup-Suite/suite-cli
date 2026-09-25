@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# Stand-in npm for test/openclaw.test.ts: records argv, fakes `ci` and the pinned `install --prefix`.
+printf '%s\n' "$(printf '%s\0' "$@" | base64 -w0)" >>"$HOME/npm-calls"
+case "$1" in
+  ci) mkdir -p node_modules; exit 0 ;;
+  install)
+    prefix=""; while [ $# -gt 0 ]; do [ "$1" = "--prefix" ] && prefix="$2"; shift; done
+    mkdir -p "$prefix/node_modules/.bin"
+    cp "$(cat "$HOME/stub-openclaw-path")" "$prefix/node_modules/.bin/openclaw"
+    chmod +x "$prefix/node_modules/.bin/openclaw"
+    exit 0 ;;
+esac
+echo "stub npm: unhandled $*" >&2; exit 64
