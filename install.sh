@@ -229,6 +229,18 @@ mkdir -p "$staged_lib"
 cp -R "$src_root/src" "$staged_lib/src" || die "could not stage the suite-cli sources"
 cp "$src_root/package.json" "$staged_lib/package.json" ||
 	die "could not stage package.json"
+if [ -f "$src_root/bun.lock" ]; then
+	cp "$src_root/bun.lock" "$staged_lib/bun.lock" || die "could not stage bun.lock"
+fi
+
+# Runtime dependencies are not in the tarball. Install them now when bun is
+# available so a missing dependency fails the install, not the first verb.
+# Without bun yet, the launcher installs them on its first run.
+if command -v bun >/dev/null 2>&1 || [ -x "${BUN_INSTALL:-$HOME/.bun}/bin/bun" ]; then
+	_bun="$(command -v bun 2>/dev/null || printf '%s' "${BUN_INSTALL:-$HOME/.bun}/bin/bun")"
+	(cd "$staged_lib" && "$_bun" install --production >/dev/null 2>&1) ||
+		die "could not install runtime dependencies (bun install --production)"
+fi
 
 # assets/ ships too, and its absence is FATAL rather than a warning.
 #

@@ -118,4 +118,16 @@ if ! command -v bun >/dev/null 2>&1; then
 	esac
 fi
 
+# Runtime dependencies (package.json "dependencies", e.g. yaml) are not in the
+# release tarball. Install them once, into the library directory, the first
+# time the launcher runs without them. install.sh does the same when bun is
+# already present; this covers installs made before bun existed on the machine.
+if [ ! -d "$SUITE_LIB_DIR/node_modules" ] && grep -q '"dependencies"' "$SUITE_LIB_DIR/package.json" 2>/dev/null; then
+	printf 'suite: installing runtime dependencies into %s\n' "$SUITE_LIB_DIR" >&2
+	(cd "$SUITE_LIB_DIR" && bun install --production >&2) || {
+		printf 'suite: could not install runtime dependencies; run: (cd %s && bun install --production)\n' "$SUITE_LIB_DIR" >&2
+		exit 1
+	}
+fi
+
 exec bun "$SUITE_LIB_DIR/src/cli.ts" "$@"
