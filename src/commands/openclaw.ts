@@ -112,13 +112,12 @@ type Env = Record<string, string | undefined>;
 /**
  * DEPLOYER: BUMP THIS BEFORE suite-cli MERGES.
  *
- * This is the stage-2 BRANCH TIP of Startup-Suite/openclaw-suite-channel
- * (`task/01a0d8f8-7fcb-7001-9cf4-6edb07e43c8f`, the token-ref resolver),
- * which is NOT merged yet. A squash merge creates a new sha and the branch is
- * then deleted, so this pin would dangle. After that PR squash-merges, replace
- * this value with the squash sha on openclaw-suite-channel main.
+ * This is the SQUASH sha on Startup-Suite/openclaw-suite-channel main of PR
+ * #29 (the stage-2 token-ref resolver, task 01a0d8f8), bumped at deploy from
+ * the pre-merge branch tip b84cb6d9. Pin a commit on main, never a branch
+ * tip: a squash merge deletes the branch and the tip would dangle.
  */
-export const OPENCLAW_CHANNEL_REF = "b84cb6d976f567f412bbe9f6007ce5c864668f30";
+export const OPENCLAW_CHANNEL_REF = "f6d8a726fe8b2dff6c18476330f07b9c1f5cd302";
 export const OPENCLAW_CHANNEL_REPO = "https://github.com/Startup-Suite/openclaw-suite-channel.git";
 
 /**

@@ -973,8 +973,8 @@ describe("--stamp-only as a subprocess: the machine contract", () => {
 });
 
 describe("pins", () => {
-  test("the channel is pinned to the stage-2 resolver commit, pending the deployer's bump to the squash sha", () => {
-    expect(OPENCLAW_CHANNEL_REF).toBe("b84cb6d976f567f412bbe9f6007ce5c864668f30");
+  test("the channel is pinned to the squash sha of the stage-2 resolver on main", () => {
+    expect(OPENCLAW_CHANNEL_REF).toBe("f6d8a726fe8b2dff6c18476330f07b9c1f5cd302");
     expect(readFileSync(resolve(import.meta.dir, "..", "src", "commands", "openclaw.ts"), "utf8")).toContain("DEPLOYER: BUMP THIS BEFORE suite-cli MERGES");
   });
   test("the OpenClaw pin", () => {

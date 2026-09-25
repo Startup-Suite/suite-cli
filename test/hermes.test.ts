@@ -1019,8 +1019,8 @@ describe("--stamp-only as a subprocess: the machine contract", () => {
 });
 
 describe("pins", () => {
-  test("the channel is pinned to the stage-6 launcher-fix commit, pending the deployer's bump to the squash sha", () => {
-    expect(HERMES_CHANNEL_REF).toBe("61e8b603c379cf18e3f7b83562fb51d13c26a979");
+  test("the channel is pinned to the squash sha of the stage-6 launcher fix on main", () => {
+    expect(HERMES_CHANNEL_REF).toBe("d9918533f0b4c5f2035ed98803fd7906030bd1bf");
   });
 
   test("the pin's DEPLOYER comment is present, so the bump is not forgotten at merge", () => {

@@ -114,16 +114,14 @@ type Env = Record<string, string | undefined>;
 /**
  * DEPLOYER: BUMP THIS BEFORE suite-cli MERGES.
  *
- * This is the stage-6 BRANCH TIP of Startup-Suite/hermes-suite-channel
- * (`task/01a0d8f8-7fcb-7001-9cf4-6edb07e43c8f`: the #!/bin/sh launcher fix
- * and `--python`, on top of main bda77344), which is NOT merged yet. The
- * installer at bda77344 refuses `--python` as an unknown argument, and this
- * verb always passes it, so the old pin cannot work either. A squash merge
- * creates a new sha and deletes the branch, so this pin would dangle: after
- * that PR squash-merges, replace this value with the squash sha on
- * hermes-suite-channel main.
+ * This is the SQUASH sha on Startup-Suite/hermes-suite-channel main of PR #3
+ * (the stage-6 #!/bin/sh launcher fix and `--python`, task 01a0d8f8), bumped
+ * at deploy from the pre-merge branch tip 61e8b603. This verb always passes
+ * `--python`, which installers before this commit refuse, so the pin cannot
+ * move to an older commit. Pin a commit on main, never a branch tip: a squash
+ * merge deletes the branch and the tip would dangle.
  */
-export const HERMES_CHANNEL_REF = "61e8b603c379cf18e3f7b83562fb51d13c26a979";
+export const HERMES_CHANNEL_REF = "d9918533f0b4c5f2035ed98803fd7906030bd1bf";
 export const HERMES_CHANNEL_REPO = "https://github.com/Startup-Suite/hermes-suite-channel.git";
 
 /** The hermes-agent commit the config shape below was measured against. */
