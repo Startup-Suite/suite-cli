@@ -164,6 +164,50 @@ export const HERMES_AGENT_COMM = "hermes";
 /** The .env variable the optional model key is stored under, named by `model.key_env`. */
 export const MODEL_KEY_ENV = "CUSTOM_MODEL_API_KEY";
 
+/**
+ * The Suite channel platform's toolset key. `startup_suite` is the platform
+ * name hermes-suite-channel registers (`PLATFORM_NAME`, adapter.py:74 at
+ * {@link HERMES_CHANNEL_REF}); the gateway reads `platform_toolsets.<name>`
+ * per turn (`_get_platform_tools`, hermes_cli/tools_config.py at fdec926e).
+ */
+export const TOOLSET_KEY = "platform_toolsets.startup_suite";
+
+/**
+ * The lean default for that key. PRODUCT DEFAULT (2026-09-25, task owner's
+ * decision, reversible): a Suite channel agent reaches its capabilities
+ * through the Suite MCP bundle, and giving a chat-driven agent shell and file
+ * tools by default widens what untrusted chat can reach. MEASURED at
+ * fdec926e: with the key unset the first prompt of a turn is 16,633 tokens,
+ * which a 16K-context model cannot answer. `hermes-webhook` is
+ * web_search/web_extract/vision_analyze/clarify (toolsets.py:44,244), and an
+ * explicit list with no MCP server named in it still merges every enabled
+ * MCP server (`_merge_mcp_servers`), so the Suite bridge stays. `--full-toolset`
+ * opts out.
+ */
+export const LEAN_TOOLSET: readonly string[] = ["hermes-webhook"];
+
+/** Whether a config.yaml value is exactly the lean default this verb writes. */
+export function isLeanToolset(value: unknown): boolean {
+  return Array.isArray(value) && value.length === LEAN_TOOLSET.length && value.every((v, i) => v === LEAN_TOOLSET[i]);
+}
+
+/**
+ * The toolset key's planned outcome. An operator's own value (anything that is
+ * neither absent nor exactly the lean default) is never rewritten, in either
+ * mode. Default mode writes the lean list when absent; `--full-toolset`
+ * removes the key only when it holds exactly the lean list.
+ */
+export function toolsetOutcome(current: unknown, fullToolset: boolean, absent: "written" | "repaired"): "written" | "repaired" | "unchanged" {
+  const unset = current === undefined || current === null;
+  if (fullToolset) return isLeanToolset(current) ? "repaired" : "unchanged";
+  return unset ? absent : "unchanged";
+}
+
+/** Whether `current` is an operator's own toolset value, preserved as-is. */
+export function isOperatorToolset(current: unknown): boolean {
+  return current !== undefined && current !== null && !isLeanToolset(current);
+}
+
 /** Where `--install-hermes` leaves the launcher, relative to HERMES_HOME. */
 export const MANAGED_HERMES_BIN = join("hermes-agent", ".hermes", "bin", "hermes");
 
@@ -189,6 +233,8 @@ export interface HermesOptions {
   allowedUsers?: string;
   hermes?: string;
   installHermes: boolean;
+  /** Leave `platform_toolsets.startup_suite` to Hermes's own default (see {@link LEAN_TOOLSET}). */
+  fullToolset: boolean;
   hermesHome: string;
   stampOnly: boolean;
   noSession: boolean;
@@ -213,8 +259,9 @@ const VALUE_FLAGS: Record<string, keyof HermesOptions> = {
   "--hermes-home": "hermesHome",
 };
 
-const BOOL_FLAGS: Record<string, "installHermes" | "stampOnly" | "noSession" | "gatewayOnly"> = {
+const BOOL_FLAGS: Record<string, "installHermes" | "fullToolset" | "stampOnly" | "noSession" | "gatewayOnly"> = {
   "--install-hermes": "installHermes",
+  "--full-toolset": "fullToolset",
   "--stamp-only": "stampOnly",
   "--no-session": "noSession",
   "--gateway-only": "gatewayOnly",
@@ -237,7 +284,7 @@ export function wantsStampOnly(args: string[]): boolean {
 export function parseHermesOptions(args: string[], cwd: string = process.cwd()): HermesOptions {
   const { tokenRef, keychainService, rest } = takeTokenRefFlags(args);
   const raw: Record<string, string> = {};
-  const bools = { installHermes: false, stampOnly: false, noSession: false, gatewayOnly: false };
+  const bools = { installHermes: false, fullToolset: false, stampOnly: false, noSession: false, gatewayOnly: false };
   let gatewayArgs: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const arg = rest[i] ?? "";
@@ -971,6 +1018,13 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
           planned("config_set", key, current === undefined || current === null ? absent : sameConfigValue(current, value) ? "unchanged" : "repaired"),
         );
       }
+      const toolsets = lookupKey(config, TOOLSET_KEY);
+      actions.push(planned("config_set", TOOLSET_KEY, toolsetOutcome(toolsets, o.fullToolset, absent)));
+      if (isOperatorToolset(toolsets)) {
+        state.warnings.push(
+          `${TOOLSET_KEY} holds an operator-set value; left unchanged (the stamp's own default is ${JSON.stringify(LEAN_TOOLSET)}, and it never overwrites another value)`,
+        );
+      }
 
       if (o.modelApiKeyRef !== undefined) {
         const ref = parseTokenRef(o.modelApiKeyRef, { keychainService: o.keychainService });
@@ -1074,7 +1128,7 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
 
       const wanted = new Map(desiredModelKeys(o));
       for (const a of actions) {
-        if (a.kind !== "config_set" || a.outcome === "unchanged") continue;
+        if (a.kind !== "config_set" || a.outcome === "unchanged" || a.target === TOOLSET_KEY) continue;
         const value = wanted.get(a.target) as string;
         const r = await spawn([bin, "config", "set", a.target, value]);
         if (r.exitCode !== 0) throw fail("config_set_failed", `hermes config set ${a.target} exited ${r.exitCode}: ${lastLine(r.stderr || r.stdout)}`);
@@ -1086,6 +1140,19 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
         }
         const a = actions.find((x) => x.kind === "config_set" && x.target === key);
         if (a !== undefined) a.applied = true;
+      }
+
+      // The toolset key: set the lean list, or (--full-toolset) remove the
+      // lean list a previous stamp wrote. `unset` is Hermes's own remover.
+      const ts = actions.find((a) => a.kind === "config_set" && a.target === TOOLSET_KEY);
+      if (ts !== undefined && ts.outcome !== "unchanged") {
+        const argv = o.fullToolset ? [bin, "config", "unset", TOOLSET_KEY] : [bin, "config", "set", TOOLSET_KEY, JSON.stringify(LEAN_TOOLSET)];
+        const r = await spawn(argv);
+        if (r.exitCode !== 0) throw fail("config_set_failed", `hermes config ${argv[2]} ${TOOLSET_KEY} exited ${r.exitCode}: ${lastLine(r.stderr || r.stdout)}`);
+        const now = lookupKey(readHermesConfig(home), TOOLSET_KEY);
+        const held = o.fullToolset ? now === undefined || now === null : isLeanToolset(now);
+        if (!held) throw fail("config_set_ineffective", `hermes config ${argv[2]} ${TOOLSET_KEY} exited 0 but config.yaml does not reflect it`);
+        ts.applied = true;
       }
 
       const envKey = actions.find((a) => a.kind === "env_key");
@@ -1149,6 +1216,7 @@ function stampRequest(opts: HermesOptions): StampRequest {
       modelApiKeyRef: opts.modelApiKeyRef,
       allowedUsers: opts.allowedUsers,
       hermes: opts.hermes,
+      fullToolset: opts.fullToolset,
     },
   };
 }

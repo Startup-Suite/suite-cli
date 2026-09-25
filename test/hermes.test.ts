@@ -19,7 +19,9 @@ import {
   HERMES_AGENT_COMM,
   HERMES_AGENT_REF,
   HERMES_CHANNEL_REF,
+  LEAN_TOOLSET,
   MCP_SDK_PIN,
+  TOOLSET_KEY,
   MODEL_KEY_ENV,
   agentNameForRoot,
   channelCheckoutDir,
@@ -486,6 +488,108 @@ describe("idempotence and repair", () => {
     const sets = configSets(stubCalls()).slice(before);
     expect(sets.map((c) => c.argv.slice(2))).toEqual([["model.default", "other-model"]]);
     expect(outcomes(result)["config_set model.default"]).toBe("repaired");
+  });
+});
+
+describe("the Suite platform toolset (product default: lean, --full-toolset opts out)", () => {
+  const cfgPath = (): string => join(hermesHome, "config.yaml");
+  const toolsetValue = (): unknown => lookupKey(parseYaml(readFileSync(cfgPath(), "utf8")), TOOLSET_KEY);
+  /** Every stub call that writes or removes the toolset key. */
+  const toolsetWrites = (calls: StubCall[]): string[][] =>
+    calls.filter((c) => c.argv[0] === "config" && (c.argv[1] === "set" || c.argv[1] === "unset") && c.argv[2] === TOOLSET_KEY).map((c) => c.argv);
+  /** Every config write of any key. */
+  const configWrites = (calls: StubCall[]): StubCall[] =>
+    calls.filter((c) => c.argv[0] === "config" && (c.argv[1] === "set" || c.argv[1] === "unset"));
+
+  test("the default sets exactly platform_toolsets.startup_suite to [hermes-webhook], and no other toolset key", async () => {
+    makeManagedPython();
+    const { result, exitCode } = await stamp();
+    expect(exitCode).toBe(0);
+    expect(toolsetWrites(stubCalls())).toEqual([["config", "set", "platform_toolsets.startup_suite", '["hermes-webhook"]']]);
+    // No other platform's toolsets and no global default are touched.
+    const others = configWrites(stubCalls()).filter((c) => /toolset/.test(c.argv[2] ?? "") && c.argv[2] !== TOOLSET_KEY);
+    expect(others).toEqual([]);
+    const pts = lookupKey(parseYaml(readFileSync(cfgPath(), "utf8")), "platform_toolsets");
+    expect(pts).toEqual({ startup_suite: ["hermes-webhook"] });
+    expect(LEAN_TOOLSET).toEqual(["hermes-webhook"]);
+    const a = result.actions.find((x) => x.kind === "config_set" && x.target === TOOLSET_KEY);
+    expect(a).toEqual({ kind: "config_set", target: TOOLSET_KEY, outcome: "written", applied: true });
+  });
+
+  test("other platforms' toolsets already in config.yaml are left byte-for-byte as they were", async () => {
+    makeManagedPython();
+    mkdirSync(hermesHome, { recursive: true });
+    writeFileSync(cfgPath(), stringifyYaml({ platform_toolsets: { cli: ["hermes-cli"], telegram: ["hermes-telegram"] }, toolsets: ["kanban"] }));
+    expect((await stamp()).exitCode).toBe(0);
+    const cfg = parseYaml(readFileSync(cfgPath(), "utf8")) as Record<string, unknown>;
+    expect(cfg.platform_toolsets).toEqual({ cli: ["hermes-cli"], telegram: ["hermes-telegram"], startup_suite: ["hermes-webhook"] });
+    expect(cfg.toolsets).toEqual(["kanban"]);
+  });
+
+  test("--full-toolset does not set it, and records the key unchanged", async () => {
+    makeManagedPython();
+    const { result, exitCode } = await stamp(stampArgs(["--full-toolset"]));
+    expect(exitCode).toBe(0);
+    expect(toolsetWrites(stubCalls())).toEqual([]);
+    expect(toolsetValue()).toBeUndefined();
+    expect(outcomes(result)[`config_set ${TOOLSET_KEY}`]).toBe("unchanged");
+    // The session command carries the choice, so the relaunch stamps the same way.
+    expect(result.human_steps[0]?.text).toContain("--full-toolset");
+  });
+
+  test("an operator's own value is preserved in both modes, reported unchanged, with a warning", async () => {
+    makeManagedPython();
+    mkdirSync(hermesHome, { recursive: true });
+    const mine = ["hermes-cli", "startup-suite"];
+    writeFileSync(cfgPath(), stringifyYaml({ platform_toolsets: { startup_suite: mine } }));
+    for (const extra of [[], ["--full-toolset"]]) {
+      const { result, exitCode } = await stamp(stampArgs(extra));
+      expect(exitCode).toBe(0);
+      expect(toolsetValue()).toEqual(mine);
+      expect(outcomes(result)[`config_set ${TOOLSET_KEY}`]).toBe("unchanged");
+      expect(result.warnings.some((w) => w.includes(TOOLSET_KEY) && w.includes("operator"))).toBe(true);
+    }
+    expect(toolsetWrites(stubCalls())).toEqual([]);
+  });
+
+  test("a re-run makes 0 config writes of any key, in either mode", async () => {
+    for (const extra of [[], ["--full-toolset"]]) {
+      rmSync(root, { recursive: true, force: true });
+      makeManagedPython();
+      expect((await stamp(stampArgs(extra))).exitCode).toBe(0);
+      const before = stubCalls().length;
+      const again = await stamp(stampArgs(extra));
+      expect(again.exitCode).toBe(0);
+      expect(again.result.changed).toBe(false);
+      expect(configWrites(stubCalls().slice(before))).toEqual([]);
+    }
+  });
+
+  test("flipping default -> --full-toolset removes the lean list (repaired); flipping back writes it again (repaired)", async () => {
+    makeManagedPython();
+    expect((await stamp()).exitCode).toBe(0);
+    expect(toolsetValue()).toEqual(["hermes-webhook"]);
+
+    let before = stubCalls().length;
+    const full = await stamp(stampArgs(["--full-toolset"]));
+    expect(full.exitCode).toBe(0);
+    expect(full.result.changed).toBe(true);
+    expect(toolsetWrites(stubCalls().slice(before))).toEqual([["config", "unset", TOOLSET_KEY]]);
+    expect(outcomes(full.result)[`config_set ${TOOLSET_KEY}`]).toBe("repaired");
+    expect(toolsetValue()).toBeUndefined();
+
+    before = stubCalls().length;
+    const lean = await stamp();
+    expect(lean.exitCode).toBe(0);
+    expect(toolsetWrites(stubCalls().slice(before))).toEqual([["config", "set", TOOLSET_KEY, '["hermes-webhook"]']]);
+    expect(outcomes(lean.result)[`config_set ${TOOLSET_KEY}`]).toBe("repaired");
+    expect(toolsetValue()).toEqual(["hermes-webhook"]);
+  });
+
+  test("--full-toolset takes no value", () => {
+    expect(() => parseHermesOptions(["--root", root, "--full-toolset=yes"])).toThrow(/takes no value/);
+    expect(parseHermesOptions(["--root", root, "--full-toolset"]).fullToolset).toBe(true);
+    expect(parseHermesOptions(["--root", root]).fullToolset).toBe(false);
   });
 });
 

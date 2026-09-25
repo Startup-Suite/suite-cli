@@ -268,6 +268,7 @@ suite hermes --root ~/agents/scribe \
 | `--allowed-users LIST` | Passed to the channel installer; without it, `--allow-all-users` |
 | `--hermes BIN`, `--install-hermes` | Which Hermes to use, or install the pinned one if absent |
 | `--hermes-home DIR` | Override `HERMES_HOME` |
+| `--full-toolset` | Leave the Suite platform's toolset to Hermes's own default instead of the lean one (see [the toolset](#the-suite-platforms-toolset-is-lean-by-default)) |
 | `--stamp-only` | [The stamp contract](#stamp-contract---stamp-only): stamp, print one JSON document, start nothing |
 | `--no-session` | Run the gateway in the foreground instead of in tmux |
 | `-- ARGS` | Everything after `--` goes to `hermes gateway run` |
@@ -280,7 +281,7 @@ What it writes, and with what mode:
 | `<root>/.suite-stamp.json` | this CLI | default | Stamp record: harness, writer and harness version, plugin ref, inputs digest, token ref, last verdict. A run that fails after its first write records `fail`, so an older `pass` never outlives it and `--gateway-only` refuses the root. A refusal before any write leaves it as it was. No secret |
 | `$HERMES_HOME/mcp-tokens/startup-suite-platform.runtime-token` | the channel installer | `0600` | The runtime token: the one sanctioned copy |
 | `$HERMES_HOME/.env` | the channel installer; this CLI adds `CUSTOM_MODEL_API_KEY` | `0600` for this CLI's write | Channel keys; the model key when `--model-api-key-ref` is given |
-| `$HERMES_HOME/config.yaml` | `hermes config set` (model keys); the channel installer (`mcp_servers.startup-suite`) | Hermes's own | `model.provider`, `model.base_url`, `model.default`, optionally `model.context_length`, `model.key_env` |
+| `$HERMES_HOME/config.yaml` | `hermes config set` (model keys, the toolset key); the channel installer (`mcp_servers.startup-suite`) | Hermes's own | `model.provider`, `model.base_url`, `model.default`, optionally `model.context_length`, `model.key_env`; `platform_toolsets.startup_suite` unless `--full-toolset` |
 | `$HERMES_HOME/plugins/startup-suite-platform` | the channel installer | the installer's | The channel plugin |
 | `~/.local/share/suite/hermes-suite-channel` | this CLI (`git`) | git's | The channel checkout, pinned to one commit |
 | `~/.local/state/suite/agents.json` | this CLI | default | The roster entry, on session creation |
@@ -311,21 +312,37 @@ the `Install directory` that `hermes --version` prints, else the local
 `g<sha>` of that line. Never its `upstream <sha>`, which is the remote tip Hermes
 last fetched (measured: 49 commits ahead of the pinned install).
 
-**Model size is a prerequisite.** With Hermes's default toolset for the
-`startup_suite` platform, the first prompt of a turn is about **16.6k tokens**
-(measured at the pinned commit: 16633). A model served with a smaller context
-cannot answer at all, and `--context-length` does not help: it declares the
-window, it does not shrink the prompt. Serve the model with a context
-comfortably above that, with room for the reply on top. For a small model, narrowing the platform's toolset is a supported
-Hermes key (`platform_toolsets.<platform>`, read at gateway turn time), and is
-an operator choice, not something the stamp sets:
+### The Suite platform's toolset is lean by default
 
-```
-HERMES_HOME=<root>/.hermes hermes config set platform_toolsets.startup_suite '["hermes-webhook"]'
-```
+The stamp sets **`platform_toolsets.startup_suite: [hermes-webhook]`**, and
+only that key: no other platform's toolsets and not the global default.
 
-That leaves the agent with the webhook toolset only (no file, shell or web
-tools). The stamp does not own this key and never rewrites it.
+- **What it leaves the agent.** `hermes-webhook` is `web_search`, `web_extract`,
+  `vision_analyze` and `clarify`, plus every enabled MCP server: an explicit
+  list that names no MCP server still merges all of them (hermes-agent
+  `_merge_mcp_servers` at the pinned commit), so the Suite MCP bridge and its
+  tools stay. No shell, file or code-execution tools.
+- **Why this is the default.** A Suite channel agent reaches its capabilities
+  through the Suite MCP bundle. Handing an agent that reads untrusted chat a
+  shell and file tools by default widens what that chat can reach. And with
+  Hermes's own default for the platform, the first prompt of a turn is
+  **16,633 tokens** (measured at the pinned commit), which a model served with
+  a 16K context cannot answer at all: `--context-length` declares the window,
+  it does not shrink the prompt.
+- **The opt-out.** `--full-toolset` leaves the key to Hermes. **It removes
+  the key** when it holds exactly the lean list this stamp writes, so Hermes's
+  own platform default applies again; it does not write a "full" list of its
+  own. Serve the model with a context comfortably above the size above if you
+  use it.
+- **An operator's value wins.** If `platform_toolsets.startup_suite` holds
+  anything other than the lean list, the stamp leaves it alone in either mode,
+  reports the action `unchanged` and says so in `warnings`.
+- **Idempotent.** A re-run in the same mode writes nothing. Switching between
+  the default and `--full-toolset` is one `config set` or `config unset`,
+  reported as `repaired` (or `written` on a first stamp) under the
+  `config_set platform_toolsets.startup_suite` action.
+
+This is a product default (2026-09-25), and can be reversed.
 
 ## `suite openclaw`
 

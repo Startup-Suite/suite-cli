@@ -18,6 +18,15 @@ behaviour anyone was relying on.
   and neither verb installs, starts or restarts a daemon. The runtime token is
   accepted only by reference (`--token-ref file:<path>` or
   `--token-ref keychain:<item> --keychain-service <svc>`); a literal is refused.
+- **`suite hermes` stamps a lean toolset for the Suite platform by default.**
+  It sets `platform_toolsets.startup_suite: [hermes-webhook]` (web, vision and
+  clarify, plus every enabled MCP server, so the Suite bridge stays) and no
+  other toolset key. The reasons: a channel agent's capabilities come through
+  the Suite MCP bundle, shell and file tools widen what untrusted chat can
+  reach, and Hermes's own default makes the first prompt 16,633 tokens, which
+  a 16K-context model cannot answer. `--full-toolset` opts out, removing the
+  key only when it holds exactly that lean list. An operator's own value is
+  never overwritten.
 - **Stamp results report what happened, not what was planned.** Each action
   carries `applied`; a failed run lists the writes it never reached as
   `applied: false`, and a harness install that ran before a refusal is still

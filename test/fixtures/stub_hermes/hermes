@@ -116,6 +116,17 @@ if (a0 === "--run-module" && a1 === "pm.environments") {
   assign(d, a2 as string, coerce(a3 as string));
   write(d);
   console.log(`✓ Set ${a2} = ${a3} in ${cfgPath}`);
+} else if (a0 === "config" && a1 === "unset") {
+  // The real CLI's shape: exit 1 "Config key not set" when absent.
+  if (a2 === undefined) die("Usage: hermes config unset <key>", 1);
+  const d = read();
+  const parts = (a2 as string).split(".");
+  const parent = lookup(d, parts.slice(0, -1).join("."));
+  const leaf = parts[parts.length - 1] as string;
+  if (parent === null || typeof parent !== "object" || !(leaf in (parent as object))) die(`Config key not set: ${a2}`);
+  delete (parent as Record<string, unknown>)[leaf];
+  write(d);
+  console.log(`✓ Unset ${a2} from ${cfgPath}`);
 } else if (a0 === "config" && a1 === "check") {
   if (knobs.check === "garbage") console.log("nothing recognisable here");
   else {
