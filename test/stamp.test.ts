@@ -14,7 +14,7 @@ import {
 } from "../src/stamp.ts";
 import { aggregateVerdict, type StampIO } from "../src/stamp_result.ts";
 import { parseTokenRef } from "../src/token_ref.ts";
-import { fakeWriter, type FakeWriterOptions } from "./fixtures/fake_writer.ts";
+import { FAKE_CONFIG, fakeWriter, type FakeWriterOptions } from "./fixtures/fake_writer.ts";
 import { canary, scanTree, scanTexts } from "./leak-scan.ts";
 
 let dir: string;
@@ -256,6 +256,58 @@ describe("identity in suite.json", () => {
     expect(exitCode).toBe(2);
     expect(result.error?.code).toBe("write_refused");
     expect(existsSync(join(repo, "agent"))).toBe(false);
+  });
+});
+
+describe("actions report what happened, and a failed stamp records fail", () => {
+  const record = () => JSON.parse(readFileSync(join(root, STAMP_FILE), "utf8")) as { verdict: string };
+
+  test("a failure part-way reports the unreached write as not applied, and records fail over an earlier pass", async () => {
+    expect((await stamp()).exitCode).toBe(0);
+    expect(record().verdict).toBe("pass");
+    const { result, exitCode } = await stamp({ failApply: "after" }, { runtimeId: "fake-01a0d8f8-rt-2" });
+    expect(exitCode).toBe(1);
+    expect(result.error?.code).toBe("fake_failed");
+    expect(result.actions.map((a) => [a.kind, a.target.split("/").pop(), a.outcome, a.applied])).toEqual([
+      ["identity", "suite.json", "repaired", true],
+      ["config_set", "fake-harness.json:account", "repaired", true],
+      ["config_set", "fake-harness.json:second", "written", false],
+      ["stamp_record", STAMP_FILE, "repaired", true],
+    ]);
+    expect(record().verdict).toBe("fail");
+    expect(result.changed).toBe(true);
+  });
+
+  test("positive control: the same run without the failure applies every action and records pass", async () => {
+    const { result, exitCode } = await stamp();
+    expect(exitCode).toBe(0);
+    expect(result.actions.every((a) => a.applied)).toBe(true);
+    expect(record().verdict).toBe("pass");
+  });
+
+  test("a failure before the writer wrote anything claims no harness write", async () => {
+    const { result, exitCode } = await stamp({ failApply: "before" });
+    expect(exitCode).toBe(1);
+    const cs = result.actions.find((a) => a.kind === "config_set");
+    expect(cs).toMatchObject({ outcome: "written", applied: false });
+    expect(existsSync(join(root, FAKE_CONFIG))).toBe(false);
+  });
+
+  test("a harness install done before a refusal is reported and counts as a change; the root is untouched", async () => {
+    const { result, exitCode } = await stamp({ installThenRefuse: true });
+    expect(exitCode).toBe(2);
+    expect(result.actions).toEqual([{ kind: "harness_install", target: "fake-harness@1.0.0", outcome: "written", applied: true }]);
+    expect(result.changed).toBe(true);
+    expect(existsSync(root)).toBe(false);
+  });
+
+  test("a refusal before any write leaves an earlier pass record exactly as it was", async () => {
+    expect((await stamp()).exitCode).toBe(0);
+    const before = readFileSync(join(root, STAMP_FILE), "utf8");
+    chmodSync(tokenPath, 0o644);
+    const { exitCode } = await stamp();
+    expect(exitCode).toBe(2);
+    expect(readFileSync(join(root, STAMP_FILE), "utf8")).toBe(before);
   });
 });
 

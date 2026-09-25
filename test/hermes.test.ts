@@ -22,10 +22,15 @@ import {
   MCP_SDK_PIN,
   MODEL_KEY_ENV,
   agentNameForRoot,
+  channelCheckoutDir,
+  findHermesPython,
+  lookupKey,
   gatewayArgv,
   parseConfigCheck,
   parseHermesOptions,
+  parseHermesInstallDir,
   parseHermesVersion,
+  pythonFromActivation,
   parseMcpTest,
   relaunchArgv,
   runHermes,
@@ -103,8 +108,8 @@ beforeEach(() => {
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
 /** A managed-venv python that answers `import mcp` once `pip install` ran. */
-function makeManagedPython(options: { pip?: boolean; mcpPresent?: boolean } = {}): string {
-  const venvBin = join(hermesHome, "installs", "i1", "environments", "e1", "venv", "bin");
+function makeManagedPython(options: { pip?: boolean; mcpPresent?: boolean; generation?: string } = {}): string {
+  const venvBin = join(hermesHome, "installs", "i1", "environments", options.generation ?? "e1", "venv", "bin");
   mkdirSync(venvBin, { recursive: true });
   const py = join(venvBin, "python");
   const marker = join(home, "mcp-installed");
@@ -264,11 +269,17 @@ function outcomes(result: StampResult): Record<string, string> {
 /* ------------------------------------------------------------------------- */
 
 describe("measured Hermes output shapes (fdec926e)", () => {
-  test("--version yields the upstream sha token the writer was measured against", () => {
+  test("--version yields the LOCAL commit, never the `upstream` tip", () => {
     expect(parseHermesVersion("Hermes Agent vgit.fdec926 (2026.9.24) · upstream fdec926e\nInstall directory: /x\n")).toBe(
       HERMES_AGENT_REF.slice(0, 8),
     );
+    // MEASURED on the pinned install: upstream names the remote tip, 49 commits ahead.
+    expect(parseHermesVersion("Hermes Agent v0.21.5+2164.gfdec926 (2026.9.24) · upstream 346c14a9\nInstall directory: /x\n")).toBe(
+      HERMES_AGENT_REF.slice(0, 8),
+    );
+    expect(parseHermesVersion("Hermes Agent v0.21.5+3.g1234abcd (2026.9.30) · upstream fdec926e\n")).toBe("1234abcd");
     expect(parseHermesVersion("Hermes Agent v2026.10.1\n")).toBe("2026.10.1");
+    expect(parseHermesInstallDir("Hermes Agent vgit.fdec926\nInstall directory: /a b/hermes-agent\nPython: 3.14.7\n")).toBe("/a b/hermes-agent");
   });
 
   test("config check: the measured healthy output passes, update-available still passes", () => {
@@ -585,7 +596,108 @@ describe("refusals and failures", () => {
     writeFileSync(join(home, "hermes-stub-knobs.json"), JSON.stringify({ version: "Hermes Agent vgit.abc1234 (2026.12.1) · upstream abc12345" }));
     const { result, exitCode } = await stamp();
     expect(exitCode).toBe(0);
-    expect(result.warnings).toEqual(["config shape unverified for hermes abc12345"]);
+    expect(result.warnings).toEqual(["config shape unverified for hermes abc1234"]);
+  });
+
+  test("the version is the install's own commit read with git, never the `upstream` tip", async () => {
+    makeManagedPython();
+    const install = join(dir, "hermes-install");
+    mkdirSync(install);
+    sh(["git", "init", "-q", "-b", "main"], install);
+    sh(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "commit", "-q", "--allow-empty", "-m", "x"], install);
+    const head = sh(["git", "rev-parse", "HEAD"], install);
+    writeFileSync(
+      join(home, "hermes-stub-knobs.json"),
+      JSON.stringify({ version: `Hermes Agent v0.21.5+2164.gfdec926 (2026.9.24) · upstream 346c14a9\nInstall directory: ${install}` }),
+    );
+    const { result, exitCode } = await stamp();
+    expect(exitCode).toBe(0);
+    expect(result.harness_version).toBe(head.slice(0, 8));
+    expect(result.warnings).toEqual([`config shape unverified for hermes ${head.slice(0, 8)}`]);
+  });
+
+  test("a failed channel install reports no write it did not make, and records `fail` over an earlier pass", async () => {
+    makeManagedPython();
+    expect((await stamp()).exitCode).toBe(0);
+    expect(JSON.parse(readFileSync(join(root, ".suite-stamp.json"), "utf8")).verdict).toBe("pass");
+    // A changed model is a planned config set; the installer then fails first.
+    const installer = join(channelCheckoutDir(makeDeps().env), "install.sh");
+    writeFileSync(installer, `#!/usr/bin/env bash\necho "hermes-suite-channel: error: /bin/sh is older than Python 3.8" >&2\nexit 1\n`);
+    const before = readFileSync(join(hermesHome, "config.yaml"), "utf8");
+    const { result, exitCode } = await stamp(stampArgs().map((a) => (a === "wave-model" ? "other-model" : a)));
+    expect(exitCode).toBe(1);
+    expect(result.error?.code).toBe("channel_install_failed");
+    const model = result.actions.find((a) => a.kind === "config_set" && a.target === "model.default");
+    expect(model).toMatchObject({ outcome: "repaired", applied: false });
+    expect(readFileSync(join(hermesHome, "config.yaml"), "utf8")).toBe(before);
+    for (const a of result.actions) if (a.kind !== "stamp_record" && a.kind !== "identity") expect(a.applied && a.outcome !== "unchanged").toBe(false);
+    expect(JSON.parse(readFileSync(join(root, ".suite-stamp.json"), "utf8")).verdict).toBe("fail");
+    expect(result.actions.at(-1)).toMatchObject({ kind: "stamp_record", outcome: "repaired", applied: true });
+    // --gateway-only now refuses to launch the root.
+    const o = parseHermesOptions(stampArgs());
+    const relaunch = relaunchArgv(["/opt/suite/bun", "/opt/suite/src/cli.ts"], o, STUB_HERMES);
+    expect(await runHermes(relaunch.slice(3), makeDeps())).toBe(2);
+  });
+});
+
+describe("the interpreter, with a real #!/bin/sh launcher (fdec926e ships only these)", () => {
+  /** A launcher of the shape fdec926e installs: POSIX sh exec-ing the real program. */
+  function shLauncher(): string {
+    const p = join(bin, "hermes");
+    writeFileSync(p, `#!/bin/sh\nexec ${STUB_HERMES} "$@"\n`);
+    chmodSync(p, 0o755);
+    return p;
+  }
+  const withLauncher = (launcher: string): string[] => stampArgs().map((a) => (a === STUB_HERMES ? launcher : a));
+
+  test("Hermes's own answer (`--run-module pm.environments`) is the interpreter, and the installer is handed it", async () => {
+    const py = makeManagedPython();
+    const launcher = shLauncher();
+    const { result, exitCode } = await stamp(withLauncher(launcher));
+    expect(exitCode).toBe(0);
+    expect(result.ok).toBe(true);
+    const call = installerCalls()[0] as InstallerCall;
+    expect(call.argv[call.argv.indexOf("--python") + 1]).toBe(py);
+    expect(call.argv[call.argv.indexOf("--hermes") + 1]).toBe(launcher);
+    expect(stubCalls().some((c) => c.argv[0] === "--run-module" && c.argv[1] === "pm.environments")).toBe(true);
+  });
+
+  test("a venv Hermes commits while installing the plugin is the one registered, so the first re-run changes nothing", async () => {
+    makeManagedPython({ mcpPresent: true });
+    const e2 = makeManagedPython({ mcpPresent: true, generation: "e2" });
+    writeFileSync(join(home, "hermes-stub-knobs.json"), JSON.stringify({ activation: "switch" }));
+    const first = await stamp(withLauncher(shLauncher()));
+    expect(first.exitCode).toBe(0);
+    const calls = installerCalls();
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.argv[(calls[1]?.argv.indexOf("--python") ?? 0) + 1]).toBe(e2);
+    expect(lookupKey(parseYaml(readFileSync(join(hermesHome, "config.yaml"), "utf8")), "mcp_servers.startup-suite.command")).toBe(e2);
+    expect(first.result.actions.find((a) => a.kind === "mcp_sdk")?.target).toBe(`${e2} ${MCP_SDK_PIN}`);
+    const before = stubCalls().length;
+    const again = await stamp(withLauncher(join(bin, "hermes")));
+    expect(again.exitCode).toBe(0);
+    expect(again.result.changed).toBe(false);
+    expect(configSets(stubCalls().slice(before))).toEqual([]);
+  });
+
+  test("a shell shebang is never taken for the interpreter", () => {
+    const launcher = shLauncher();
+    const found = findHermesPython(join(dir, "no-home"), launcher, { which: (b) => (b === "python3" ? "/usr/bin/python3" : null) });
+    expect(found).toBe("/usr/bin/python3");
+    expect(found).not.toBe("/bin/sh");
+  });
+
+  test("the activation JSON's PYTHONPATH names the venv: its bin/python is the interpreter (measured shape)", () => {
+    const venv = "/h/.hermes/installs/18b099f9e907f2de/environments/952fde04b2ba442e9e1ead1656b09fa7/venv";
+    const out = JSON.stringify({
+      HOME: "/h",
+      HERMES_HOME: "/h/.hermes",
+      PYTHONPATH: `/h/.hermes/hermes-agent:${venv}/lib/python3.14/site-packages`,
+      __HERMES_ACTIVATED: "/h/.hermes/installs/18b099f9e907f2de/facts.json",
+    });
+    expect(pythonFromActivation(out)).toBe(`${venv}/bin/python`);
+    expect(pythonFromActivation("not json")).toBeNull();
+    expect(pythonFromActivation(JSON.stringify({ PYTHONPATH: "/h/.hermes/hermes-agent" }))).toBeNull();
   });
 });
 
@@ -702,6 +814,28 @@ describe("the gateway session", () => {
     expect(stderr.join("")).toContain(`recycling stale session ${session}`);
   });
 
+  test("a recorded session that tmux no longer has is relaunched out loud, not announced as a first start", async () => {
+    makeManagedPython();
+    const tmux = fakeTmux();
+    const written: Record<string, string> = {};
+    const restore: RestoreDeps = {
+      tmux: tmux.deps,
+      readRoster: (p) => written[p] ?? null,
+      writeRoster: (p, c) => void (written[p] = c),
+      now: () => new Date("2026-09-25T00:00:00Z"),
+      log: () => {},
+    };
+    const session = `suite-${agentNameForRoot(root)}`;
+    // First launch: nothing recorded yet, so no stale line.
+    await runHermes(stampArgs(), makeDeps({ tmux: tmux.deps, restore }));
+    expect(stderr.join("")).not.toContain("was stale");
+    // The gateway died and took the tmux server with it: tmux says none, the roster says launched.
+    stderr = [];
+    await runHermes(stampArgs(), makeDeps({ tmux: tmux.deps, restore }));
+    expect(stderr.join("")).toContain(`suite: previous session ${session} was stale (recorded, no longer running); relaunching`);
+    expect(tmux.ran.filter((a) => a[1] === "new-session")).toHaveLength(2);
+  });
+
   test("--gateway-only execs `hermes gateway run` with an allowlisted env and no Suite credential", async () => {
     makeManagedPython();
     await stamp();
@@ -781,7 +915,13 @@ describe("--stamp-only as a subprocess: the machine contract", () => {
 });
 
 describe("pins", () => {
-  test("the channel is pinned to the merged hermes-suite-channel main", () => {
-    expect(HERMES_CHANNEL_REF).toBe("bda77344d5dfacdcd4114df1e79e534ad5dba618");
+  test("the channel is pinned to the stage-6 launcher-fix commit, pending the deployer's bump to the squash sha", () => {
+    expect(HERMES_CHANNEL_REF).toBe("61e8b603c379cf18e3f7b83562fb51d13c26a979");
+  });
+
+  test("the pin's DEPLOYER comment is present, so the bump is not forgotten at merge", () => {
+    const src = readFileSync(resolve(import.meta.dir, "..", "src", "commands", "hermes.ts"), "utf8");
+    const at = src.indexOf("export const HERMES_CHANNEL_REF");
+    expect(src.slice(Math.max(0, at - 1200), at)).toContain("DEPLOYER: BUMP THIS BEFORE suite-cli MERGES.");
   });
 });

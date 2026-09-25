@@ -23,9 +23,11 @@
  *   5. the harness is present (the writer may install it on its own flag)
  *   6. if the writer needs the token VALUE, resolve it now, into memory —
  *      a locked keychain is exit 3 before any write
- *   7. plan, then apply only the actions that are not `unchanged`
+ *   7. plan, then apply only the actions that are not `unchanged`; each
+ *      action reports whether it was APPLIED, measured, not assumed
  *   8. validate; unparseable output is a failure carrying the raw line
- *   9. record `.suite-stamp.json`, only if its bytes changed
+ *   9. record `.suite-stamp.json`, only if its bytes changed — with verdict
+ *      `fail` when any step after the first write failed
  *
  * Nothing here writes `.suite-state.json`: a stamp stores no secret of its
  * own. The identity in `<root>/suite.json` holds the REF, never the value.
@@ -40,9 +42,11 @@ import {
   EXIT_REFUSED,
   StampFailure,
   aggregateVerdict,
+  changedTheDisk,
   divertStdout,
   emptyResult,
   exitCodeFor,
+  planned,
   processIO,
   redact,
   refused,
@@ -97,9 +101,19 @@ export interface HarnessWriter {
   detectVersion(): Promise<string | null>;
   /** Whether apply needs the token VALUE. False when the harness resolves the ref itself. */
   needsTokenValue(ref: TokenRef): boolean;
-  /** Read current state and say what each step would do. Writes nothing. */
+  /** Read current state and say what each step would do. Writes nothing. Build actions with {@link planned}. */
   plan(inputs: StampInputs): Promise<StampAction[]>;
-  /** Perform every planned action whose outcome is not `unchanged`. */
+  /**
+   * Writes the writer already performed before planning — a harness install
+   * run by `detectVersion`. Collected even when detection or planning then
+   * fails or refuses, so the result never hides an install that happened.
+   */
+  performed?(): StampAction[];
+  /**
+   * Perform every planned action whose outcome is not `unchanged`, setting
+   * `applied` on each as it is performed (and, where it can, read back). An
+   * action left `applied: false` is reported as not having happened.
+   */
   apply(inputs: StampInputs, actions: StampAction[]): Promise<void>;
   /** The post-write check. Unparseable output must come back as `unparseable`, never `pass`. */
   validate(inputs: StampInputs): Promise<ValidationVerdict>;
@@ -227,6 +241,33 @@ export function mergeIdentity(existing: SuiteConfig | null, ref: TokenRef, suite
 interface Progress {
   result: StampResult;
   secrets: string[];
+  /** Actions the writer performed before planning (a harness install). */
+  performed: StampAction[];
+  /** The identity action and the writer's plan, once planning finished. */
+  plan: StampAction[] | null;
+  /** The stamp record this run would write, minus its verdict; set once the inputs are known. */
+  draft: Omit<StampRecord, "verdict"> | null;
+  /** True once any write to the root has begun. A failure after this point records `fail`. */
+  writesStarted: boolean;
+}
+
+/**
+ * The actions a result reports, in order: what was performed before planning,
+ * then the identity and the plan (each marked applied or not), then the
+ * record. Never the plan alone: a failed run must not list writes it did not
+ * reach, and a harness install that ran before a refusal must still show.
+ */
+function reportedActions(progress: Progress, record: StampAction | null): StampAction[] {
+  const [identity, ...rest] = progress.plan ?? [];
+  return [...(identity !== undefined ? [identity] : []), ...progress.performed, ...rest, ...(record !== null ? [record] : [])];
+}
+
+async function writeRecord(stampPath: string, draft: Omit<StampRecord, "verdict">, verdict: StampRecord["verdict"]): Promise<StampAction> {
+  const next = serializeStampRecord({ ...draft, verdict });
+  const action: StampAction = { kind: "stamp_record", target: stampPath, outcome: outcomeFor(await readText(stampPath), next), applied: false };
+  if (action.outcome !== "unchanged") await Bun.write(stampPath, next);
+  action.applied = true;
+  return action;
 }
 
 async function runStampInner(
@@ -283,7 +324,12 @@ async function runStampInner(
   assertWritable(identityPath, probe);
   assertWritable(stampPath, probe);
 
-  const harnessVersion = await writer.detectVersion();
+  let harnessVersion: string | null;
+  try {
+    harnessVersion = await writer.detectVersion();
+  } finally {
+    progress.performed.push(...(writer.performed?.() ?? []));
+  }
   if (harnessVersion === null) {
     throw refused("harness_absent", `${writer.harness} is not installed; pass --install-${writer.harness} to install it`);
   }
@@ -310,20 +356,27 @@ async function runStampInner(
   }
   const digest = inputsDigest(inputs, writer);
 
-  const identityAction: StampAction = {
-    kind: "identity",
-    target: identityPath,
-    outcome: outcomeFor(identityText, identityNext),
+  const identityAction = planned("identity", identityPath, outcomeFor(identityText, identityNext));
+  const actions = await writer.plan(inputs);
+  progress.plan = [identityAction, ...actions];
+  progress.draft = {
+    harness: writer.harness,
+    writerVersion: writer.writerVersion,
+    harnessVersion,
+    pluginRef: writer.pluginRef,
+    inputsDigest: digest,
+    tokenRef: ref.raw,
+    ...(ref.kind === "keychain" ? { keychainService: ref.service } : {}),
   };
-  const planned = await writer.plan(inputs);
-  result.actions = [identityAction, ...planned];
 
+  progress.writesStarted = true;
   if (identityAction.outcome !== "unchanged") {
     await mkdir(root, { recursive: true });
     await writeConfig(parseConfig(identityNext), { path: identityPath, probe });
+    identityAction.applied = true;
   }
-  await writer.apply(inputs, planned);
-  for (const a of result.actions) io.stderr(`suite: ${a.kind} ${a.target}: ${a.outcome}\n`);
+  await writer.apply(inputs, actions);
+  for (const a of reportedActions(progress, null)) io.stderr(`suite: ${a.kind} ${a.target}: ${a.outcome}${a.applied ? "" : " (not applied)"}\n`);
   for (const w of writer.warnings?.(inputs) ?? []) {
     const line = redact(w, progress.secrets);
     result.warnings.push(line);
@@ -337,22 +390,9 @@ async function runStampInner(
     if (c.verdict !== "pass") io.stderr(`suite: check ${c.command}: ${c.verdict}${c.raw ? `: ${c.raw}` : ""}\n`);
   }
 
-  const record: StampRecord = {
-    harness: writer.harness,
-    writerVersion: writer.writerVersion,
-    harnessVersion,
-    pluginRef: writer.pluginRef,
-    inputsDigest: digest,
-    tokenRef: ref.raw,
-    ...(ref.kind === "keychain" ? { keychainService: ref.service } : {}),
-    verdict: aggregated.verdict,
-  };
-  const recordNext = serializeStampRecord(record);
-  const recordAction: StampAction = { kind: "stamp_record", target: stampPath, outcome: outcomeFor(await readText(stampPath), recordNext) };
-  if (recordAction.outcome !== "unchanged") await Bun.write(stampPath, recordNext);
-  result.actions.push(recordAction);
-
-  result.changed = result.actions.some((a) => a.outcome !== "unchanged");
+  const recordAction = await writeRecord(stampPath, progress.draft, aggregated.verdict);
+  result.actions = reportedActions(progress, recordAction);
+  result.changed = result.actions.some(changedTheDisk);
   result.ok = aggregated.verdict === "pass";
   if (!result.ok) {
     result.error = { code: "validation_failed", message: `post-write check for ${writer.harness} did not pass (${aggregated.verdict})` };
@@ -365,6 +405,12 @@ async function runStampInner(
  * Run one stamp and return the result plus its exit code. Writes nothing to
  * stdout; human lines go to `io.stderr`. `build` parses the verb's flags and
  * may throw a {@link StampFailure}, so a refused flag still yields a document.
+ *
+ * A run that fails AFTER it began writing to the root records `fail` in
+ * `.suite-stamp.json`, so an older `pass` cannot outlive it: `suite status`
+ * would otherwise report the last good stamp, and `--gateway-only` would
+ * launch on a root in an unknown state. A refusal before any write leaves the
+ * record, and every other file, as it was.
  */
 export async function runStamp(
   writer: HarnessWriter,
@@ -372,7 +418,14 @@ export async function runStamp(
   io: StampIO,
   deps: StampDeps = {},
 ): Promise<{ result: StampResult; exitCode: StampExitCode; secrets: string[] }> {
-  const progress: Progress = { result: emptyResult(writer.harness, writer.writerVersion), secrets: [] };
+  const progress: Progress = {
+    result: emptyResult(writer.harness, writer.writerVersion),
+    secrets: [],
+    performed: [],
+    plan: null,
+    draft: null,
+    writesStarted: false,
+  };
   let failure: StampFailure | null = null;
   try {
     await runStampInner(writer, build, io, deps, progress);
@@ -386,7 +439,17 @@ export async function runStamp(
     result.ok = false;
     result.error = { code: failure.code, message: redact(failure.message, progress.secrets) };
     result.human_steps.push(...failure.humanSteps);
-    result.changed = result.actions.some((a) => a.outcome !== "unchanged");
+    let record: StampAction | null = null;
+    if (progress.writesStarted && progress.draft !== null) {
+      try {
+        record = await writeRecord(join(result.agent.root, STAMP_FILE), progress.draft, "fail");
+      } catch (e) {
+        io.stderr(`suite: could not record the failed stamp: ${e instanceof Error ? e.message : String(e)}\n`);
+      }
+    }
+    result.actions = reportedActions(progress, record);
+    result.changed = result.actions.some(changedTheDisk);
+    for (const a of result.actions) if (!a.applied) io.stderr(`suite: ${a.kind} ${a.target}: ${a.outcome} (not applied)\n`);
     io.stderr(`suite: ${redact(failure.message, progress.secrets)}\n`);
   }
   return { result, exitCode: exitCodeFor(result, failure), secrets: progress.secrets };

@@ -2,7 +2,8 @@
 # A stand-in for hermes-suite-channel's install.sh, for test/hermes.test.ts.
 #
 # Same argument surface and the same observable contract as the real one at
-# bda77344: refuses --token; reads the token from --token-file, else stdin;
+# the pinned HERMES_CHANNEL_REF (it takes --python, and registers it as the
+# MCP command, since task 01a0d8f8 stage 6): refuses --token; reads the token from --token-file, else stdin;
 # writes it 0600 to $HERMES_HOME/mcp-tokens/startup-suite-platform.runtime-token
 # only when it changed; sets SUITE_* keys in .env in place (never the token);
 # installs and enables the plugin; registers the stdio mcp_servers entry
@@ -24,7 +25,7 @@ mkdir -p "$CALL"
 printf '%s\0' "$@" >"$CALL/argv"
 env -0 >"$CALL/env"
 
-URL="" RID="" HH="" TF="" HB="hermes" ALLOW="" USERS=""
+URL="" RID="" HH="" TF="" HB="hermes" PY="" ALLOW="" USERS=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --token | --token=*) die "--token is refused" ;;
@@ -33,6 +34,7 @@ while [ "$#" -gt 0 ]; do
     --hermes-home) HH="$2"; shift 2 ;;
     --token-file) TF="$2"; shift 2 ;;
     --hermes) HB="$2"; shift 2 ;;
+    --python) PY="$2"; shift 2 ;;
     --allow-all-users) ALLOW=true; shift ;;
     --allowed-users) USERS="$2"; shift 2 ;;
     *) die "unknown argument: $1" ;;
@@ -110,8 +112,9 @@ else
 fi
 
 MCP="$(printf '%s' "$URL" | sed -e 's#^wss://#https://#' -e 's#^ws://#http://#' -e 's#^\(https*://[^/]*\).*#\1/mcp#')"
-want_cmd="/usr/bin/env"
-want_args="[\"python3\",\"$PD/hermes_suite_channel/mcp_bridge.py\",\"--url\",\"$MCP\",\"--token-file\",\"$TP\"]"
+[ -n "$PY" ] || die "the stub requires --python (the CLI always passes it)"
+want_cmd="$PY"
+want_args="[\"$PD/hermes_suite_channel/mcp_bridge.py\",\"--url\",\"$MCP\",\"--token-file\",\"$TP\"]"
 have_cmd="$("$HB" config get mcp_servers.startup-suite.command 2>/dev/null || true)"
 have_args="$("$HB" config get mcp_servers.startup-suite.args --json 2>/dev/null || true)"
 [ "$have_cmd" = "$want_cmd" ] || "$HB" config set mcp_servers.startup-suite.command "$want_cmd" >&2

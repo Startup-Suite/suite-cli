@@ -277,7 +277,7 @@ What it writes, and with what mode:
 | Path | Written by | Mode | Holds |
 | --- | --- | --- | --- |
 | `<root>/suite.json` | this CLI | default (`0644` under a `022` umask) | Suite URL, runtime id, the token **ref**. No secret |
-| `<root>/.suite-stamp.json` | this CLI | default | Stamp record: harness, writer and harness version, plugin ref, inputs digest, token ref, last verdict. No secret |
+| `<root>/.suite-stamp.json` | this CLI | default | Stamp record: harness, writer and harness version, plugin ref, inputs digest, token ref, last verdict. A run that fails after its first write records `fail`, so an older `pass` never outlives it and `--gateway-only` refuses the root. A refusal before any write leaves it as it was. No secret |
 | `$HERMES_HOME/mcp-tokens/startup-suite-platform.runtime-token` | the channel installer | `0600` | The runtime token: the one sanctioned copy |
 | `$HERMES_HOME/.env` | the channel installer; this CLI adds `CUSTOM_MODEL_API_KEY` | `0600` for this CLI's write | Channel keys; the model key when `--model-api-key-ref` is given |
 | `$HERMES_HOME/config.yaml` | `hermes config set` (model keys); the channel installer (`mcp_servers.startup-suite`) | Hermes's own | `model.provider`, `model.base_url`, `model.default`, optionally `model.context_length`, `model.key_env` |
@@ -301,6 +301,32 @@ names the command to run.
 `keychain:` ref is resolved in memory, handed to the installer on stdin, and
 materialised into the `0600` token file above. The stamp says so in `warnings`.
 
+**The interpreter.** Every Hermes launcher at the pinned commit is a
+`#!/bin/sh` wrapper, so the interpreter is not read from a shebang. It is asked
+of Hermes (`hermes --run-module pm.environments` names the dependency venv it
+selects), and passed to the channel installer as `--python`.
+
+**The harness version** is the install's own commit: `git rev-parse HEAD` in
+the `Install directory` that `hermes --version` prints, else the local
+`g<sha>` of that line. Never its `upstream <sha>`, which is the remote tip Hermes
+last fetched (measured: 49 commits ahead of the pinned install).
+
+**Model size is a prerequisite.** With Hermes's default toolset for the
+`startup_suite` platform, the first prompt of a turn is about **16.6k tokens**
+(measured at the pinned commit: 16633). A model served with a smaller context
+cannot answer at all, and `--context-length` does not help: it declares the
+window, it does not shrink the prompt. Serve the model with a context
+comfortably above that, with room for the reply on top. For a small model, narrowing the platform's toolset is a supported
+Hermes key (`platform_toolsets.<platform>`, read at gateway turn time), and is
+an operator choice, not something the stamp sets:
+
+```
+HERMES_HOME=<root>/.hermes hermes config set platform_toolsets.startup_suite '["hermes-webhook"]'
+```
+
+That leaves the agent with the webhook toolset only (no file, shell or web
+tools). The stamp does not own this key and never rewrites it.
+
 ## `suite openclaw`
 
 Stamps an [OpenClaw](https://www.npmjs.com/package/openclaw) root Suite-ready
@@ -310,6 +336,20 @@ the tmux session `suite-<root dir name>`. State lives under the root
 `OPENCLAW_HOME=<root>`), never in `~/.openclaw`. The config is written by
 upstream: `openclaw onboard --non-interactive --accept-risk` for the base, then
 `openclaw config set` for every later key. openclaw.json is never hand-written.
+The keys this verb manages are READ back from openclaw.json itself and compared
+on the fields it owns: `openclaw config get --json` returns the account's
+`token` as `__OPENCLAW_REDACTED__` and adds schema defaults, so it cannot say
+whether the account is already right (measured at 2026.9.4).
+
+**`plugins.allow` is exclusive**: once set, every plugin it does not name is
+disabled, bundled ones included (measured: 39 bundled plugins load on a fresh
+onboard, 1 with `plugins.allow` naming only this plugin, and `plugins doctor`
+then fails on the harness's own `anthropic` entry). So a stamp that creates the
+allowlist names every plugin `openclaw plugins list` reports enabled at that
+moment, plus this one: what loads is unchanged except for this plugin. An
+allowlist the operator already wrote is kept, with this plugin appended. A
+plugin that a later OpenClaw release bundles is therefore not enabled until it
+is added to the list.
 
 | Flag | Meaning |
 | --- | --- |
@@ -388,8 +428,8 @@ and no session is started.
 | `harness` | string | `hermes` or `openclaw` |
 | `agent` | object | `{name, root, runtime_id}` |
 | `token_ref` | string or null | The token **ref** as given or recorded, never a value |
-| `changed` | boolean | Whether any action wrote anything |
-| `actions` | array | `{kind, target, outcome}` per write; `outcome` is `written`, `unchanged` or `repaired`; `target` is a path, key or package, never a value |
+| `changed` | boolean | Whether any action that was applied wrote anything |
+| `actions` | array | `{kind, target, outcome, applied}` per write; `outcome` is `written`, `unchanged` or `repaired`; `target` is a path, key or package, never a value. `applied` is measured: `true` once the write was performed (or when `unchanged` needed none), `false` for a planned write the run never reached. A failed run therefore lists the writes it did not make as `applied: false`, and a harness install that ran before a refusal is still listed |
 | `validation` | object | `{verdict, checks}`; `verdict` is `pass`, `fail` or `unparseable`, and each check carries `command`, `exit_code`, `verdict` and, on a failure, the `raw` line |
 | `harness_version` | string or null | The harness version the stamp ran against |
 | `writer_version` | number | The version of this CLI's writer for that harness |
@@ -458,6 +498,10 @@ Hermes env ships `ruamel.yaml`, because Hermes needs it to read its own config.
 6. **The upstream Hermes `.env` child-env leak.** Hermes copies `.env` into its
    own environment every turn, and children it spawns without a scrub inherit
    it, model key included.
+7. **The Hermes MCP command names a venv generation.** The interpreter the
+   channel installer registers as `mcp_servers.startup-suite.command` is the
+   dependency venv Hermes selected at stamp time, which Hermes may replace on
+   `hermes update`. A re-run of the stamp repairs it; nothing does in between.
 
 ## Five decisions, stated rather than guessed
 

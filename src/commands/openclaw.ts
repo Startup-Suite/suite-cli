@@ -22,7 +22,14 @@
  *     from `openclaw config set`; openclaw.json is never hand-written. The
  *     interactive wizard is never run: no `onboard` without
  *     `--non-interactive`, no `--classic`, no `setup --wizard`, no
- *     `configure`. Current values are read with `openclaw config get --json`.
+ *     `configure`. The keys this verb MANAGES are read back from
+ *     openclaw.json itself, and compared on the fields this verb owns only:
+ *     `openclaw config get --json` is not a faithful read of them. MEASURED at
+ *     2026.9.4, it returns the account's `token` as `__OPENCLAW_REDACTED__`
+ *     and adds the schema defaults `reconnectIntervalMs`,
+ *     `maxReconnectIntervalMs` and `useMcpTools`, so a comparison against it
+ *     could never match and every run rewrote the account. Other values
+ *     (`gateway.port`, `plugins.load.paths`) are still read through it.
  *  2. EVERY OpenClaw child is spawned through `spawnHarness` with a
  *     `harnessChildEnv` environment scoped to the root, so no child inherits
  *     the operator's OPENCLAW_* (hive's live gateway is exactly such an
@@ -66,6 +73,7 @@ import {
   EXIT_FAILED,
   EXIT_REFUSED,
   StampFailure,
+  planned,
   redact,
   refused,
   type HumanStep,
@@ -84,7 +92,7 @@ import {
 } from "../token_ref.ts";
 import type { TmuxDeps } from "../tmux.ts";
 import { classifyPullFailure, noGitPrompt, pullRemedyLines } from "./init.ts";
-import { recordLaunch, liveRestoreDeps, type RestoreDeps } from "./restore.ts";
+import { loadRoster, recordLaunch, liveRestoreDeps, type RestoreDeps } from "./restore.ts";
 import {
   liveDeepseekDeps,
   runInSession,
@@ -575,31 +583,121 @@ export function mergedBindings(current: unknown, agentId: string): unknown[] {
   return out;
 }
 
-export function mergedAllow(current: unknown): unknown[] {
-  const list = Array.isArray(current) ? [...current] : [];
-  return list.includes(PLUGIN_ID) ? list : [...list, PLUGIN_ID];
+/**
+ * `plugins.allow` with this plugin in it.
+ *
+ * `plugins.allow` is an EXCLUSIVE allowlist: once it is set, every plugin not
+ * named in it is disabled, bundled ones included. MEASURED at 2026.9.4 on a
+ * fresh onboard: 39 bundled plugins load with `plugins.allow` unset, and 1
+ * (memory-core) with `plugins.allow = [startup-suite-channel-plugin]`; the
+ * harness's own model plugin `anthropic` is among the 38 lost, which is what
+ * `plugins doctor` reports as `plugins.entries.anthropic: plugin disabled (not
+ * in allowlist) but config is present`.
+ *
+ * So when there is no allowlist yet, the one this creates names every plugin
+ * that was ENABLED before the stamp (`enabledBefore`, read from `openclaw
+ * plugins list --json`) plus this one: the set that loads is unchanged except
+ * for this plugin. An allowlist the operator already wrote is kept as it is,
+ * with this plugin appended.
+ */
+export function mergedAllow(current: unknown, enabledBefore: readonly string[] = []): unknown[] {
+  if (Array.isArray(current)) return current.includes(PLUGIN_ID) ? [...current] : [...current, PLUGIN_ID];
+  const out: string[] = [];
+  for (const id of enabledBefore) if (id !== PLUGIN_ID && !out.includes(id)) out.push(id);
+  return [...out, PLUGIN_ID];
 }
 
-/** A config key this verb owns: the path it reads, and the value it wants given what it read. */
+/**
+ * `openclaw plugins list --json`: the ids of the plugins that are enabled.
+ * MEASURED at 2026.9.4: `{workspaceDir, workspaceScope, registry, plugins:
+ * [{id, enabled, status, origin, ...}], diagnostics}`. Anything else throws:
+ * guessing an empty list here would disable every plugin the harness has.
+ */
+export function parsePluginsList(exitCode: number, stdout: string, stderr: string): string[] {
+  const doc = parseJson(stdout);
+  if (exitCode !== 0 || !isObject(doc) || !Array.isArray(doc.plugins)) {
+    throw new StampFailure(
+      EXIT_FAILED,
+      "plugins_list_unparseable",
+      `openclaw plugins list --json exited ${exitCode} without a plugin list: ${firstLine(stdout || stderr)}`,
+    );
+  }
+  return doc.plugins.filter((p): p is Record<string, unknown> => isObject(p) && p.enabled === true && typeof p.id === "string").map((p) => p.id as string);
+}
+
+/**
+ * Whether an account already holds what this verb manages: `url`,
+ * `runtimeId`, `token` (the ref string), `tokenKeychainService` (present
+ * exactly when the ref is a keychain one) and an `autoJoinSpaces` list. Keys
+ * this verb does not own (the reconnect tunables, `useMcpTools`) are ignored.
+ */
+export function accountHolds(current: unknown, desired: AccountShape): boolean {
+  if (!isObject(current)) return false;
+  return (
+    current.url === desired.url &&
+    current.runtimeId === desired.runtimeId &&
+    current.token === desired.token &&
+    current.tokenKeychainService === desired.tokenKeychainService &&
+    Array.isArray(current.autoJoinSpaces)
+  );
+}
+
+/** A config key this verb owns: the path it reads, the value it wants given what it read, and when it already holds. */
 interface ManagedKey {
   path: string;
   want(current: unknown): unknown;
-}
-
-export function managedKeys(inputs: Pick<StampInputs, "suiteUrl" | "runtimeId" | "tokenRef">, agentId: string): ManagedKey[] {
-  const account = desiredAccount(inputs);
-  return [
-    { path: "plugins.allow", want: mergedAllow },
-    { path: `plugins.entries.${PLUGIN_ID}.enabled`, want: () => true },
-    { path: `channels.${CHANNEL_ID}.enabled`, want: () => true },
-    { path: `channels.${CHANNEL_ID}.dmPolicy`, want: () => "allowlist" },
-    { path: `channels.${CHANNEL_ID}.allowFrom`, want: () => ["*"] },
-    { path: `channels.${CHANNEL_ID}.accounts.${agentId}`, want: (c) => mergedAccount(c, account) },
-    { path: "bindings", want: (c) => mergedBindings(c, agentId) },
-  ];
+  holds(current: unknown): boolean;
 }
 
 const same = (a: unknown, b: unknown): boolean => canonicalJson(a) === canonicalJson(b);
+
+export function managedKeys(
+  inputs: Pick<StampInputs, "suiteUrl" | "runtimeId" | "tokenRef">,
+  agentId: string,
+  enabledBefore: readonly string[] = [],
+): ManagedKey[] {
+  const account = desiredAccount(inputs);
+  const exact = (path: string, want: (c: unknown) => unknown): ManagedKey => ({ path, want, holds: (c) => c !== undefined && same(c, want(c)) });
+  return [
+    exact("plugins.allow", (c) => mergedAllow(c, enabledBefore)),
+    exact(`plugins.entries.${PLUGIN_ID}.enabled`, () => true),
+    exact(`channels.${CHANNEL_ID}.enabled`, () => true),
+    exact(`channels.${CHANNEL_ID}.dmPolicy`, () => "allowlist"),
+    exact(`channels.${CHANNEL_ID}.allowFrom`, () => ["*"]),
+    {
+      path: `channels.${CHANNEL_ID}.accounts.${agentId}`,
+      want: (c) => mergedAccount(c, account),
+      holds: (c) => accountHolds(c, account),
+    },
+    exact("bindings", (c) => mergedBindings(c, agentId)),
+  ];
+}
+
+/**
+ * The authored value at a dotted path of openclaw.json, or undefined when it
+ * is not set. Read from the file OpenClaw wrote, never through `config get`
+ * (see rule 1). The path's segments are ids without dots (agent ids are
+ * normalised, plugin and channel ids are constants).
+ */
+export function authoredValue(doc: Record<string, unknown> | null, path: string): unknown {
+  let node: unknown = doc;
+  for (const part of path.split(".")) {
+    if (!isObject(node) || !(part in node)) return undefined;
+    node = node[part];
+  }
+  return node;
+}
+
+/** openclaw.json as OpenClaw wrote it, or null when it does not exist yet. */
+export function readOpenclawConfig(root: string): Record<string, unknown> | null {
+  const path = configPathFor(root);
+  if (!existsSync(path)) return null;
+  const doc = parseJson(readFileSync(path, "utf8"));
+  if (!isObject(doc)) {
+    throw new StampFailure(EXIT_FAILED, "openclaw_config_unreadable", `${path} is not a JSON object; \`openclaw config validate\` names the problem`);
+  }
+  return doc;
+}
 
 /* ------------------------------------------------------------------------- */
 /* Dependencies                                                               */
@@ -882,15 +980,18 @@ export function openclawWriter(ctx: { opts: OpenclawOptions | null }, deps: Open
       return false;
     },
 
+    performed() {
+      return state.installedNow
+        ? [{ kind: "harness_install", target: `${managedOpenclawDir(deps.env)}@${OPENCLAW_PACKAGE}`, outcome: "written", applied: true }]
+        : [];
+    },
+
     async plan(inputs) {
       const o = opts();
       state.agentId = agentIdForRoot(o.root);
       state.stampedBefore = (await readStampRecord(o.root)) !== null;
       const absent = state.stampedBefore ? "repaired" : "written";
       const actions: StampAction[] = [];
-      if (state.installedNow) {
-        actions.push({ kind: "harness_install", target: `${managedOpenclawDir(deps.env)}@${OPENCLAW_PACKAGE}`, outcome: "written" });
-      }
 
       if (o.modelApiKeyRef !== undefined) {
         const ref = parseTokenRef(o.modelApiKeyRef, { keychainService: o.keychainService });
@@ -901,41 +1002,31 @@ export function openclawWriter(ctx: { opts: OpenclawOptions | null }, deps: Open
       const mode = await configGet("gateway.mode");
       const agent = await configGet(`agents.entries.${state.agentId}`);
       const needsOnboard = !mode.present || !agent.present;
-      actions.push({ kind: "base_config", target: `${configPathFor(o.root)} (openclaw onboard --non-interactive)`, outcome: needsOnboard ? absent : "unchanged" });
+      actions.push(planned("base_config", `${configPathFor(o.root)} (openclaw onboard --non-interactive)`, needsOnboard ? absent : "unchanged"));
 
       const portRead = valueOf(await configGet("gateway.port"));
       const configured = typeof portRead === "number" ? portRead : undefined;
       const port = await choosePort(configured);
       state.port = port;
-      actions.push({
-        kind: "gateway_port",
-        target: `gateway.port=${port}`,
-        outcome: configured === undefined ? absent : configured === port ? "unchanged" : "repaired",
-      });
+      actions.push(planned("gateway_port", `gateway.port=${port}`, configured === undefined ? absent : configured === port ? "unchanged" : "repaired"));
 
       const head = await gitHead();
-      actions.push({
-        kind: "plugin_checkout",
-        target: `${checkout()}@${channelRef}`,
-        outcome: head === null ? "written" : head === channelRef ? "unchanged" : "repaired",
-      });
+      actions.push(planned("plugin_checkout", `${checkout()}@${channelRef}`, head === null ? "written" : head === channelRef ? "unchanged" : "repaired"));
       const marker = depsMarker();
-      actions.push({
-        kind: "plugin_deps",
-        target: `${join(checkout(), "node_modules")} (npm ci)`,
-        outcome: marker === null ? "written" : marker === channelRef && head === channelRef ? "unchanged" : "repaired",
-      });
+      actions.push(
+        planned(
+          "plugin_deps",
+          `${join(checkout(), "node_modules")} (npm ci)`,
+          marker === null ? "written" : marker === channelRef && head === channelRef ? "unchanged" : "repaired",
+        ),
+      );
       const linked = (await linkedPaths()).includes(checkout());
-      actions.push({ kind: "plugin_link", target: `plugins.load.paths += ${checkout()} (openclaw plugins install --link)`, outcome: linked ? "unchanged" : absent });
+      actions.push(planned("plugin_link", `plugins.load.paths += ${checkout()} (openclaw plugins install --link)`, linked ? "unchanged" : absent));
 
+      const doc = readOpenclawConfig(o.root);
       for (const key of managedKeys(inputs, state.agentId)) {
-        const current = await configGet(key.path);
-        const cur = valueOf(current);
-        actions.push({
-          kind: "config_set",
-          target: key.path,
-          outcome: !current.present ? absent : same(cur, key.want(cur)) ? "unchanged" : "repaired",
-        });
+        const cur = authoredValue(doc, key.path);
+        actions.push(planned("config_set", key.path, cur === undefined ? absent : key.holds(cur) ? "unchanged" : "repaired"));
       }
       return actions;
     },
@@ -944,7 +1035,12 @@ export function openclawWriter(ctx: { opts: OpenclawOptions | null }, deps: Open
       const o = opts();
       const port = state.port as number;
       const agentId = state.agentId as string;
-      const outcomeOf = (kind: string): string | undefined => actions.find((a) => a.kind === kind)?.outcome;
+      const action = (kind: string, target?: string): StampAction | undefined =>
+        actions.find((a) => a.kind === kind && (target === undefined || a.target === target));
+      const outcomeOf = (kind: string): string | undefined => action(kind)?.outcome;
+      const done = (a: StampAction | undefined): void => {
+        if (a !== undefined) a.applied = true;
+      };
       mkdirSync(stateDirFor(o.root), { recursive: true, mode: 0o700 });
 
       if (outcomeOf("base_config") !== "unchanged") {
@@ -958,14 +1054,26 @@ export function openclawWriter(ctx: { opts: OpenclawOptions | null }, deps: Open
         if (!agent.present) {
           throw fail("onboard_ineffective", `openclaw onboard exited 0 but agents.entries.${agentId} is unset; the binding would name no agent`);
         }
+        done(action("base_config"));
       }
-      const portNow = valueOf(await configGet("gateway.port"));
-      if (portNow !== port) await configSet("gateway.port", port);
+      if (valueOf(await configGet("gateway.port")) !== port) {
+        await configSet("gateway.port", port);
+        if (valueOf(await configGet("gateway.port")) !== port) {
+          throw fail("config_set_ineffective", `openclaw config set gateway.port exited 0 but gateway.port is not ${port}`);
+        }
+      }
+      done(action("gateway_port"));
 
       const co = outcomeOf("plugin_checkout");
       const depsOutcome = outcomeOf("plugin_deps");
-      if (co !== "unchanged") await ensureCheckout();
-      if (depsOutcome !== "unchanged" || co !== "unchanged") await installPluginDeps();
+      if (co !== "unchanged") {
+        await ensureCheckout();
+        done(action("plugin_checkout"));
+      }
+      if (depsOutcome !== "unchanged" || co !== "unchanged") {
+        await installPluginDeps();
+        done(action("plugin_deps"));
+      }
 
       if (!(await linkedPaths()).includes(checkout())) {
         // --link, not a copy: a copy install of a TypeScript entry needs a
@@ -978,18 +1086,30 @@ export function openclawWriter(ctx: { opts: OpenclawOptions | null }, deps: Open
         if (r.exitCode !== 0) {
           throw fail("plugin_install_failed", `openclaw plugins install --link ${checkout()} exited ${r.exitCode}: ${lastLine(r.stderr || r.stdout)}`);
         }
-      }
-
-      for (const key of managedKeys(inputs, agentId)) {
-        const cur = valueOf(await configGet(key.path));
-        const want = key.want(cur);
-        if (!same(cur, want)) await configSet(key.path, want);
-      }
-      for (const key of managedKeys(inputs, agentId)) {
-        const cur = valueOf(await configGet(key.path));
-        if (!same(cur, key.want(cur))) {
-          throw fail("config_set_ineffective", `openclaw config set ${key.path} exited 0 but config get does not return the value`);
+        if (!(await linkedPaths()).includes(checkout())) {
+          throw fail("plugin_install_ineffective", `openclaw plugins install --link exited 0 but plugins.load.paths does not name ${checkout()}`);
         }
+      }
+      done(action("plugin_link"));
+
+      // Creating an allowlist disables every plugin it does not name (see
+      // mergedAllow), so read which are enabled now, before it exists.
+      let enabledBefore: string[] = [];
+      if (authoredValue(readOpenclawConfig(o.root), "plugins.allow") === undefined) {
+        const r = await oc(["plugins", "list", "--json"]);
+        enabledBefore = parsePluginsList(r.exitCode, r.stdout, r.stderr);
+      }
+      const keys = managedKeys(inputs, agentId, enabledBefore);
+      for (const key of keys) {
+        const cur = authoredValue(readOpenclawConfig(o.root), key.path);
+        if (!key.holds(cur)) await configSet(key.path, key.want(cur));
+      }
+      const after = readOpenclawConfig(o.root);
+      for (const key of keys) {
+        if (!key.holds(authoredValue(after, key.path))) {
+          throw fail("config_set_ineffective", `openclaw config set ${key.path} exited 0 but ${configPathFor(o.root)} does not hold the value`);
+        }
+        done(action("config_set", key.path));
       }
 
       if (state.modelKey !== undefined) {
@@ -1180,6 +1300,7 @@ export async function runOpenclaw(args: string[], deps: OpenclawDeps): Promise<n
     onCreated: (createArgv) => {
       if (deps.restore) recordLaunch(deps.restore, home, { session, command: createArgv, cwd: opts.root, kind: "openclaw" });
     },
+    wasRecorded: () => deps.restore !== undefined && loadRoster(deps.restore, home).some((e) => e.session === session),
   });
 }
 

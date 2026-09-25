@@ -17,6 +17,7 @@ import {
   configPathFor,
   gatewayArgv,
   managedOpenclawBin,
+  mergedAllow,
   mergedBindings,
   nodeMeetsFloor,
   normalizeAgentId,
@@ -49,6 +50,14 @@ const STUB_OPENCLAW = join(STUB_DIR, "openclaw");
 const STUB_CHANNEL = resolve(import.meta.dir, "fixtures", "stub_openclaw_channel");
 const OPENCLAW_FIXTURE = resolve(import.meta.dir, "fixtures", "openclaw-fixture.ts");
 const BUN_DIR = dirname(process.execPath);
+const CAPTURED = resolve(import.meta.dir, "fixtures", "openclaw-2026.9.4");
+const readCaptured = (name: string) => JSON.parse(readFileSync(join(CAPTURED, name), "utf8"));
+const CAPTURED_ACCOUNT_GET = readCaptured("config-get-account.json");
+const CAPTURED_DOCTOR_ALLOW_OURS = readCaptured("plugins-doctor.allow-ours-only.json");
+/** The plugins enabled on a fresh onboard, in listed order (captured). */
+const CAPTURED_ENABLED: string[] = (readCaptured("plugins-list.onboard.json").plugins as { id: string; enabled: boolean }[])
+  .filter((p) => p.enabled)
+  .map((p) => p.id);
 
 let shared: string;
 let channelRepo: string;
@@ -412,7 +421,8 @@ describe("a first stamp", () => {
     expect(c.bindings).toEqual([
       { type: "route", agentId: "openclaw-01a0d8f8", match: { channel: "startup-suite", accountId: "openclaw-01a0d8f8" } },
     ]);
-    expect(c.plugins.allow).toEqual([PLUGIN_ID]);
+    // Every plugin that was enabled before the stamp, then this one (see the allowlist tests).
+    expect(c.plugins.allow).toEqual([...CAPTURED_ENABLED, PLUGIN_ID]);
     expect(c.plugins.entries[PLUGIN_ID].enabled).toBe(true);
     expect(c.gateway.port).toBe(FIRST_STAMP_PORT);
   });
@@ -492,6 +502,125 @@ describe("no secret leaks", () => {
   });
 });
 
+describe("the stub answers in the captured 2026.9.4 shapes", () => {
+  // The reviewer's run found two failures the stub had hidden. These pin the
+  // stub to what the real CLI printed in a throwaway OPENCLAW_STATE_DIR.
+  test("config get redacts the account token and adds the schema defaults, exactly as captured", async () => {
+    await stamp();
+    const c = config();
+    c.channels["startup-suite"].accounts.m1 = { url: "ws://127.0.0.1:9/runtime/ws", runtimeId: "m1-rt", token: "file:/nonexistent/m1.token", autoJoinSpaces: [] };
+    writeFileSync(configPathFor(root), JSON.stringify(c, null, 2));
+    const r = Bun.spawnSync([STUB_OPENCLAW, "config", "get", "channels.startup-suite.accounts.m1", "--json"], {
+      env: { ...baseEnv(), OPENCLAW_CONFIG_PATH: configPathFor(root) },
+    });
+    expect(JSON.parse(r.stdout.toString())).toEqual(CAPTURED_ACCOUNT_GET);
+    // The file itself holds the ref: that is what the writer reads.
+    expect(config().channels["startup-suite"].accounts.m1.token).toBe("file:/nonexistent/m1.token");
+  });
+
+  test("an allowlist naming only this plugin reproduces the captured doctor failure", async () => {
+    await stamp();
+    const c = config();
+    c.plugins.allow = [PLUGIN_ID];
+    writeFileSync(configPathFor(root), JSON.stringify(c, null, 2));
+    const r = Bun.spawnSync([STUB_OPENCLAW, "plugins", "doctor", "--json"], { env: { ...baseEnv(), OPENCLAW_CONFIG_PATH: configPathFor(root) } });
+    expect(JSON.parse(r.stdout.toString())).toEqual(CAPTURED_DOCTOR_ALLOW_OURS);
+  });
+});
+
+describe("the plugin allowlist keeps the harness's own plugins", () => {
+  const enabledIds = (): string[] => {
+    const r = Bun.spawnSync([STUB_OPENCLAW, "plugins", "list", "--json"], { env: { ...baseEnv(), OPENCLAW_CONFIG_PATH: configPathFor(root) } });
+    return (JSON.parse(r.stdout.toString()).plugins as { id: string; enabled: boolean }[]).filter((p) => p.enabled).map((p) => p.id);
+  };
+
+  test("anthropic stays enabled, codex stays as it was, and doctor passes", async () => {
+    const { result, exitCode } = await stamp();
+    expect(exitCode).toBe(0);
+    expect(result.validation.checks.find((c) => c.command === "openclaw plugins doctor --json")?.verdict).toBe("pass");
+    expect(enabledIds().sort()).toEqual([...CAPTURED_ENABLED, PLUGIN_ID].sort());
+    expect(enabledIds()).toContain("anthropic");
+    expect(config().plugins.entries.codex).toEqual({ config: { sessionCatalog: { enabled: false } } });
+    expect(config().plugins.entries.anthropic).toEqual({ config: { sessionCatalog: { enabled: false } } });
+  });
+
+  test("an allowlist the operator wrote is kept as written, with this plugin appended", async () => {
+    await stamp();
+    const c = config();
+    c.plugins.allow = ["anthropic", "openai"];
+    writeFileSync(configPathFor(root), JSON.stringify(c, null, 2));
+    const { exitCode } = await stamp();
+    expect(exitCode).toBe(0);
+    expect(config().plugins.allow).toEqual(["anthropic", "openai", PLUGIN_ID]);
+  });
+
+  test("mergedAllow: no allowlist yet means every plugin enabled before, then this one; one written is kept", () => {
+    expect(mergedAllow(undefined, ["anthropic", PLUGIN_ID, "openai", "anthropic"])).toEqual(["anthropic", "openai", PLUGIN_ID]);
+    expect(mergedAllow(["x"], ["anthropic"])).toEqual(["x", PLUGIN_ID]);
+    expect(mergedAllow([PLUGIN_ID, "x"])).toEqual([PLUGIN_ID, "x"]);
+  });
+
+  test("an unreadable plugin list stops the stamp rather than guessing an empty allowlist", async () => {
+    writeFileSync(join(home, "openclaw-stub-knobs.json"), JSON.stringify({ list: "garbage" }));
+    const { result, exitCode } = await stamp();
+    expect(exitCode).toBe(1);
+    expect(result.error?.code).toBe("plugins_list_unparseable");
+    expect(config().plugins?.allow).toBeUndefined();
+  });
+});
+
+describe("actions are measured, not planned", () => {
+  test("a failed onboard reports every later write as not applied, and changed:false", async () => {
+    writeFileSync(join(home, "openclaw-stub-knobs.json"), JSON.stringify({ onboard: "fail" }));
+    const { result, exitCode } = await stamp();
+    expect(exitCode).toBe(1);
+    const configSets = result.actions.filter((a) => a.kind === "config_set");
+    expect(configSets.length).toBeGreaterThan(0);
+    for (const a of configSets) expect(a).toMatchObject({ outcome: "written", applied: false });
+    expect(result.actions.find((a) => a.kind === "base_config")).toMatchObject({ applied: false });
+    // Only the identity and the failure record touched the root.
+    expect(result.actions.filter((a) => a.applied && a.outcome !== "unchanged").map((a) => a.kind)).toEqual(["identity", "stamp_record"]);
+  });
+
+  test("a failure after the first write records `fail` over an earlier pass, and --gateway-only then refuses", async () => {
+    expect((await stamp()).exitCode).toBe(0);
+    const c = config();
+    c.bindings = [];
+    writeFileSync(configPathFor(root), JSON.stringify(c, null, 2));
+    writeFileSync(join(home, "openclaw-stub-knobs.json"), JSON.stringify({ doctor: "error" }));
+    const { exitCode } = await stamp();
+    expect(exitCode).toBe(1);
+    expect(JSON.parse(readFileSync(join(root, ".suite-stamp.json"), "utf8")).verdict).toBe("fail");
+    const o = parseOpenclawOptions(stampArgs());
+    const relaunch = relaunchArgv(["/opt/suite/bun", "/opt/suite/src/cli.ts"], o, STUB_OPENCLAW, FIRST_STAMP_PORT);
+    expect(await runOpenclaw(relaunch.slice(3), makeDeps())).toBe(2);
+  });
+
+  test("a harness install that ran before a port refusal is reported, and changed:true", async () => {
+    let server: Server | null = null;
+    let port = 0;
+    for (let p = 19500; p < 19600 && server === null; p++) {
+      if (await probePortInUse(p)) continue;
+      const s = createServer();
+      await new Promise<void>((ok) => s.listen(p, "127.0.0.1", ok));
+      server = s;
+      port = p;
+    }
+    try {
+      const args = stampArgs().filter((a, i, all) => a !== "--openclaw" && all[i - 1] !== "--openclaw");
+      const which = (b: string) => (b === "openclaw" ? null : Bun.which(b, { PATH: baseEnv().PATH ?? "" }));
+      const { result, exitCode } = await stamp([...args, "--install-openclaw", "--gateway-port", String(port)], makeDeps({ which, portInUse: probePortInUse }));
+      expect(exitCode).toBe(2);
+      expect(result.error?.code).toBe("port_in_use");
+      expect(result.actions).toEqual([{ kind: "harness_install", target: expect.stringContaining(OPENCLAW_PACKAGE), outcome: "written", applied: true }]);
+      expect(result.changed).toBe(true);
+      expect(existsSync(join(root, ".suite-stamp.json"))).toBe(false);
+    } finally {
+      await new Promise<void>((ok) => (server as Server).close(() => ok()));
+    }
+  });
+});
+
 describe("idempotence and repair", () => {
   test("a second identical run is changed:false with zero writes", async () => {
     await stamp();
@@ -503,6 +632,7 @@ describe("idempotence and repair", () => {
     expect(result.changed).toBe(false);
     expect(result.actions.filter((a) => a.outcome !== "unchanged")).toEqual([]);
     expect(writes(stubCalls().slice(before))).toEqual([]);
+    expect(stubCalls().slice(before).filter((c) => c.argv[0] === "config" && c.argv[1] === "set")).toHaveLength(0);
     expect(npmCalls().length).toBe(npmBefore);
     expect(readFileSync(configPathFor(root), "utf8")).toBe(cfgBefore);
   });

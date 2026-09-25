@@ -47,7 +47,24 @@ export interface StampAction {
   /** What it writes to: a path, a config key, a package. Never a value. */
   target: string;
   outcome: ActionOutcome;
+  /**
+   * Whether the disk now holds what `outcome` names. MEASURED, not planned:
+   * a write is `applied` only once it has been performed (and, where the
+   * writer can check, read back); an `unchanged` action is applied because
+   * nothing had to be written. A run that stops part-way reports the writes
+   * it never reached as `applied: false`, so a failed stamp does not claim
+   * writes that did not happen.
+   */
+  applied: boolean;
 }
+
+/** A planned action: not applied until a writer performs it. `unchanged` needs no write. */
+export function planned(kind: string, target: string, outcome: ActionOutcome): StampAction {
+  return { kind, target, outcome, applied: outcome === "unchanged" };
+}
+
+/** Whether an action changed the disk in this run. */
+export const changedTheDisk = (a: StampAction): boolean => a.applied && a.outcome !== "unchanged";
 
 export type Verdict = "pass" | "fail" | "unparseable";
 

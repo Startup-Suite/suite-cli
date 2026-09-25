@@ -15,6 +15,12 @@
  *   version  the --version line
  *   check    ok | missing | garbage
  *   mcp      ok | zero | fail | garbage
+ *   activation  ok (default) | none | garbage | switch — `--run-module pm.environments`,
+ *            which at fdec926e prints Hermes's activation environment as JSON
+ *            with PYTHONPATH `<repo>:<venv>/lib/python3.14/site-packages` of
+ *            the committed venv (here: the one under installs/, if any).
+ *            `switch`: environment e1 until the channel plugin is installed,
+ *            e2 after, as a real plugin install with Python deps commits a new one
  *
  * State is $HERMES_HOME/config.yaml as real YAML. `config set` coerces a
  * digits-only value to an integer and a JSON list/object to structure, as the
@@ -72,7 +78,32 @@ const die = (msg: string, code = 1): never => {
 };
 
 const [a0, a1, a2, a3] = argv;
-if (a0 === "--version") {
+if (a0 === "--run-module" && a1 === "pm.environments") {
+  const mode = knobs.activation ?? "ok";
+  if (mode === "garbage") {
+    console.log("not json");
+    process.exit(0);
+  }
+  const { readdirSync } = await import("node:fs");
+  const installs = join(HH, "installs");
+  let venv: string | null = null;
+  if (mode === "switch") {
+    const e = existsSync(join(HH, "plugins", "startup-suite-platform")) ? "e2" : "e1";
+    const v = join(installs, "i1", "environments", e, "venv");
+    if (existsSync(join(v, "bin", "python"))) venv = v;
+  } else if (mode === "ok" && existsSync(installs)) {
+    for (const a of readdirSync(installs)) {
+      const envs = join(installs, a, "environments");
+      if (!existsSync(envs)) continue;
+      for (const b of readdirSync(envs)) if (existsSync(join(envs, b, "venv", "bin", "python"))) venv = join(envs, b, "venv");
+    }
+  }
+  if (venv === null) {
+    process.stderr.write("RuntimeError: no committed dependency environment\n");
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ HOME, HERMES_HOME: HH, PYTHONPATH: `${join(HH, "hermes-agent")}:${venv}/lib/python3.14/site-packages` }));
+} else if (a0 === "--version") {
   console.log(knobs.version ?? "Hermes Agent vgit.fdec926 (2026.9.24) · upstream fdec926e");
   console.log("Python: 3.14.7");
 } else if (a0 === "config" && a1 === "get") {

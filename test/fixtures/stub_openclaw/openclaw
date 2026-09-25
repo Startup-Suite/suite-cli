@@ -6,14 +6,23 @@
  * and OUTPUT SHAPES of the real CLI at 2026.9.4 (3a9d69d), measured on hive in
  * a throwaway OPENCLAW_STATE_DIR (see the parsers in src/commands/openclaw.ts):
  *
- *   config get <p> --json   exit 0 + the value as JSON (a string too: `"local"`); exit 1 + {"ok":false,
+ *   config get <p> --json   exit 0 + the value as JSON (a string too: `"local"`), with an account's
+ *                           `token` REDACTED and its schema defaults ADDED, exactly as the capture
+ *                           in ../openclaw-2026.9.4/config-get-account.json shows; exit 1 + {"ok":false,
  *                           "error":{"message":"Config path is valid but unset: <p>. ..."}}
  *                           or "Unknown config path: <p>. ..." for channels.startup-suite.*
  *                           before the plugin is linked
  *   config validate --json  {"valid":true,"path":..,"warnings":[]} exit 0, or
  *                           {"ok":false,..,"valid":false,..,"issues":[..]} exit 1
  *                           (a binding naming an agent absent from agents.entries is invalid)
- *   plugins doctor --json   {"ok":true,"pluginErrors":[],"diagnostics":[],...}
+ *   plugins doctor --json   {"ok":true,"pluginErrors":[],"diagnostics":[],...}; ok:false with a
+ *                           `plugins.entries.<id>: plugin disabled (not in allowlist) but config is
+ *                           present` warning for an entry plugins.allow shuts out (captured:
+ *                           ../openclaw-2026.9.4/plugins-doctor.allow-ours-only.json)
+ *   plugins list --json     the bundled plugins of ../openclaw-2026.9.4/plugins-list.onboard.json,
+ *                           plus this plugin once linked. plugins.allow is EXCLUSIVE: once set,
+ *                           a bundled plugin loads only if named in it (memory-core excepted,
+ *                           as measured)
  *   plugins inspect <id>    {"ok":false,"error":{"message":"Plugin not found: ..."}} when absent
  *
  * and the `plugins install` rules READ FROM SOURCE at 3a9d69d: a local path
@@ -103,6 +112,47 @@ const flag = (name: string): string | undefined => {
 
 const [a0, a1, a2] = argv;
 
+// The npm stub copies this file elsewhere; the fixtures sit beside the original.
+const stubPathFile = join(HOME, "stub-openclaw-path");
+const CAPTURED = join(dirname(existsSync(stubPathFile) ? readFileSync(stubPathFile, "utf8").trim() : import.meta.path), "..", "openclaw-2026.9.4");
+const capturedAccount = JSON.parse(readFileSync(join(CAPTURED, "config-get-account.json"), "utf8")) as Obj;
+const REDACTED = capturedAccount.token as string;
+/** The keys `config get` adds to an account that does not set them, with the captured values. */
+const ACCOUNT_DEFAULTS: Obj = Object.fromEntries(
+  Object.entries(capturedAccount).filter(([k]) => !["url", "runtimeId", "token", "autoJoinSpaces"].includes(k)),
+);
+const bundled = (JSON.parse(readFileSync(join(CAPTURED, "plugins-list.onboard.json"), "utf8")) as { plugins: Obj[] }).plugins;
+/** Loaded even under an allowlist that omits it (measured: 1 of 39 survives allow=[ours]). */
+const ALWAYS_LOADED = new Set(["memory-core"]);
+const OURS = "startup-suite-channel-plugin";
+
+/** What `config get` prints for a value: accounts redacted and defaulted, as 2026.9.4 does. */
+const asGot = (path: string, v: unknown): unknown => {
+  const account = (a: unknown): unknown => (isObj(a) ? { ...a, ...Object.fromEntries(Object.entries(ACCOUNT_DEFAULTS).filter(([k]) => !(k in a))), ...(typeof a.token === "string" ? { token: REDACTED } : {}) } : a);
+  const parts = path.split(".");
+  if (parts[0] !== "channels" || parts[1] !== "startup-suite") return v;
+  if (parts.length === 5 && parts[2] === "accounts" && parts[4] === "token") return typeof v === "string" ? REDACTED : v;
+  if (parts.length === 4 && parts[2] === "accounts") return account(v);
+  if (parts.length === 3 && parts[2] === "accounts" && isObj(v)) return Object.fromEntries(Object.entries(v).map(([k, a]) => [k, account(a)]));
+  if (parts.length === 2 && isObj(v) && isObj(v.accounts)) return { ...v, accounts: asGot("channels.startup-suite.accounts", v.accounts) };
+  return v;
+};
+
+/** The plugin list OpenClaw would print for this config. */
+const pluginList = (d: Obj): Obj[] => {
+  const allow = get(d, "plugins.allow");
+  const allowed = (id: string): boolean => !Array.isArray(allow) || allow.includes(id) || ALWAYS_LOADED.has(id);
+  const rows = bundled.map((p) => {
+    const enabled = p.enabled === true && allowed(p.id as string);
+    return { ...p, enabled, status: enabled ? "loaded" : "disabled" };
+  });
+  if (pluginLinked(d)) {
+    const enabled = allowed(OURS) && get(d, `plugins.entries.${OURS}.enabled`) !== false;
+    rows.unshift({ id: OURS, enabled, status: enabled ? "loaded" : "disabled", origin: "config" });
+  }
+  return rows;
+};
+
 if (a0 === "--version") {
   out(knobs.version ?? "OpenClaw 2026.9.4 (3a9d69d)");
   process.exit(0);
@@ -124,6 +174,9 @@ if (a0 === "onboard") {
   set(d, "gateway.port", Number(flag("--gateway-port") ?? "18789"));
   set(d, `agents.entries.${id}`, { name: flag("--agent-name"), workspace: flag("--workspace") });
   set(d, "agents.defaults.model", { primary: `custom/${flag("--custom-model-id")}` });
+  // MEASURED: onboard writes config entries for two bundled model plugins.
+  set(d, "plugins.entries.anthropic", { config: { sessionCatalog: { enabled: false } } });
+  set(d, "plugins.entries.codex", { config: { sessionCatalog: { enabled: false } } });
   set(d, "models.providers.custom", {
     baseUrl: flag("--custom-base-url"),
     api: flag("--custom-compatibility"),
@@ -149,7 +202,7 @@ if (a0 === "config" && a1 === "get") {
     cliError(`Config path is valid but unset: ${path}. The runtime default applies until you set an authored value with openclaw config set ${path} <value>.`);
   }
   // --json prints every value as JSON, strings included (measured: `"local"`).
-  out(JSON.stringify(v, null, 2));
+  out(JSON.stringify(asGot(path, v), null, 2));
   process.exit(0);
 }
 
@@ -215,13 +268,32 @@ if (a0 === "plugins" && a1 === "install") {
   process.exit(0);
 }
 
+if (a0 === "plugins" && a1 === "list" && argv.includes("--json")) {
+  if (knobs.list === "garbage") {
+    out("59 plugins");
+    process.exit(0);
+  }
+  out({ workspaceDir: "<state>/workspace", workspaceScope: "selected", registry: { source: "derived", diagnostics: [] }, plugins: pluginList(read()), diagnostics: [] });
+  process.exit(0);
+}
+
 if (a0 === "plugins" && a1 === "doctor") {
   if (knobs.doctor === "garbage") {
     out("everything is probably fine");
     process.exit(0);
   }
+  const d = read();
   const errs = knobs.doctor === "error" ? [{ pluginId: "startup-suite-channel-plugin", message: "failed to load" }] : [];
-  out({ ok: errs.length === 0, pluginErrors: errs, diagnostics: [], sourceShadowing: [], compatibility: [], configurationWarnings: [] });
+  const rows = new Map(pluginList(d).map((p) => [p.id as string, p]));
+  const entries = get(d, "plugins.entries");
+  const warnings: string[] = [];
+  for (const [id, entry] of Object.entries(isObj(entries) ? entries : {})) {
+    const bundledRow = bundled.find((p) => p.id === id);
+    if (bundledRow?.enabled === true && rows.get(id)?.enabled === false && isObj(entry) && "config" in entry) {
+      warnings.push(`- plugins.entries.${id}: plugin disabled (not in allowlist) but config is present`);
+    }
+  }
+  out({ ok: errs.length === 0 && warnings.length === 0, pluginErrors: errs, diagnostics: [], sourceShadowing: [], compatibility: [], configurationWarnings: warnings });
   process.exit(0);
 }
 

@@ -18,6 +18,15 @@ behaviour anyone was relying on.
   and neither verb installs, starts or restarts a daemon. The runtime token is
   accepted only by reference (`--token-ref file:<path>` or
   `--token-ref keychain:<item> --keychain-service <svc>`); a literal is refused.
+- **Stamp results report what happened, not what was planned.** Each action
+  carries `applied`; a failed run lists the writes it never reached as
+  `applied: false`, and a harness install that ran before a refusal is still
+  listed. A run that fails after its first write records `fail` in
+  `.suite-stamp.json`, so `suite status` and `--gateway-only` never act on an
+  older `pass`.
+- **A signalled gateway wrapper takes its gateway down.** The session exec
+  forwards SIGTERM and SIGHUP (and SIGINT when no terminal delivered it) to the
+  child and waits for it, instead of leaving it orphaned.
 - **`--stamp-only` is a stable machine contract** for callers such as core's
   installer `setup channel` step: one JSON document on stdout
   (`contract_version: 1`, additive changes only), and exit codes 0 ok, 1 failed,

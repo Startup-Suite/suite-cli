@@ -76,6 +76,7 @@ import {
   EXIT_FAILED,
   EXIT_REFUSED,
   StampFailure,
+  planned,
   redact,
   refused,
   type HumanStep,
@@ -94,7 +95,7 @@ import {
 } from "../token_ref.ts";
 import type { TmuxDeps } from "../tmux.ts";
 import { classifyPullFailure, noGitPrompt, pullRemedyLines } from "./init.ts";
-import { recordLaunch, liveRestoreDeps, type RestoreDeps } from "./restore.ts";
+import { loadRoster, recordLaunch, liveRestoreDeps, type RestoreDeps } from "./restore.ts";
 import {
   liveDeepseekDeps,
   runInSession,
@@ -110,15 +111,29 @@ type Env = Record<string, string | undefined>;
 /* Pins and names                                                             */
 /* ------------------------------------------------------------------------- */
 
-/** Startup-Suite/hermes-suite-channel main, merged 2026-09-25 (core #1094). */
-export const HERMES_CHANNEL_REF = "bda77344d5dfacdcd4114df1e79e534ad5dba618";
+/**
+ * DEPLOYER: BUMP THIS BEFORE suite-cli MERGES.
+ *
+ * This is the stage-6 BRANCH TIP of Startup-Suite/hermes-suite-channel
+ * (`task/01a0d8f8-7fcb-7001-9cf4-6edb07e43c8f`: the #!/bin/sh launcher fix
+ * and `--python`, on top of main bda77344), which is NOT merged yet. The
+ * installer at bda77344 refuses `--python` as an unknown argument, and this
+ * verb always passes it, so the old pin cannot work either. A squash merge
+ * creates a new sha and deletes the branch, so this pin would dangle: after
+ * that PR squash-merges, replace this value with the squash sha on
+ * hermes-suite-channel main.
+ */
+export const HERMES_CHANNEL_REF = "61e8b603c379cf18e3f7b83562fb51d13c26a979";
 export const HERMES_CHANNEL_REPO = "https://github.com/Startup-Suite/hermes-suite-channel.git";
 
 /** The hermes-agent commit the config shape below was measured against. */
 export const HERMES_AGENT_REF = "fdec926ef54391edcf6caad5f7f6761fdcccdaa2";
 export const HERMES_INSTALLER_URL = `https://raw.githubusercontent.com/NousResearch/hermes-agent/${HERMES_AGENT_REF}/scripts/install.sh`;
 
-/** `hermes --version` at fdec926e prints `... · upstream fdec926e`; this is that token. */
+/**
+ * The harness version this writer reports is the LOCAL commit of the install,
+ * 8 hex characters: the one its config shape was measured against.
+ */
 export const MEASURED_HERMES_VERSIONS = [HERMES_AGENT_REF.slice(0, 8)] as const;
 
 export const WRITER_VERSION = 1;
@@ -312,17 +327,55 @@ const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g;
 const stripAnsi = (s: string): string => s.replace(ANSI, "");
 
 /**
- * The version token from `hermes --version`. MEASURED at fdec926e:
+ * The version token from `hermes --version`: the LOCAL commit.
+ *
+ * MEASURED at fdec926e, two shapes of the first line:
+ *   Hermes Agent v0.21.5+2164.gfdec926 (2026.9.24) · upstream 346c14a9
  *   Hermes Agent vgit.fdec926 (2026.9.24) · upstream fdec926e
- * The `upstream <sha>` token is preferred (8 chars), then `vX`, then the line.
+ * `upstream <sha>` is the REMOTE tip Hermes last fetched, not what is
+ * installed: on the first shape it named a commit 49 ahead of the pinned one,
+ * so every run warned "config shape unverified" on the exact pinned install.
+ * It is never used. The local commit is the `g<sha>` of the git-describe
+ * version, or the `git.<sha>` of an untagged one; a prefix of the pinned
+ * commit is reported as the pinned commit's 8-character form. Otherwise the
+ * `vX` token, then the whole line.
  */
 export function parseHermesVersion(stdout: string): string {
   const first = stripAnsi(stdout).split("\n").find((l) => l.trim() !== "")?.trim() ?? "";
-  const up = /upstream\s+([0-9a-f]{7,40})\b/.exec(first);
-  if (up?.[1] !== undefined) return up[1].slice(0, 8);
+  const local = /Hermes Agent v(?:git\.|\S*?\.g)([0-9a-f]{7,40})\b/.exec(first)?.[1];
+  if (local !== undefined) return HERMES_AGENT_REF.startsWith(local) ? HERMES_AGENT_REF.slice(0, 8) : local.slice(0, 8);
   const v = /Hermes Agent v(\S+)/.exec(first);
   if (v?.[1] !== undefined) return v[1];
   return first === "" ? "unknown" : first;
+}
+
+/** The `Install directory: <path>` line of `hermes --version`, when it prints one. */
+export function parseHermesInstallDir(stdout: string): string | null {
+  const m = /^Install directory:\s*(\S.*?)\s*$/m.exec(stripAnsi(stdout));
+  return m?.[1] ?? null;
+}
+
+/**
+ * The interpreter of the dependency environment Hermes selects, from what
+ * `hermes --run-module pm.environments` prints: Hermes's own activation
+ * environment as JSON (pm/environments.py `__main__` at fdec926e), whose
+ * PYTHONPATH is `<repo>:<venv>/lib/pythonX.Y/site-packages`. Null when the
+ * output does not have that shape.
+ */
+export function pythonFromActivation(stdout: string): string | null {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(stdout.trim());
+  } catch {
+    return null;
+  }
+  const pp = doc !== null && typeof doc === "object" ? (doc as Record<string, unknown>).PYTHONPATH : undefined;
+  if (typeof pp !== "string") return null;
+  for (const entry of pp.split(":")) {
+    const m = /^(.*)\/lib\/python[0-9.]+\/site-packages\/?$/.exec(entry);
+    if (m?.[1] !== undefined) return join(m[1], "bin", "python");
+  }
+  return null;
 }
 
 /**
@@ -583,10 +636,13 @@ export function resolveHermesBin(opts: HermesOptions, deps: Pick<HermesDeps, "wh
 }
 
 /**
- * The interpreter Hermes's MCP client runs in: the per-home managed env
- * (`installs/<id>/environments/<id>/venv`, newest first), else what the
- * channel installer's `find_hermes_python` would pick (the launcher's
- * shebang, through `env` when it uses one), else python3 on PATH.
+ * The interpreter Hermes's MCP client runs in, when Hermes itself cannot be
+ * asked (see `pythonFromActivation`, which is tried first): the per-home
+ * managed env (`installs/<id>/environments/<id>/venv`, newest first), else a
+ * PYTHON launcher's shebang (through `env` when it uses one), else python3 on
+ * PATH. A launcher whose shebang is a shell is a wrapper, not an interpreter:
+ * at fdec926e every Hermes launcher is `#!/bin/sh`, and running
+ * `/bin/sh -c 'import sys'` is how the channel installer failed.
  */
 export function findHermesPython(home: string, bin: string, deps: Pick<HermesDeps, "which">): string {
   const installs = join(home, "installs");
@@ -609,7 +665,7 @@ export function findHermesPython(home: string, bin: string, deps: Pick<HermesDep
       const words = first.slice(2).trim().split(/\s+/);
       let interp = words[0] ?? "";
       if (basename(interp) === "env" && words[1] !== undefined) interp = deps.which(words[1]) ?? "";
-      if (interp !== "" && isExecutable(interp)) return interp;
+      if (interp !== "" && /^python/.test(basename(interp)) && isExecutable(interp)) return interp;
     }
   } catch {
     // unreadable launcher: fall through
@@ -764,6 +820,11 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
       o.hermesHome,
       "--hermes",
       bin,
+      // The interpreter this verb already resolved (and installs the mcp SDK
+      // into). The launcher is a #!/bin/sh wrapper at fdec926e, so the
+      // installer must not have to guess it from a shebang.
+      "--python",
+      state.python as string,
       ...(o.allowedUsers !== undefined ? ["--allowed-users", o.allowedUsers] : ["--allow-all-users"]),
       ...(inputs.tokenRef.kind === "file" ? ["--token-file", inputs.tokenRef.path] : []),
     ];
@@ -787,6 +848,22 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
     if (lastLine(r.stdout) !== INSTALLER_RESULT_LINE) {
       throw fail("channel_install_unparseable", `the hermes-suite-channel installer did not end with "${INSTALLER_RESULT_LINE}": ${lastLine(r.stdout)}`);
     }
+  }
+
+  /**
+   * Ask Hermes which interpreter its dependencies live in. The only answer
+   * that is Hermes's own: the launcher is a shell wrapper, and the
+   * environment it selects is a generation PM chooses (installs/<key>/facts.json),
+   * which a directory scan can only approximate. Null when this Hermes does
+   * not answer (an older or non-PM install): the caller falls back.
+   * The output is Hermes's environment as JSON; only PYTHONPATH is read and
+   * nothing of it is logged.
+   */
+  async function askHermesPython(bin: string): Promise<string | null> {
+    const r = await spawn([bin, "--run-module", "pm.environments"]);
+    if (r.exitCode !== 0) return null;
+    const py = pythonFromActivation(r.stdout);
+    return py !== null && isExecutable(py) ? py : null;
   }
 
   async function importsMcp(py: string): Promise<boolean> {
@@ -836,7 +913,24 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
       state.bin = bin;
       const r = await spawn([bin, "--version"]);
       if (r.exitCode !== 0) throw fail("harness_broken", `${bin} --version exited ${r.exitCode}: ${lastLine(r.stderr || r.stdout)}`);
+      // The install's own commit, from git, when it is a git checkout; the
+      // --version line's local token otherwise (never its `upstream` token).
+      const dir = parseHermesInstallDir(r.stdout);
+      if (dir !== null && existsSync(join(dir, ".git"))) {
+        const head = await spawn(["git", "-C", dir, "rev-parse", "HEAD"], { env: gitEnv(deps) });
+        const sha = head.stdout.trim();
+        if (head.exitCode === 0 && /^[0-9a-f]{40}$/.test(sha)) return sha.slice(0, 8);
+      }
       return parseHermesVersion(r.stdout);
+    },
+
+    performed() {
+      if (!state.installedNow) return [];
+      const home = opts().hermesHome;
+      return [
+        { kind: "harness_install", target: `${join(home, "hermes-agent")}@${HERMES_AGENT_REF.slice(0, 8)}`, outcome: "written", applied: true },
+        { kind: "upstream_outside_hermes_home", target: OUTSIDE_HOME_WRITES, outcome: "written", applied: true },
+      ];
     },
 
     needsTokenValue(ref: TokenRef) {
@@ -855,41 +949,27 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
       // restoring it is a repair, not a first write.
       state.stampedBefore = (await readStampRecord(o.root)) !== null;
       const absent = state.stampedBefore ? "repaired" : "written";
-      if (state.installedNow) {
-        actions.push({ kind: "harness_install", target: `${join(home, "hermes-agent")}@${HERMES_AGENT_REF.slice(0, 8)}`, outcome: "written" });
-        actions.push({ kind: "upstream_outside_hermes_home", target: OUTSIDE_HOME_WRITES, outcome: "written" });
-      }
 
       const head = await gitHead();
-      actions.push({
-        kind: "plugin_checkout",
-        target: `${checkout()}@${channelRef}`,
-        outcome: head === null ? "written" : head === channelRef ? "unchanged" : "repaired",
-      });
+      actions.push(planned("plugin_checkout", `${checkout()}@${channelRef}`, head === null ? "written" : head === channelRef ? "unchanged" : "repaired"));
 
       state.before = channelFingerprints(home);
       for (const part of CHANNEL_PARTS) {
-        const a: StampAction = {
-          kind: part,
-          target: channelPartTarget(part, home),
-          outcome: state.before[part] === null ? absent : "unchanged",
-        };
+        const a = planned(part, channelPartTarget(part, home), state.before[part] === null ? absent : "unchanged");
         state.channelActions.set(part, a);
         actions.push(a);
       }
 
-      const py = findHermesPython(home, bin, deps);
+      const py = (await askHermesPython(bin)) ?? findHermesPython(home, bin, deps);
       state.python = py;
-      actions.push({ kind: "mcp_sdk", target: `${py} ${MCP_SDK_PIN}`, outcome: (await importsMcp(py)) ? "unchanged" : absent });
+      actions.push(planned("mcp_sdk", `${py} ${MCP_SDK_PIN}`, (await importsMcp(py)) ? "unchanged" : absent));
 
       const config = readHermesConfig(home);
       for (const [key, value] of desiredModelKeys(o)) {
         const current = lookupKey(config, key);
-        actions.push({
-          kind: "config_set",
-          target: key,
-          outcome: current === undefined || current === null ? absent : sameConfigValue(current, value) ? "unchanged" : "repaired",
-        });
+        actions.push(
+          planned("config_set", key, current === undefined || current === null ? absent : sameConfigValue(current, value) ? "unchanged" : "repaired"),
+        );
       }
 
       if (o.modelApiKeyRef !== undefined) {
@@ -900,11 +980,7 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
         assertEnvValue("the model API key", value);
         const envPath = join(home, ".env");
         const current = envKeyValue(existsSync(envPath) ? readFileSync(envPath, "utf8") : null, MODEL_KEY_ENV);
-        actions.push({
-          kind: "env_key",
-          target: `${envPath}:${MODEL_KEY_ENV}`,
-          outcome: current === undefined ? absent : current === value ? "unchanged" : "repaired",
-        });
+        actions.push(planned("env_key", `${envPath}:${MODEL_KEY_ENV}`, current === undefined ? absent : current === value ? "unchanged" : "repaired"));
       }
       return actions;
     },
@@ -916,17 +992,59 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
       mkdirSync(home, { recursive: true, mode: 0o700 });
 
       const co = actions.find((a) => a.kind === "plugin_checkout");
-      if (co !== undefined && co.outcome !== "unchanged") await ensureCheckout();
+      if (co !== undefined && co.outcome !== "unchanged") {
+        await ensureCheckout();
+        co.applied = true;
+      }
 
       // Always run: the installer is idempotent, and it IS the repair path
-      // for a deleted MCP entry or a changed runtime id.
-      await runInstaller(inputs);
-      const after = channelFingerprints(home);
-      const before = state.before as Record<ChannelPart, string | null>;
-      for (const part of CHANNEL_PARTS) {
-        const a = state.channelActions.get(part) as StampAction;
-        a.outcome =
-          after[part] === before[part] ? "unchanged" : before[part] === null && !state.stampedBefore ? "written" : "repaired";
+      // for a deleted MCP entry or a changed runtime id. Its parts are
+      // MEASURED afterwards, and also when it fails part-way: a part it did
+      // change is reported as changed, and a part it never reached as not
+      // applied.
+      const measureParts = (): void => {
+        const after = channelFingerprints(home);
+        const before = state.before as Record<ChannelPart, string | null>;
+        for (const part of CHANNEL_PARTS) {
+          const a = state.channelActions.get(part) as StampAction;
+          if (after[part] !== before[part]) {
+            a.outcome = before[part] === null && !state.stampedBefore ? "written" : "repaired";
+            a.applied = true;
+          } else if (a.outcome === "unchanged" || after[part] !== null) {
+            a.outcome = "unchanged";
+            a.applied = true;
+          }
+        }
+      };
+      try {
+        await runInstaller(inputs);
+      } finally {
+        measureParts();
+      }
+      // Installing a plugin with Python dependencies makes Hermes commit a NEW
+      // dependency venv (MEASURED on a fresh fdec926e install: the generation
+      // named in installs/<key>/facts.json changed during `hermes plugins
+      // install`). The MCP command registered a moment ago then names the old
+      // one, and the next run would "repair" it. Ask again, and register the
+      // one Hermes now selects.
+      const selected = await askHermesPython(bin);
+      if (selected !== null && selected !== state.python) {
+        deps.stderr(`suite: Hermes selected a new dependency environment while installing the plugin; registering the MCP bridge with ${selected}\n`);
+        state.python = selected;
+        // The SDK check moves to the new interpreter; the step below installs it if missing.
+        const sdkAction = actions.find((a) => a.kind === "mcp_sdk");
+        if (sdkAction !== undefined) {
+          const has = await importsMcp(selected);
+          sdkAction.target = `${selected} ${MCP_SDK_PIN}`;
+          if (has) sdkAction.outcome = "unchanged";
+          else if (sdkAction.outcome === "unchanged") sdkAction.outcome = state.stampedBefore ? "repaired" : "written";
+          sdkAction.applied = has;
+        }
+        try {
+          await runInstaller(inputs);
+        } finally {
+          measureParts();
+        }
       }
       const tokenPath = tokenFilePath(home);
       let mode = -1;
@@ -949,7 +1067,10 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
       }
 
       const sdk = actions.find((a) => a.kind === "mcp_sdk");
-      if (sdk !== undefined && sdk.outcome !== "unchanged") await installMcp(state.python as string);
+      if (sdk !== undefined && sdk.outcome !== "unchanged") {
+        await installMcp(state.python as string);
+        sdk.applied = true;
+      }
 
       const wanted = new Map(desiredModelKeys(o));
       for (const a of actions) {
@@ -963,6 +1084,8 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
         if (!sameConfigValue(lookupKey(config, key), value)) {
           throw fail("config_set_ineffective", `hermes config set ${key} exited 0 but config.yaml does not hold the value`);
         }
+        const a = actions.find((x) => x.kind === "config_set" && x.target === key);
+        if (a !== undefined) a.applied = true;
       }
 
       const envKey = actions.find((a) => a.kind === "env_key");
@@ -974,6 +1097,7 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
           writeFileSync(tmp, next, { mode: 0o600 });
           chmodSync(tmp, 0o600);
           renameSync(tmp, envPath);
+          envKey.applied = true;
         }
         state.warnings.push(
           `the model API key is stored in ${join(home, ".env")} as ${MODEL_KEY_ENV}; Hermes copies .env into os.environ ` +
@@ -1140,6 +1264,7 @@ export async function runHermes(args: string[], deps: HermesDeps): Promise<numbe
     onCreated: (createArgv) => {
       if (deps.restore) recordLaunch(deps.restore, home, { session, command: createArgv, cwd: opts.root, kind: "hermes" });
     },
+    wasRecorded: () => deps.restore !== undefined && loadRoster(deps.restore, home).some((e) => e.session === session),
   });
 }
 

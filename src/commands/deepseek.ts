@@ -25,6 +25,7 @@
  *     name a plugin path that is correct on two machines, so the patch is
  *     written at run time with this machine's resolved paths baked in.
  */
+import { runForwardingSignals } from "../child_signals.ts";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -514,6 +515,13 @@ export interface SessionOptions {
   tmux?: TmuxDeps;
   /** Called with the exact `tmux new-session` argv once a session was created. */
   onCreated?(createArgv: string[]): void;
+  /**
+   * Whether the roster records this session as launched. tmux reports `none`
+   * for an agent that died with its pane (the server exits with its last
+   * session), and `suite status` calls that `stale`; the relaunch then says so
+   * rather than announcing a first start.
+   */
+  wasRecorded?(): boolean;
 }
 
 export async function runInSession(
@@ -542,6 +550,8 @@ export async function runInSession(
   if (state === "stale") {
     deps.stderr.write(`suite: recycling stale session ${session}\n`);
     await tmux.run([TMUX, "kill-session", "-t", session]);
+  } else if (state === "none" && options.wasRecorded?.() === true) {
+    deps.stderr.write(`suite: previous session ${session} was stale (recorded, no longer running); relaunching\n`);
   }
 
   if (state !== "live") {
@@ -631,10 +641,9 @@ export function liveDeepseekDeps(): DeepseekDeps {
       const proc = Bun.spawn(argv, { cwd: opts.cwd, env: { ...process.env, ...(opts.env ?? {}) }, stdout: "inherit", stderr: "inherit" });
       return await proc.exited;
     },
-    exec: async (argv, opts) => {
-      const proc = Bun.spawn(argv, { cwd: opts.cwd, env: opts.env, stdout: "inherit", stderr: "inherit", stdin: "inherit" });
-      return await proc.exited;
-    },
+    // Forwards SIGTERM/SIGHUP (and SIGINT without a terminal) to the child and
+    // waits for it: a signalled wrapper must not leave the harness orphaned.
+    exec: async (argv, opts) => await runForwardingSignals(argv, { cwd: opts.cwd, env: opts.env }),
     stderr: process.stderr,
   };
 }
