@@ -1,6 +1,15 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, describe, expect, test } from "bun:test";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
+  agentLine,
+  agentNameForKind,
   formatAge,
+  lastVerdict,
+  readFileOrNull,
+  recordedState,
+  type StatusDeps,
   listSessionsArgv,
   ownSessions,
   parseSessions,
@@ -10,7 +19,11 @@ import {
 import type { DoctorDeps } from "../src/commands/doctor.ts";
 import { CHANNEL_SERVER, TOOLS_SERVER } from "../src/commands/init.ts";
 import { emptyConfig, type SuiteConfig } from "../src/config.ts";
-import { SESSION_PREFIX } from "../src/tmux.ts";
+import { SESSION_PREFIX, detectState, killSessionArgv, liveTmuxDeps, newSessionArgv } from "../src/tmux.ts";
+import { rosterPath, serializeRoster, type RosterEntry } from "../src/roster.ts";
+import { STAMP_FILE } from "../src/stamp.ts";
+import { HERMES_AGENT_COMM } from "../src/commands/hermes.ts";
+import { OPENCLAW_GATEWAY_COMM } from "../src/commands/openclaw.ts";
 
 /** Invented, like every other fixture value in this public repository. */
 const SUITE_URL = "https://suite.example.invalid";
@@ -211,5 +224,265 @@ describe("session listing primitives", () => {
     expect(sessionLine(row, "stale", NOW, { color: false, utf8: false })).toContain("X");
     // Off-TTY / NO_COLOR: not one escape byte.
     expect(stale).not.toMatch(/\[\d+m/);
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* Stamped agents: hermes and openclaw (01a0d8f8 stage 5)                     */
+/* ------------------------------------------------------------------------- */
+
+describe("stamped-agent primitives", () => {
+  test("each kind is looked for under its MEASURED process name", () => {
+    expect(agentNameForKind("hermes")).toBe(HERMES_AGENT_COMM);
+    expect(agentNameForKind("openclaw")).toBe(OPENCLAW_GATEWAY_COMM);
+    expect(agentNameForKind("claude")).toBe("claude");
+    expect(agentNameForKind("deepseek")).toBe("dsh");
+  });
+
+  /** A recorded agent with no session died; it did not never exist. */
+  test("a recorded agent with no session is stale, never none", () => {
+    expect(recordedState("none")).toBe("stale");
+    expect(recordedState("stale")).toBe("stale");
+    expect(recordedState("live")).toBe("live");
+  });
+
+  test("the verdict is the only thing read out of the stamp record", () => {
+    const record = JSON.stringify({ harness: "hermes", tokenRef: "file:/srv/secret/tok", verdict: "fail" });
+    expect(lastVerdict(record)).toBe("fail");
+    expect(lastVerdict(null)).toBe("none");
+    expect(lastVerdict("{nope")).toBe("unreadable");
+    expect(lastVerdict(JSON.stringify({ verdict: "maybe" }))).toBe("unreadable");
+  });
+
+  test("an agent line names session, kind, state, verdict and root", () => {
+    const line = agentLine(
+      { session: "suite-scribe", kind: "hermes", root: "/srv/agents/scribe", state: "stale", verdict: "pass" },
+      { color: false, utf8: true },
+    );
+    expect(line).toContain("✘");
+    for (const part of ["suite-scribe", "hermes", "stale", "stamp pass", "/srv/agents/scribe"]) expect(line).toContain(part);
+    expect(line).not.toMatch(/\[\d+m/);
+  });
+});
+
+/**
+ * Against a REAL tmux on a private socket ($TMUX_TMPDIR), as in tmux.test.ts:
+ * nothing here can list, create or kill anyone else's session.
+ *
+ * The gateway is a stub: `/bin/sleep` copied to a file named `hermes`, so `ps`
+ * reports comm=hermes exactly as the measured gateway does. The pane runs a
+ * shell that starts the stub and WAITS on it — the shape of the real session,
+ * whose pane process is the gateway relaunch awaiting its gateway child.
+ * Killing the stub by pid is the real kill; the test does not construct a
+ * state and hand it to status.
+ */
+const SOCKET_DIR = mkdtempSync(resolve(tmpdir(), "suite-status-tmux-"));
+const WORK_DIR = mkdtempSync(resolve(tmpdir(), "suite-status-work-"));
+const TMUX_ENV = { ...process.env, TMUX_TMPDIR: SOCKET_DIR, TMUX: "" };
+const realTmux = liveTmuxDeps(TMUX_ENV);
+const HAVE_TMUX = realTmux.which("tmux") !== null;
+const createdSessions = new Set<string>();
+
+afterAll(async () => {
+  for (const name of createdSessions) await realTmux.run(killSessionArgv(name));
+  rmSync(SOCKET_DIR, { recursive: true, force: true });
+  rmSync(WORK_DIR, { recursive: true, force: true });
+});
+
+async function until<T>(fn: () => Promise<T>, ok: (v: T) => boolean, ms = 10_000): Promise<T> {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    const v = await fn();
+    if (ok(v) || Date.now() > deadline) return v;
+    await Bun.sleep(100);
+  }
+}
+
+/** A stamped hermes root with a roster entry, on disk. */
+function stampedHermes(label: string, verdict: string): { session: string; home: string; root: string; stub: string } {
+  const session = `${SESSION_PREFIX}-s5-${label}-${Math.random().toString(36).slice(2, 8)}`;
+  createdSessions.add(session);
+  const home = join(WORK_DIR, session, "home");
+  const root = join(WORK_DIR, session, "scribe");
+  const bin = join(WORK_DIR, session, "bin");
+  for (const d of [home, root, bin]) mkdirSync(d, { recursive: true });
+  const stub = join(bin, HERMES_AGENT_COMM);
+  Bun.spawnSync(["cp", "/bin/sleep", stub]);
+  chmodSync(stub, 0o755);
+  writeFileSync(
+    join(root, STAMP_FILE),
+    `${JSON.stringify({ harness: "hermes", writerVersion: 1, tokenRef: `file:${join(root, "token")}`, verdict }, null, 2)}\n`,
+  );
+  const entry: RosterEntry = {
+    session,
+    command: ["tmux", "new-session", "-d", "-s", session, "-c", root, "suite", "hermes"],
+    cwd: root,
+    kind: "hermes",
+    recordedAt: "2026-09-25T00:00:00.000Z",
+  };
+  mkdirSync(join(home, ".local", "state", "suite"), { recursive: true });
+  writeFileSync(rosterPath(home), serializeRoster([entry]));
+  return { session, home, root, stub };
+}
+
+function realStatusDeps(home: string): StatusDeps & { lines: string[] } {
+  const lines: string[] = [];
+  return {
+    env: {},
+    cwd: WORK_DIR,
+    run: realTmux.run,
+    // claude is deliberately absent: this test is about the agents section,
+    // and must not call a real `claude mcp list`.
+    which: (name) => (name === "tmux" ? realTmux.which(name) : null),
+    exists: () => true,
+    config: config(),
+    configFile: join(home, "config.json"),
+    tmux: realTmux,
+    probe: async () => {
+      throw new Error("status does not probe the tools endpoint");
+    },
+    color: false,
+    utf8: true,
+    lines,
+    out: (line) => void lines.push(line),
+    home,
+    readFile: readFileOrNull,
+  };
+}
+
+test("the real-tmux status tests below are not silently skipped", () => {
+  expect(HAVE_TMUX || process.env.SUITE_CLI_ALLOW_NO_TMUX === "1").toBe(true);
+});
+
+describe.if(HAVE_TMUX)("status of a stamped agent, against a real tmux", () => {
+  test(
+    "a killed gateway reports stale, not healthy — and tmux alone would have said none",
+    async () => {
+      const { session, home, root, stub } = stampedHermes("kill", "pass");
+      const pidFile = join(root, "gateway.pid");
+      const script = `${JSON.stringify(stub)} 900 & echo $! > ${JSON.stringify(pidFile)}; wait $!`;
+      const start = await realTmux.run(newSessionArgv({ session, command: ["/bin/sh", "-c", script], cwd: root }));
+      expect(start.exitCode).toBe(0);
+
+      expect(await until(() => detectState(session, realTmux, HERMES_AGENT_COMM), (s) => s === "live")).toBe("live");
+      const before = realStatusDeps(home);
+      await runStatus(before, NOW);
+      const liveLine = before.lines.find((l) => l.includes(session)) ?? "";
+      expect(liveLine).toContain("live");
+      expect(liveLine).toContain("hermes");
+      expect(liveLine).toContain("stamp pass");
+      expect(liveLine).toContain(root);
+      // Listed once, under agents, not again as a Claude session.
+      expect(before.lines.filter((l) => l.includes(session))).toHaveLength(1);
+      expect(before.lines.join("\n")).not.toContain("Claude dead");
+
+      // The real kill: the stub, by the pid it recorded. Not a pattern.
+      const pid = (await Bun.file(pidFile).text()).trim();
+      expect(pid).toMatch(/^\d+$/);
+      expect(Bun.spawnSync(["kill", pid]).exitCode).toBe(0);
+
+      // MEASURED: with the gateway gone, the pane's process exits and the
+      // session vanishes, so tmux-only detection says `none`.
+      expect(await until(() => detectState(session, realTmux, HERMES_AGENT_COMM), (s) => s === "none")).toBe("none");
+
+      const after = realStatusDeps(home);
+      const code = await runStatus(after, NOW);
+      const line = after.lines.find((l) => l.includes(session)) ?? "";
+      expect(line).toContain("stale");
+      expect(line).not.toContain("live");
+      expect(line).toContain("✘");
+      expect(line).toContain("stamp pass");
+      expect(code).toBe(1);
+      createdSessions.delete(session);
+    },
+    60_000,
+  );
+
+  test(
+    "a dead gateway in a surviving shell is stale too",
+    async () => {
+      const { session, home, root, stub } = stampedHermes("shell", "fail");
+      const pidFile = join(root, "gateway.pid");
+      // The script lives in a FILE, so the shell's own args do not name the
+      // stub (a `sh -c '<...>/hermes ...'` would itself look like the agent),
+      // and the shell is NOT exec'd into sleep: it must stay the parent that
+      // reaps the killed stub, or a zombie `hermes` stays in the table.
+      const scriptFile = join(root, "pane.sh");
+      writeFileSync(scriptFile, `${JSON.stringify(stub)} 900 &\necho $! > ${JSON.stringify(pidFile)}\nsleep 900\n`);
+      const start = await realTmux.run(newSessionArgv({ session, command: ["/bin/sh", scriptFile], cwd: root }));
+      expect(start.exitCode).toBe(0);
+      expect(await until(() => detectState(session, realTmux, HERMES_AGENT_COMM), (s) => s === "live")).toBe("live");
+
+      const pid = (await until(async () => ((await Bun.file(pidFile).exists()) ? (await Bun.file(pidFile).text()).trim() : ""), (p) => p !== "")) as string;
+      expect(Bun.spawnSync(["kill", pid]).exitCode).toBe(0);
+      expect(await until(() => detectState(session, realTmux, HERMES_AGENT_COMM), (s) => s === "stale")).toBe("stale");
+
+      const deps = realStatusDeps(home);
+      const code = await runStatus(deps, NOW);
+      const line = deps.lines.find((l) => l.includes(session)) ?? "";
+      expect(line).toContain("stale");
+      expect(line).toContain("stamp fail");
+      expect(code).toBe(1);
+
+      await realTmux.run(killSessionArgv(session));
+      createdSessions.delete(session);
+    },
+    60_000,
+  );
+});
+
+describe("stamped agents in the fake-tmux status", () => {
+  /** A roster with one openclaw agent and its stamp record, on disk. Self-contained per test. */
+  function fakeStampedHome(label: string): { home: string; root: string; ref: string } {
+    const home = join(WORK_DIR, `fake-home-${label}`);
+    const root = join(WORK_DIR, `fake-root-${label}`);
+    mkdirSync(join(home, ".local", "state", "suite"), { recursive: true });
+    mkdirSync(root, { recursive: true });
+    const ref = `file:${join(root, "runtime-token")}`;
+    writeFileSync(join(root, STAMP_FILE), JSON.stringify({ harness: "openclaw", tokenRef: ref, verdict: "pass" }));
+    writeFileSync(
+      rosterPath(home),
+      serializeRoster([
+        { session: "suite-lobster", command: ["tmux", "new-session"], cwd: root, kind: "openclaw", recordedAt: "" },
+      ]),
+    );
+    return { home, root, ref };
+  }
+
+  test("status prints no secret: not the token ref, not a token value", async () => {
+    const { home, ref } = fakeStampedHome("secret");
+    const deps = fakeDeps() as StatusDeps & { lines: string[] };
+    deps.env = { SUITE_TOKEN: TOKEN };
+    deps.home = home;
+    deps.readFile = readFileOrNull;
+    const code = await runStatus(deps, NOW);
+    const text = deps.lines.join("\n");
+    expect(text).toContain("suite-lobster");
+    expect(text).toContain("openclaw");
+    expect(text).toContain("stale");
+    expect(text).not.toContain(ref);
+    expect(text).not.toContain("runtime-token");
+    expect(text).not.toContain(TOKEN);
+    expect(code).toBe(1);
+  });
+
+  test("an unfederated box still lists its stamped agents", async () => {
+    const { home } = fakeStampedHome("unfederated");
+    const deps = fakeDeps({ config: null }) as StatusDeps & { lines: string[] };
+    deps.home = home;
+    deps.readFile = readFileOrNull;
+    const code = await runStatus(deps, NOW);
+    expect(deps.lines.join("\n")).toContain("not federated");
+    expect(deps.lines.join("\n")).toContain("suite-lobster");
+    expect(code).toBe(1);
+  });
+
+  test("with no roster, status reads exactly as before", async () => {
+    const deps = fakeDeps() as StatusDeps & { lines: string[] };
+    deps.home = join(WORK_DIR, "no-such-home");
+    deps.readFile = readFileOrNull;
+    const code = await runStatus(deps, NOW);
+    expect(deps.lines.join("\n")).not.toContain("agents");
+    expect(code).toBe(0);
   });
 });

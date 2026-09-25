@@ -11,11 +11,13 @@ import {
   type RosterEntry,
   type RunningSession,
   adoptEntries,
+  bareGatewayKind,
   forgetEntry,
   parseRoster,
   restorePlan,
   rosterPath,
   serializeRoster,
+  stampRelaunchKind,
   upsertEntry,
 } from "../roster.ts";
 import {
@@ -154,7 +156,15 @@ export async function runningSessions(
       continue;
     }
     const kids = descendants(procs, [Number(pid)]);
-    const agent = kids.find((k) => looksLikeAgent(k)) ?? kids.find((k) => k.args.includes("dsh"));
+    // The stamp relaunch first: it is the pane's own process in a `suite
+    // hermes` / `suite openclaw` session, and the command that re-creates it.
+    // Its gateway child is only a fallback, for a gateway started by hand.
+    const argvOf = (k: { args: string }) => k.args.split(/\s+/).filter((a) => a !== "");
+    const agent =
+      kids.find((k) => stampRelaunchKind(argvOf(k)) !== null) ??
+      kids.find((k) => looksLikeAgent(k)) ??
+      kids.find((k) => bareGatewayKind(argvOf(k)) !== null) ??
+      kids.find((k) => k.args.includes("dsh"));
     if (!agent) continue;
     out.push({ session, cwd, argv: agent.args.split(/\s+/).filter((a) => a !== "") });
   }

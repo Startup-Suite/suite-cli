@@ -138,9 +138,12 @@ again from the same place and you are back in the same session.
 | `suite claude -- …` | `--` terminates wrapper options; everything after it is Claude's, including the literal word `new` |
 | `suite deepseek [...]` | Runs a DeepSeek Harness agent federated into Suite. Installs the harness on demand; every argument after ours passes through to `dsh` |
 | `suite deepseek --root DIR` | The agent's root folder — its cwd, its `DSH_HOME`, and where a per-agent identity may live |
+| `suite hermes --root DIR [...]` | Stamps a Hermes agent root and runs its gateway in tmux. See [`suite hermes`](#suite-hermes) |
+| `suite openclaw --root DIR [...]` | Stamps an OpenClaw agent root and runs its gateway in tmux. See [`suite openclaw`](#suite-openclaw) |
+| `suite hermes\|openclaw --stamp-only` | Stamps only, and prints one JSON document. See [the stamp contract](#stamp-contract---stamp-only) |
 | `suite update` | Re-runs the installer to replace this install with the latest published CLI |
 | `suite doctor` | Diagnoses a broken setup — one runnable remedy per failure, and a stale session is never reported green |
-| `suite status` | Shows which runtime this box is federated as, and the state and age of each session |
+| `suite status` | Shows which runtime this box is federated as, the state and age of each session, and each stamped agent's kind, root, state and last verdict |
 | `suite --version`, `suite --help` | Version, and the verb list |
 
 ### What `suite doctor` checks that nothing else does
@@ -238,6 +241,223 @@ Deployments behind an access proxy may need extra headers. The CLI knows none
 of them by name: whatever `headerNames` the config carries is forwarded from
 the credential store as `SUITE_HEADER_<NORMALISED_NAME>`, and a deployment with
 none works unchanged.
+
+## `suite hermes`
+
+Stamps a [Hermes Agent](https://github.com/NousResearch/hermes-agent) root
+Suite-ready, then runs its gateway (`hermes gateway run`) in the tmux session
+`suite-<root dir name>`. Hermes state lives under the root
+(`HERMES_HOME=<root>/.hermes` unless `--hermes-home` says otherwise), never in
+`~/.hermes`.
+
+```
+suite hermes --root ~/agents/scribe \
+  --suite-url https://suite.example.invalid --runtime-id <id> \
+  --token-ref file:/home/me/.config/suite/tokens/scribe \
+  --model-base-url http://127.0.0.1:8080/v1 --model some-model
+```
+
+| Flag | Meaning |
+| --- | --- |
+| `--root DIR` | Required. The agent root; its directory name is the agent name |
+| `--suite-url URL`, `--runtime-id ID` | The Suite runtime. Recorded in `<root>/suite.json`, so a re-run may omit them |
+| `--token-ref REF`, `--keychain-service SVC` | The runtime token, by reference only (see [token refs](#token-refs)) |
+| `--model-base-url URL`, `--model ID` | Required. An OpenAI-compatible endpoint and model id |
+| `--context-length N` | Optional `model.context_length` |
+| `--model-api-key-ref REF` | Optional model key, by reference |
+| `--allowed-users LIST` | Passed to the channel installer; without it, `--allow-all-users` |
+| `--hermes BIN`, `--install-hermes` | Which Hermes to use, or install the pinned one if absent |
+| `--hermes-home DIR` | Override `HERMES_HOME` |
+| `--stamp-only` | [The stamp contract](#stamp-contract---stamp-only): stamp, print one JSON document, start nothing |
+| `--no-session` | Run the gateway in the foreground instead of in tmux |
+| `-- ARGS` | Everything after `--` goes to `hermes gateway run` |
+
+What it writes, and with what mode:
+
+| Path | Written by | Mode | Holds |
+| --- | --- | --- | --- |
+| `<root>/suite.json` | this CLI | default (`0644` under a `022` umask) | Suite URL, runtime id, the token **ref**. No secret |
+| `<root>/.suite-stamp.json` | this CLI | default | Stamp record: harness, writer and harness version, plugin ref, inputs digest, token ref, last verdict. No secret |
+| `$HERMES_HOME/mcp-tokens/startup-suite-platform.runtime-token` | the channel installer | `0600` | The runtime token: the one sanctioned copy |
+| `$HERMES_HOME/.env` | the channel installer; this CLI adds `CUSTOM_MODEL_API_KEY` | `0600` for this CLI's write | Channel keys; the model key when `--model-api-key-ref` is given |
+| `$HERMES_HOME/config.yaml` | `hermes config set` (model keys); the channel installer (`mcp_servers.startup-suite`) | Hermes's own | `model.provider`, `model.base_url`, `model.default`, optionally `model.context_length`, `model.key_env` |
+| `$HERMES_HOME/plugins/startup-suite-platform` | the channel installer | the installer's | The channel plugin |
+| `~/.local/share/suite/hermes-suite-channel` | this CLI (`git`) | git's | The channel checkout, pinned to one commit |
+| `~/.local/state/suite/agents.json` | this CLI | default | The roster entry, on session creation |
+
+With `--install-hermes` it also writes `~/.local/share/suite/hermes-agent/`
+(`0700`, holding the pinned upstream installer, `0700`) and `$HERMES_HOME`
+(`0700`). **The upstream installer writes outside `HERMES_HOME`**: shell rc PATH
+lines and `~/.local/bin/{hermes,hermes-agent,hermes-acp}`. The stamp reports
+that as its own action rather than hiding it.
+
+**The MCP SDK.** The bridge needs `mcp==2.0.0` in Hermes's own Python. The
+managed Hermes venv is made by `uv` and **has no pip** (measured: `No module
+named pip`), so after `python -m pip` fails that way the install falls back to
+`uv pip install --python <that python>`. With no `uv` on PATH, the failure
+names the command to run.
+
+**The token file.** hermes-suite-channel has no keychain resolver yet, so a
+`keychain:` ref is resolved in memory, handed to the installer on stdin, and
+materialised into the `0600` token file above. The stamp says so in `warnings`.
+
+## `suite openclaw`
+
+Stamps an [OpenClaw](https://www.npmjs.com/package/openclaw) root Suite-ready
+through OpenClaw's own non-interactive path, then runs `openclaw gateway run` in
+the tmux session `suite-<root dir name>`. State lives under the root
+(`OPENCLAW_STATE_DIR=<root>/.openclaw`, `OPENCLAW_CONFIG_PATH=<root>/.openclaw/openclaw.json`,
+`OPENCLAW_HOME=<root>`), never in `~/.openclaw`. The config is written by
+upstream: `openclaw onboard --non-interactive --accept-risk` for the base, then
+`openclaw config set` for every later key. openclaw.json is never hand-written.
+
+| Flag | Meaning |
+| --- | --- |
+| `--root DIR` | Required. The agent root; its directory name is the agent id |
+| `--suite-url URL`, `--runtime-id ID` | The Suite runtime |
+| `--token-ref REF`, `--keychain-service SVC` | The runtime token, by reference only. The plugin resolves the ref itself: this CLI never reads the token |
+| `--model-base-url URL`, `--model ID` | Required. The custom model provider |
+| `--model-compat openai\|openai-responses\|anthropic` | Provider API shape. Default `openai` |
+| `--model-api-key-ref REF` | Optional model key, by reference |
+| `--gateway-port N` | The gateway port. Default: the first free port from `18800`; **never `18789`**, OpenClaw's default |
+| `--openclaw BIN`, `--install-openclaw` | Which OpenClaw to use, or install the pinned one (`openclaw@2026.9.4`) |
+| `--stamp-only` | [The stamp contract](#stamp-contract---stamp-only) |
+| `--no-session` | Run the gateway in the foreground |
+| `-- ARGS` | Passed to `openclaw gateway run`, except `--force`, `--port`, `--dev`, `--reset` and credential flags, which are refused |
+
+What it writes, and with what mode:
+
+| Path | Written by | Mode | Holds |
+| --- | --- | --- | --- |
+| `<root>/suite.json` | this CLI | default | Suite URL, runtime id, the token ref. No secret |
+| `<root>/.suite-stamp.json` | this CLI | default | Stamp record, as for Hermes. No secret |
+| `<root>/.openclaw/` | this CLI | `0700` | OpenClaw's state directory |
+| `<root>/.openclaw/openclaw.json` | `openclaw onboard` / `openclaw config set` | OpenClaw's own | `gateway.port`, `plugins.load.paths`, `plugins.allow`, the plugin and channel entries, the account (its `token` is the **ref string**), one route binding |
+| `~/.local/share/suite/openclaw-suite-channel` | this CLI (`git`, `npm ci`) | git's / npm's | The channel checkout pinned to one commit, and its dependencies |
+| `~/.local/state/suite/agents.json` | this CLI | default | The roster entry, on session creation |
+
+With `--install-openclaw` it also writes `~/.local/share/suite/openclaw/`
+(`0700`), an npm prefix holding the pinned package; nothing global.
+
+**The model key is not stored.** openclaw.json holds an env ref to
+`CUSTOM_API_KEY`, and each launch resolves `--model-api-key-ref` into the
+gateway's environment.
+
+## Rules both stamp verbs keep
+
+**No daemon.** Neither verb ever runs `gateway install`, `start` or `restart`,
+`--install-daemon`, or `systemctl`. systemd `--user` is per UID, not per HOME,
+so any of them could restart a gateway that some other install on the same
+machine already runs. The gateway is always `gateway run`, in the foreground,
+inside tmux.
+
+**Per-root isolation.** Each agent's harness state lives under its root, and
+every harness child runs with an allowlisted environment: it inherits no
+`SUITE_*`, `HERMES_*` or `OPENCLAW_*` from the operator's shell. What two
+agents on one machine do share lives under `~/.local/share/suite/`: the pinned
+plugin checkouts and any managed harness install. Those are programs, not agent
+state.
+
+**The header limitation.** Neither channel plugin can forward extra HTTP
+headers. A root whose `suite.json` names operator headers (for a deployment
+behind an access proxy) is refused with exit `2` and `headers_unsupported`,
+before anything is written.
+
+`suite status` lists every stamped agent with its kind, root, session state and
+last stamp verdict. A gateway that died takes its tmux session with it, so the
+state comes from the roster, and a recorded agent that is not running is
+reported `stale`, never absent.
+
+## Stamp contract (`--stamp-only`)
+
+`suite hermes --stamp-only` and `suite openclaw --stamp-only` are a stable,
+machine-callable interface. **The intended caller is core's installer `setup
+channel` step (task 01a0d6b9)**, which calls these verbs rather than
+reimplementing them.
+
+Under `--stamp-only`, stdout carries **exactly one JSON document** (indent 2,
+trailing newline) and nothing else. Every human-readable line goes to stderr,
+and no session is started.
+
+### Fields
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `contract_version` | number | `1` |
+| `ok` | boolean | Stamped, and the post-write check passed |
+| `harness` | string | `hermes` or `openclaw` |
+| `agent` | object | `{name, root, runtime_id}` |
+| `token_ref` | string or null | The token **ref** as given or recorded, never a value |
+| `changed` | boolean | Whether any action wrote anything |
+| `actions` | array | `{kind, target, outcome}` per write; `outcome` is `written`, `unchanged` or `repaired`; `target` is a path, key or package, never a value |
+| `validation` | object | `{verdict, checks}`; `verdict` is `pass`, `fail` or `unparseable`, and each check carries `command`, `exit_code`, `verdict` and, on a failure, the `raw` line |
+| `harness_version` | string or null | The harness version the stamp ran against |
+| `writer_version` | number | The version of this CLI's writer for that harness |
+| `warnings` | array of strings | For example `config shape unverified for <harness> <version>` |
+| `human_steps` | array | `{kind, text}` for a human to act on, such as `start_agent_session` or `keychain_unlock` |
+| `error` | object or null | `{code, message}`. The message names paths, flags and item names, never a value |
+
+**`contract_version: 1` changes additively only.** A new field may appear. An
+existing field is never renamed, retyped or removed without bumping the version.
+
+### Exit codes
+
+| Code | Meaning |
+| --- | --- |
+| `0` | ok: stamped, and the post-write check passed |
+| `1` | failed: the harness or its check failed, or its output was unreadable |
+| `2` | refused: a literal secret, a bad ref, operator headers, a busy port, a missing harness without its install flag |
+| `3` | blocked on a human: a locked keychain or a missing keychain item. `human_steps` says what to do |
+
+### Token refs
+
+The runtime token is accepted **only by reference**:
+
+```
+--token-ref file:<absolute path>
+--token-ref keychain:<item> --keychain-service <service>     (macOS only)
+```
+
+A literal value is refused with exit `2` in every spelling: `--token`,
+`--token=...`, and a token piped on stdin. argv is readable through `ps`. A
+`file:` ref is checked by stat and never read: the file must be a regular file
+owned by the caller, mode `0600` or `0400`. A `keychain:` ref is resolved with
+`/usr/bin/security find-generic-password -s <service> -a <item> -w`, so argv
+carries names only. The same syntax is read by the OpenClaw channel plugin's own
+resolver.
+
+### Idempotence
+
+A re-run with identical inputs changes nothing, reports every action
+`unchanged`, and returns `changed: false`. `.suite-stamp.json` is rewritten only
+when its bytes would change. The inputs digest covers the token **ref**, not the
+value, so rotating the token behind the same ref leaves the digest alone. For
+OpenClaw that is the whole story, because the plugin reads the ref itself. For
+Hermes the channel installer copies the new value into its `0600` token file,
+and that action reports `repaired`.
+
+Hermes has one known dependency here. The channel installer decides whether
+`config.yaml` already holds its MCP entry by parsing the YAML with the Hermes
+Python, using `ruamel.yaml` or PyYAML. **If that Python has neither, the
+installer cannot tell, and it rewrites its MCP keys on every run.** The managed
+Hermes env ships `ruamel.yaml`, because Hermes needs it to read its own config.
+
+### Follow-ups
+
+1. **Upstream config-shape detection.** Each writer declares the harness
+   versions its config shape was measured against. Any other version gets one
+   warning and no drift detection. Detection belongs in `measuredHarnessVersions`
+   and the `.suite-stamp.json` record, not inside a writer.
+2. **A keychain resolver in hermes-suite-channel**, so the Hermes token needs
+   no `0600` file.
+3. **The OpenClaw secret-contract SecretRef**, as an alternative to the
+   channel plugin's prefix resolver.
+4. **openclaw-suite-channel's `install.sh` passes `--token` on argv.** This CLI
+   does not call it, but other callers should not either until it is fixed.
+5. **Operator headers**, which neither channel plugin can forward yet.
+6. **The upstream Hermes `.env` child-env leak.** Hermes copies `.env` into its
+   own environment every turn, and children it spawns without a scrub inherit
+   it, model key included.
 
 ## Five decisions, stated rather than guessed
 
