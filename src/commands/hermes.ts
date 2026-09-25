@@ -57,7 +57,17 @@ import {
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
-import { parse as parseYaml } from "yaml";
+import { createRequire } from "node:module";
+
+// `yaml` is loaded lazily, on the first config.yaml read. cli.ts imports every
+// command module at startup, so a top-level import made EVERY verb (`suite
+// claude` included) fail with "ENOENT while resolving package 'yaml'" on an
+// install whose dependencies were not installed. Only the hermes verb needs it.
+const requireLazy = createRequire(import.meta.url);
+function parseYaml(text: string): unknown {
+  const { parse } = requireLazy("yaml") as { parse: (t: string) => unknown };
+  return parse(text);
+}
 import { harnessChildEnv, spawnHarness } from "../harness_env.ts";
 import { dataDir } from "../paths.ts";
 import { assertNoSecretsInArgv, createStore } from "../secrets.ts";
