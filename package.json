@@ -13,9 +13,11 @@
     "lint": "shellcheck install.sh bin/suite.template",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "yaml": "^2.9.0"
+  },
   "devDependencies": {
     "@types/bun": "latest",
-    "typescript": "^5",
-    "yaml": "^2.9.0"
+    "typescript": "^5"
   }
 }

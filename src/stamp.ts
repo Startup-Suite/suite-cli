@@ -105,6 +105,12 @@ export interface HarnessWriter {
   validate(inputs: StampInputs): Promise<ValidationVerdict>;
   /** Steps left for a human after a successful stamp, e.g. `start_agent_session`. */
   humanSteps?(inputs: StampInputs): HumanStep[];
+  /**
+   * Advisories the writer learned while applying (e.g. a file upstream writes
+   * outside the harness home). Collected after `apply`, before `validate`;
+   * each becomes one `warnings` entry and one stderr line. Never a value.
+   */
+  warnings?(inputs: StampInputs): string[];
 }
 
 export interface StampRequest {
@@ -318,6 +324,11 @@ async function runStampInner(
   }
   await writer.apply(inputs, planned);
   for (const a of result.actions) io.stderr(`suite: ${a.kind} ${a.target}: ${a.outcome}\n`);
+  for (const w of writer.warnings?.(inputs) ?? []) {
+    const line = redact(w, progress.secrets);
+    result.warnings.push(line);
+    io.stderr(`suite: warning: ${line}\n`);
+  }
 
   const verdict = await writer.validate(inputs);
   const aggregated: ValidationVerdict = { verdict: aggregateVerdict(verdict.checks), checks: verdict.checks };

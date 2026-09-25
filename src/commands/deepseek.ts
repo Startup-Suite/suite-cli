@@ -507,15 +507,25 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
  * recycled rather than joined — the same three-way handling `suite claude`
  * documents at length.
  */
-async function runInSession(
+export interface SessionOptions {
+  /** The program name `detectState` looks for in the pane's process tree. */
+  agentName?: string;
+  /** Injected in tests; defaults to the live tmux on `env`. */
+  tmux?: TmuxDeps;
+  /** Called with the exact `tmux new-session` argv once a session was created. */
+  onCreated?(createArgv: string[]): void;
+}
+
+export async function runInSession(
   session: string,
   argv: string[],
   cwd: string,
   env: Record<string, string>,
   store: CredentialStore,
-  deps: DeepseekDeps,
+  deps: Pick<DeepseekDeps, "isTTY" | "exec" | "stderr">,
+  options: SessionOptions = {},
 ): Promise<number> {
-  const tmux: TmuxDeps = liveTmuxDeps(env);
+  const tmux: TmuxDeps = options.tmux ?? liveTmuxDeps(env);
 
   if (tmux.which(TMUX) === null) {
     // Never silently: losing persistence is exactly the kind of downgrade that
@@ -527,7 +537,7 @@ async function runInSession(
     return await deps.exec(argv, { cwd, env });
   }
 
-  const state = await detectState(session, tmux, "dsh");
+  const state = await detectState(session, tmux, options.agentName ?? "dsh");
 
   if (state === "stale") {
     deps.stderr.write(`suite: recycling stale session ${session}\n`);
@@ -542,6 +552,7 @@ async function runInSession(
       return created.exitCode;
     }
     deps.stderr.write(`suite: started ${session}\n`);
+    options.onCreated?.(create);
   } else {
     deps.stderr.write(`suite: attaching to ${session}\n`);
   }

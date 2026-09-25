@@ -30,7 +30,7 @@ export interface RosterEntry {
   /** Working directory the session was started in. */
   cwd: string;
   /** Which verb produced it. Recorded for the operator, not branched on. */
-  kind: "claude" | "deepseek";
+  kind: "claude" | "deepseek" | "hermes";
   /** ISO timestamp of the most recent launch. */
   recordedAt: string;
 }
@@ -68,7 +68,7 @@ export function parseRoster(text: string): RosterEntry[] {
       session: e.session,
       command: e.command as string[],
       cwd: e.cwd,
-      kind: e.kind === "deepseek" ? "deepseek" : "claude",
+      kind: e.kind === "deepseek" || e.kind === "hermes" ? e.kind : "claude",
       recordedAt: typeof e.recordedAt === "string" ? e.recordedAt : "",
     });
   }
