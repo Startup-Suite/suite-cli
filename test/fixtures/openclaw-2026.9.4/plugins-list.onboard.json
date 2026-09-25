@@ -1,0 +1,372 @@
+{
+  "_captured": "openclaw 2026.9.4 (3a9d69d) `plugins list --json` on a fresh `onboard --non-interactive` state (task 01a0d8f8 stage 6), each plugin trimmed to id/enabled/status/origin; workspaceDir replaced",
+  "workspaceDir": "<state>/workspace",
+  "workspaceScope": "selected",
+  "registry": {
+    "source": "derived",
+    "diagnostics": [
+      {
+        "level": "info",
+        "code": "persisted-registry-missing",
+        "message": "Persisted plugin registry is missing or invalid; using derived plugin index."
+      }
+    ]
+  },
+  "plugins": [
+    {
+      "id": "a2a",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "active-memory",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "admin-http-rpc",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "alibaba",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "anthropic",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "azure-speech",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "beam",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "bonjour",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "browser",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "canvas",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "clawrouter",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "copilot-proxy",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "crabbox",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "cua-computer",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "deepgram",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "device-pair",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "document-extract",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "elevenlabs",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "fal",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "file-transfer",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "geolocation",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "github-copilot",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "google",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "huggingface",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "imap",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "linux-node",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "litellm",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "llm-task",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "lmstudio",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "logbook",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "memory-core",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "memory-wiki",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "microsoft",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "microsoft-foundry",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "migrate-claude",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "migrate-hermes",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "minimax",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "nvidia",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "oc-path",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "ollama",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "onepassword",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "openai",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "opencode-go",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "openrouter",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "policy",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "reef",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "runway",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "senseaudio",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "sglang",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "talk-voice",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "telegram",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "together",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "tts-local-cli",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "vault",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "vllm",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "web-readability",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    },
+    {
+      "id": "webhooks",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "workboard",
+      "enabled": false,
+      "status": "disabled",
+      "origin": "bundled"
+    },
+    {
+      "id": "xai",
+      "enabled": true,
+      "status": "loaded",
+      "origin": "bundled"
+    }
+  ],
+  "diagnostics": []
+}

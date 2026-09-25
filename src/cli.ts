@@ -11,7 +11,7 @@ import { liveDeps, runInit } from "./commands/init.ts";
 import { liveClaudeDeps, runClaude } from "./commands/claude.ts";
 import { liveDoctorDeps, runDoctor } from "./commands/doctor.ts";
 import { hostname } from "node:os";
-import { runStatus } from "./commands/status.ts";
+import { liveStatusDeps, runStatus } from "./commands/status.ts";
 import {
   forceRecover,
   liveWatchDeps,
@@ -42,6 +42,8 @@ function telemetryAuth(): string | null {
 }
 import { emptyConfig, readConfig } from "./config.ts";
 import { liveDeepseekDeps, runDeepseek } from "./commands/deepseek.ts";
+import { liveHermesDeps, runHermes } from "./commands/hermes.ts";
+import { liveOpenclawDeps, runOpenclaw } from "./commands/openclaw.ts";
 import { liveUpdateDeps, runUpdate } from "./commands/update.ts";
 import { ttyPrompter } from "./secrets.ts";
 
@@ -50,6 +52,8 @@ export type Verb =
   | "claude"
   | "claude new"
   | "deepseek"
+  | "hermes"
+  | "openclaw"
   | "doctor"
   | "status"
   | "update"
@@ -62,7 +66,7 @@ export interface Dispatch {
   args: string[];
 }
 
-const VERBS = new Set(["init", "claude", "deepseek", "doctor", "status", "update", "watch", "restore"]);
+const VERBS = new Set(["init", "claude", "deepseek", "hermes", "openclaw", "doctor", "status", "update", "watch", "restore"]);
 
 /**
  * Pure: map argv to a verb plus untouched passthrough arguments.
@@ -145,8 +149,10 @@ export function usage(): string {
     row("claude", "run Claude Code in a persistent session"),
     row("claude new", "force a new session"),
     row("deepseek", "run a DeepSeek Harness agent federated into Suite"),
+    row("hermes", "stamp a Hermes agent root and run its gateway (--stamp-only: JSON contract)"),
+    row("openclaw", "stamp an OpenClaw agent root and run its gateway (--stamp-only: JSON contract)"),
     row("doctor", "diagnose a broken setup"),
-    row("status", "show federation and session state"),
+    row("status", "show federation, session state and stamped agents (kind, root, live/stale, last verdict)"),
     row("watch", "recover halted agent sessions (--dry-run, --once, --interval N, --force SESSION)"),
     row("restore", "bring recorded agents back up (--adopt, --dry-run, --forget NAME)"),
     row("update", "install the latest suite CLI"),
@@ -189,6 +195,16 @@ export async function run(argv: string[]): Promise<number> {
     // Ours: `--root DIR` before a `--`. Everything else reaches dsh verbatim.
     const { args } = parse(argv);
     return runDeepseek(args, liveDeepseekDeps());
+  }
+  if (verb === "hermes") {
+    // Ours up to `--`; everything after it reaches `hermes gateway run`.
+    const { args } = parse(argv);
+    return runHermes(args, liveHermesDeps());
+  }
+  if (verb === "openclaw") {
+    // Ours up to `--`; everything after it reaches `openclaw gateway run`.
+    const { args } = parse(argv);
+    return runOpenclaw(args, liveOpenclawDeps());
   }
   if (verb === "watch") {
     const { args } = parse(argv);
@@ -286,7 +302,7 @@ export async function run(argv: string[]): Promise<number> {
   }
   if (verb === "update") return runUpdate(liveUpdateDeps());
   if (verb === "doctor") return runDoctor(await liveDoctorDeps());
-  return runStatus(await liveDoctorDeps());
+  return runStatus(await liveStatusDeps());
 }
 
 if (import.meta.main) {

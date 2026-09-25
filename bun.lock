@@ -4,10 +4,12 @@
   "workspaces": {
     "": {
       "name": "suite-cli",
+      "dependencies": {
+        "yaml": "^2.9.0",
+      },
       "devDependencies": {
         "@types/bun": "latest",
         "typescript": "^5",
-        "yaml": "^2.9.0",
       },
     },
   },

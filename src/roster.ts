@@ -30,7 +30,7 @@ export interface RosterEntry {
   /** Working directory the session was started in. */
   cwd: string;
   /** Which verb produced it. Recorded for the operator, not branched on. */
-  kind: "claude" | "deepseek";
+  kind: "claude" | "deepseek" | "hermes" | "openclaw";
   /** ISO timestamp of the most recent launch. */
   recordedAt: string;
 }
@@ -68,7 +68,7 @@ export function parseRoster(text: string): RosterEntry[] {
       session: e.session,
       command: e.command as string[],
       cwd: e.cwd,
-      kind: e.kind === "deepseek" ? "deepseek" : "claude",
+      kind: e.kind === "deepseek" || e.kind === "hermes" || e.kind === "openclaw" ? e.kind : "claude",
       recordedAt: typeof e.recordedAt === "string" ? e.recordedAt : "",
     });
   }
@@ -155,9 +155,65 @@ export function adoptEntries(
       session: r.session,
       command: ["tmux", "new-session", "-d", "-s", r.session, "-c", r.cwd, ...r.argv],
       cwd: r.cwd,
-      kind: r.argv.some((a) => a.includes("dsh")) ? "deepseek" : "claude",
+      kind: kindFromArgv(r.argv),
       recordedAt: now,
     });
   }
   return out;
+}
+
+const programName = (arg: string): string => arg.slice(arg.lastIndexOf("/") + 1);
+
+/**
+ * This CLI's own gateway relaunch — the process a `suite hermes` or `suite
+ * openclaw` session's pane actually runs:
+ *
+ *   <bun> <.../cli.ts> hermes   --root DIR --gateway-only --no-session ...
+ *   <bun> <.../cli.ts> openclaw --root DIR --gateway-only --no-session ...
+ *
+ * `--gateway-only` is internal to that relaunch, so its presence is what marks
+ * it. The verb is the first argument that is EXACTLY `hermes` or `openclaw`;
+ * the verb precedes every flag, so a flag value (a `--hermes /path/hermes`
+ * binary, a root named `openclaw`) can only come after it.
+ */
+export function stampRelaunchKind(argv: string[]): "hermes" | "openclaw" | null {
+  if (!argv.includes("--gateway-only")) return null;
+  for (const a of argv) {
+    if (a === "--gateway-only") return null;
+    if (a === "hermes" || a === "openclaw") return a;
+  }
+  return null;
+}
+
+/**
+ * A gateway started directly rather than through the relaunch:
+ * `<...>/hermes gateway run ...` or `<...>/openclaw gateway run ...`.
+ *
+ * NOT the running OpenClaw gateway's own argv. `gateway run` overwrites its
+ * process title to `openclaw-gateway`, after which the args no longer name the
+ * program or the subcommand; that argv could not be replayed, so it is
+ * deliberately not recognised here. Adopting such a pane finds the relaunch
+ * above it instead, or nothing.
+ */
+export function bareGatewayKind(argv: string[]): "hermes" | "openclaw" | null {
+  const g = argv.indexOf("gateway");
+  if (g <= 0 || argv[g + 1] !== "run") return null;
+  const programs = argv.slice(0, g).map(programName);
+  if (programs.includes("hermes")) return "hermes";
+  if (programs.includes("openclaw")) return "openclaw";
+  return null;
+}
+
+/**
+ * Which verb an adopted argv belongs to. Recorded for the operator and for
+ * `suite status`, which picks the process name to look for by it.
+ *
+ * The Hermes and OpenClaw shapes are checked FIRST: their argv carries a root
+ * path, and a root whose path happens to contain `dsh` must not read as a
+ * DeepSeek agent.
+ */
+export function kindFromArgv(argv: string[]): RosterEntry["kind"] {
+  const stamped = stampRelaunchKind(argv) ?? bareGatewayKind(argv);
+  if (stamped !== null) return stamped;
+  return argv.some((a) => a.includes("dsh")) ? "deepseek" : "claude";
 }

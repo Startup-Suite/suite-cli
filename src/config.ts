@@ -41,6 +41,14 @@ export interface SuiteConfig {
    * same split the rest of this config uses.
    */
   telemetry?: TelemetrySinkConfig;
+  /**
+   * A REFERENCE to the runtime token, written by the stamp verbs: the string
+   * `file:<absolute path>` or `keychain:<item>`. Never the value — parseConfig
+   * drops anything not spelled as a ref, so a literal cannot round-trip.
+   */
+  tokenRef?: string;
+  /** The keychain service a `keychain:` ref is looked up under. A name, not a secret. */
+  keychainService?: string;
 }
 
 export interface TelemetrySinkConfig {
@@ -53,7 +61,19 @@ export interface TelemetrySinkConfig {
 export const DEFAULT_SESSION_NAMING: SessionNaming = "cwd";
 
 /** Keys permitted in the serialised document. Anything else is dropped. */
-const ALLOWED_KEYS = ["suiteUrl", "runtimeId", "headerNames", "sessionNaming", "telemetry"] as const;
+const ALLOWED_KEYS = [
+  "suiteUrl",
+  "runtimeId",
+  "headerNames",
+  "sessionNaming",
+  "telemetry",
+  "tokenRef",
+  "keychainService",
+] as const;
+
+/** Mirrors token_ref.ts; duplicated so config.ts keeps no import of the resolver. */
+const isRefString = (v: unknown): v is string =>
+  typeof v === "string" && (v.startsWith("file:") || v.startsWith("keychain:"));
 
 export function emptyConfig(): SuiteConfig {
   return { suiteUrl: "", runtimeId: "", headerNames: [], sessionNaming: DEFAULT_SESSION_NAMING };
@@ -72,6 +92,14 @@ export function serializeConfig(config: SuiteConfig): string {
       // Omit entirely when unset, so an untouched config is byte-identical to
       // what it was before this feature existed.
       if (config.telemetry) out[key] = config.telemetry;
+    } else if (key === "tokenRef") {
+      // Omitted when unset (byte-identical to before), and never a non-ref.
+      if (config.tokenRef !== undefined) {
+        if (!isRefString(config.tokenRef)) throw new Error("config.tokenRef must be a file: or keychain: ref");
+        out[key] = config.tokenRef;
+      }
+    } else if (key === "keychainService") {
+      if (config.keychainService !== undefined && config.keychainService !== "") out[key] = config.keychainService;
     } else {
       out[key] = config[key];
     }
@@ -89,6 +117,10 @@ export function parseConfig(text: string): SuiteConfig {
     headerNames: Array.isArray(names) ? names.filter((n): n is string => typeof n === "string") : [],
     sessionNaming: raw.sessionNaming === "runtime" ? "runtime" : base.sessionNaming,
     ...parseTelemetry(raw.telemetry),
+    ...(isRefString(raw.tokenRef) ? { tokenRef: raw.tokenRef } : {}),
+    ...(typeof raw.keychainService === "string" && raw.keychainService !== ""
+      ? { keychainService: raw.keychainService }
+      : {}),
   };
 }
 

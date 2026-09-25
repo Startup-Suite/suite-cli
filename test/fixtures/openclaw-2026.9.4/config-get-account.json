@@ -1,0 +1,9 @@
+{
+  "url": "ws://127.0.0.1:9/runtime/ws",
+  "runtimeId": "m1-rt",
+  "token": "__OPENCLAW_REDACTED__",
+  "autoJoinSpaces": [],
+  "reconnectIntervalMs": 5000,
+  "maxReconnectIntervalMs": 60000,
+  "useMcpTools": false
+}

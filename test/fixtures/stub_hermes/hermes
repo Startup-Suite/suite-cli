@@ -1,0 +1,152 @@
+#!/usr/bin/env bun
+/**
+ * A stand-in `hermes` for test/hermes.test.ts.
+ *
+ * Implements the subcommands `suite hermes` and the stub channel installer
+ * call, with the argument shapes and OUTPUT SHAPES of the real CLI at
+ * hermes-agent fdec926e (measured 2026-09-25 against a real install in a
+ * throwaway HERMES_HOME; see the parsers in src/commands/hermes.ts).
+ *
+ * Every call appends one JSON line {argv, env, cwd} to $HOME/hermes-stub.jsonl.
+ * It is keyed on HOME because the child env is an allowlist: a HERMES_STUB_*
+ * variable would be stripped before reaching here, which is the point.
+ *
+ * Knobs come from $HOME/hermes-stub-knobs.json:
+ *   version  the --version line
+ *   check    ok | missing | garbage
+ *   mcp      ok | zero | fail | garbage
+ *   activation  ok (default) | none | garbage | switch — `--run-module pm.environments`,
+ *            which at fdec926e prints Hermes's activation environment as JSON
+ *            with PYTHONPATH `<repo>:<venv>/lib/python3.14/site-packages` of
+ *            the committed venv (here: the one under installs/, if any).
+ *            `switch`: environment e1 until the channel plugin is installed,
+ *            e2 after, as a real plugin install with Python deps commits a new one
+ *
+ * State is $HERMES_HOME/config.yaml as real YAML. `config set` coerces a
+ * digits-only value to an integer and a JSON list/object to structure, as the
+ * real CLI does (measured: `context_length: 65536` lands unquoted).
+ */
+import { appendFileSync, existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { parse, stringify } from "yaml";
+
+const HOME = process.env.HOME ?? "";
+const HH = process.env.HERMES_HOME ?? join(HOME, ".hermes");
+const argv = process.argv.slice(2);
+appendFileSync(join(HOME, "hermes-stub.jsonl"), `${JSON.stringify({ argv, env: process.env, cwd: process.cwd() })}\n`);
+
+const knobsPath = join(HOME, "hermes-stub-knobs.json");
+const knobs: Record<string, string> = existsSync(knobsPath) ? JSON.parse(readFileSync(knobsPath, "utf8")) : {};
+
+const cfgPath = join(HH, "config.yaml");
+const read = (): Record<string, unknown> => (existsSync(cfgPath) ? ((parse(readFileSync(cfgPath, "utf8")) as Record<string, unknown>) ?? {}) : {});
+const write = (d: Record<string, unknown>): void => {
+  mkdirSync(HH, { recursive: true });
+  writeFileSync(cfgPath, stringify(d));
+};
+const lookup = (d: unknown, key: string): unknown => {
+  let n: unknown = d;
+  for (const p of key.split(".")) {
+    if (n === null || typeof n !== "object" || !(p in (n as object))) return undefined;
+    n = (n as Record<string, unknown>)[p];
+  }
+  return n;
+};
+const assign = (d: Record<string, unknown>, key: string, v: unknown): void => {
+  const parts = key.split(".");
+  let n = d;
+  for (const p of parts.slice(0, -1)) {
+    if (n[p] === null || typeof n[p] !== "object") n[p] = {};
+    n = n[p] as Record<string, unknown>;
+  }
+  n[parts[parts.length - 1] as string] = v;
+};
+const coerce = (v: string): unknown => {
+  if (/^[0-9]+$/.test(v)) return Number.parseInt(v, 10);
+  if (v.startsWith("[") || v.startsWith("{")) {
+    try {
+      return JSON.parse(v);
+    } catch {
+      return v;
+    }
+  }
+  return v;
+};
+const die = (msg: string, code = 1): never => {
+  process.stderr.write(`${msg}\n`);
+  process.exit(code);
+};
+
+const [a0, a1, a2, a3] = argv;
+if (a0 === "--run-module" && a1 === "pm.environments") {
+  const mode = knobs.activation ?? "ok";
+  if (mode === "garbage") {
+    console.log("not json");
+    process.exit(0);
+  }
+  const { readdirSync } = await import("node:fs");
+  const installs = join(HH, "installs");
+  let venv: string | null = null;
+  if (mode === "switch") {
+    const e = existsSync(join(HH, "plugins", "startup-suite-platform")) ? "e2" : "e1";
+    const v = join(installs, "i1", "environments", e, "venv");
+    if (existsSync(join(v, "bin", "python"))) venv = v;
+  } else if (mode === "ok" && existsSync(installs)) {
+    for (const a of readdirSync(installs)) {
+      const envs = join(installs, a, "environments");
+      if (!existsSync(envs)) continue;
+      for (const b of readdirSync(envs)) if (existsSync(join(envs, b, "venv", "bin", "python"))) venv = join(envs, b, "venv");
+    }
+  }
+  if (venv === null) {
+    process.stderr.write("RuntimeError: no committed dependency environment\n");
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ HOME, HERMES_HOME: HH, PYTHONPATH: `${join(HH, "hermes-agent")}:${venv}/lib/python3.14/site-packages` }));
+} else if (a0 === "--version") {
+  console.log(knobs.version ?? "Hermes Agent vgit.fdec926 (2026.9.24) · upstream fdec926e");
+  console.log("Python: 3.14.7");
+} else if (a0 === "config" && a1 === "get") {
+  const v = lookup(read(), a2 ?? "");
+  if (v === undefined) die(`Config key not set: ${a2}`);
+  console.log(argv.includes("--json") ? JSON.stringify(v) : String(v));
+} else if (a0 === "config" && a1 === "set") {
+  if (a2 === undefined || a3 === undefined) die("usage: hermes config set KEY VALUE", 2);
+  const d = read();
+  assign(d, a2 as string, coerce(a3 as string));
+  write(d);
+  console.log(`✓ Set ${a2} = ${a3} in ${cfgPath}`);
+} else if (a0 === "config" && a1 === "unset") {
+  // The real CLI's shape: exit 1 "Config key not set" when absent.
+  if (a2 === undefined) die("Usage: hermes config unset <key>", 1);
+  const d = read();
+  const parts = (a2 as string).split(".");
+  const parent = lookup(d, parts.slice(0, -1).join("."));
+  const leaf = parts[parts.length - 1] as string;
+  if (parent === null || typeof parent !== "object" || !(leaf in (parent as object))) die(`Config key not set: ${a2}`);
+  delete (parent as Record<string, unknown>)[leaf];
+  write(d);
+  console.log(`✓ Unset ${a2} from ${cfgPath}`);
+} else if (a0 === "config" && a1 === "check") {
+  if (knobs.check === "garbage") console.log("nothing recognisable here");
+  else {
+    console.log("\n📋 Configuration Status\n\n  Config version: 46 ✓\n\n  Required:");
+    if (knobs.check === "missing") console.log("    ✗ SOME_REQUIRED_KEY (missing)");
+    console.log("\n  Optional:\n    ○ OPENROUTER_API_KEY → vision_analyze\n");
+  }
+} else if (a0 === "mcp" && a1 === "test") {
+  if (lookup(read(), `mcp_servers.${a2}`) === undefined) die(`  ✗ Server '${a2}' not found in config.`, 3);
+  const mode = knobs.mcp ?? "ok";
+  console.log(`\n  Testing '${a2}'...\n  Transport: stdio → /usr/bin/env\n  Auth: none`);
+  if (mode === "fail") {
+    console.log("  ✗ Connection failed (7.8s): Connection closed");
+    process.exit(1);
+  }
+  if (mode === "garbage") console.log("  something the parser has never seen");
+  else if (mode === "zero") console.log("  ✓ Connected (12ms)\n  ✓ Tools discovered: 0\n");
+  else console.log("  ✓ Connected (1655ms)\n  ✓ Tools discovered: 2\n\n    ping      Reply pong.\n    echo      Echo text.\n");
+} else if (a0 === "gateway" && a1 === "run") {
+  setInterval(() => {}, 1 << 30);
+} else {
+  die(`stub hermes: unsupported command ${JSON.stringify(argv)}`);
+}

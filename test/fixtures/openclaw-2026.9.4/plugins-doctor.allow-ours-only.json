@@ -1,0 +1,10 @@
+{
+  "ok": false,
+  "pluginErrors": [],
+  "diagnostics": [],
+  "sourceShadowing": [],
+  "compatibility": [],
+  "configurationWarnings": [
+    "- plugins.entries.anthropic: plugin disabled (not in allowlist) but config is present"
+  ]
+}

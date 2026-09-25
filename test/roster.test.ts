@@ -2,11 +2,14 @@ import { describe, expect, test } from "bun:test";
 import {
   type RosterEntry,
   adoptEntries,
+  bareGatewayKind,
   forgetEntry,
+  kindFromArgv,
   parseRoster,
   restorePlan,
   rosterPath,
   serializeRoster,
+  stampRelaunchKind,
   upsertEntry,
 } from "../src/roster.ts";
 import {
@@ -301,5 +304,159 @@ describe("reading the running agents off the process table", () => {
     const afterCwd = e?.command[e.command.indexOf("/Volumes/Dev/agents/brosnan") + 1];
     expect(afterCwd).toBe("claude");
     expect(afterCwd?.startsWith("-")).toBe(false);
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* Hermes and OpenClaw agents (01a0d8f8 stage 5)                              */
+/* ------------------------------------------------------------------------- */
+
+const BUN = "/home/q/.bun/bin/bun";
+const CLI = "/home/q/.local/share/suite/lib/src/cli.ts";
+const hermesRelaunch = [
+  BUN, CLI, "hermes", "--root", "/srv/agents/scribe", "--gateway-only", "--no-session",
+  "--hermes", "/srv/agents/scribe/.hermes/hermes-agent/.hermes/bin/hermes",
+  "--hermes-home", "/srv/agents/scribe/.hermes", "--",
+];
+const openclawRelaunch = [
+  BUN, CLI, "openclaw", "--root", "/srv/agents/lobster", "--gateway-only", "--no-session",
+  "--openclaw", "/srv/agents/bin/openclaw", "--gateway-port", "18800", "--",
+];
+
+describe("the roster knows every verb that records a launch", () => {
+  test("hermes and openclaw entries round-trip with their kind intact", () => {
+    const entries: RosterEntry[] = [
+      { ...entry("suite-scribe", "/srv/agents/scribe"), kind: "hermes" },
+      { ...entry("suite-lobster", "/srv/agents/lobster"), kind: "openclaw" },
+      { ...entry("suite-oddjob", "/srv/agents/oddjob"), kind: "deepseek" },
+      entry("suite-brosnan"),
+    ];
+    const back = parseRoster(serializeRoster(entries));
+    expect(back).toEqual(entries);
+    expect(back.map((e) => e.kind)).toEqual(["hermes", "openclaw", "deepseek", "claude"]);
+  });
+
+  /**
+   * An unknown kind is not a reason to drop an agent from recovery, and it is
+   * not a kind to invent: it reads as `claude`, the verb that predates the
+   * field. Case matters — `Hermes` is not a kind this CLI writes.
+   */
+  test("an unknown kind stays claude, and the entry is kept", () => {
+    const text = JSON.stringify({
+      agents: [
+        { session: "suite-x", command: ["tmux", "new-session"], cwd: "/w", kind: "gemini" },
+        { session: "suite-y", command: ["tmux", "new-session"], cwd: "/w", kind: "Hermes" },
+        { session: "suite-z", command: ["tmux", "new-session"], cwd: "/w" },
+      ],
+    });
+    const got = parseRoster(text);
+    expect(got.map((e) => e.session)).toEqual(["suite-x", "suite-y", "suite-z"]);
+    expect(got.every((e) => e.kind === "claude")).toBe(true);
+  });
+
+  test("restore's live-session guard is the same for a gateway agent", () => {
+    const hermes: RosterEntry = { ...entry("suite-scribe"), kind: "hermes" };
+    const openclaw: RosterEntry = { ...entry("suite-lobster"), kind: "openclaw" };
+    const plan = restorePlan([hermes, openclaw], ["suite-scribe"]);
+    expect(plan.find((p) => p.entry.session === "suite-scribe")?.action).toBe("skip");
+    expect(plan.find((p) => p.entry.session === "suite-lobster")?.action).toBe("start");
+  });
+});
+
+describe("adopting a gateway session", () => {
+  const now = "2026-09-25T00:00:00.000Z";
+
+  test("the stamp relaunch is recognised by its verb and --gateway-only", () => {
+    expect(stampRelaunchKind(hermesRelaunch)).toBe("hermes");
+    expect(stampRelaunchKind(openclawRelaunch)).toBe("openclaw");
+    // The verb without the internal flag is an operator's own `suite hermes`
+    // run, not the relaunch.
+    expect(stampRelaunchKind([BUN, CLI, "hermes", "--root", "/w"])).toBeNull();
+  });
+
+  test("a flag VALUE named like the other verb does not change the kind", () => {
+    // A hermes agent whose root is literally a directory called `openclaw`.
+    const argv = [BUN, CLI, "hermes", "--root", "openclaw", "--gateway-only", "--no-session"];
+    expect(stampRelaunchKind(argv)).toBe("hermes");
+    expect(kindFromArgv(argv)).toBe("hermes");
+  });
+
+  test("a root path containing `dsh` does not make a gateway a DeepSeek agent", () => {
+    const argv = hermesRelaunch.map((a) => a.replace("/srv/agents/scribe", "/srv/dshared/scribe"));
+    expect(argv.some((a) => a.includes("dsh"))).toBe(true);
+    expect(kindFromArgv(argv)).toBe("hermes");
+  });
+
+  test("a gateway started by hand is recognised from `<bin> gateway run`", () => {
+    const venv = "/srv/agents/scribe/.hermes/hermes-agent/venv/bin";
+    expect(bareGatewayKind([`${venv}/python`, `${venv}/hermes`, "gateway", "run"])).toBe("hermes");
+    expect(bareGatewayKind(["/usr/bin/openclaw", "gateway", "run", "--port", "18800"])).toBe("openclaw");
+    // Short-lived CLI calls in the same tree are not gateways.
+    expect(bareGatewayKind([`${venv}/hermes`, "config", "check"])).toBeNull();
+    expect(bareGatewayKind(["/usr/bin/openclaw", "gateway", "status"])).toBeNull();
+  });
+
+  /**
+   * The running OpenClaw gateway overwrites its argv to `openclaw-gateway`.
+   * That argv replays nothing, so it is not claimed as an OpenClaw shape.
+   */
+  test("the title-rewritten OpenClaw gateway argv is not claimed", () => {
+    expect(bareGatewayKind(["openclaw-gateway"])).toBeNull();
+    expect(stampRelaunchKind(["openclaw-gateway"])).toBeNull();
+  });
+
+  test("adoption records hermes and openclaw kinds, and still claude and deepseek", () => {
+    const running = [
+      { session: "suite-scribe", cwd: "/srv/agents/scribe", argv: hermesRelaunch },
+      { session: "suite-lobster", cwd: "/srv/agents/lobster", argv: openclawRelaunch },
+      { session: "suite-oddjob", cwd: "/w", argv: ["node", "x/.bin/dsh"] },
+      { session: "suite-brosnan", cwd: "/w", argv: ["claude", "--continue"] },
+    ];
+    const kinds = Object.fromEntries(adoptEntries(running, [], now).map((e) => [e.session, e.kind]));
+    expect(kinds).toEqual({
+      "suite-scribe": "hermes",
+      "suite-lobster": "openclaw",
+      "suite-oddjob": "deepseek",
+      "suite-brosnan": "claude",
+    });
+  });
+
+  /**
+   * The seam, as for Claude above: what `runningSessions` hands adoption is
+   * read off a process table. A Hermes pane holds the relaunch (the pane's own
+   * process) and, under it, the gateway. The RELAUNCH is what re-creates the
+   * session with its stamp check; replaying the bare gateway would skip it.
+   */
+  test("off a real-shaped process table, the relaunch is adopted, not its gateway child", async () => {
+    const venv = "/srv/agents/scribe/.hermes/hermes-agent/venv/bin";
+    const PANES = "suite-scribe\t5100\t/srv/agents/scribe\t/srv/agents/scribe\n";
+    const PS = [
+      `  900     1 tmux             tmux new-session -d -s suite-scribe -c /srv/agents/scribe ${hermesRelaunch.join(" ")}`,
+      ` 5100   900 bun              ${hermesRelaunch.join(" ")}`,
+      ` 5120  5100 hermes           ${venv}/python ${venv}/hermes gateway run`,
+      "",
+    ].join("\n");
+    const d: RestoreDeps = {
+      tmux: {
+        env: {},
+        which: () => "/usr/bin/tmux",
+        async run(argv) {
+          if (argv.includes("list-panes")) return { exitCode: 0, stdout: PANES, stderr: "" };
+          if (argv[0] === "ps") return { exitCode: 0, stdout: PS, stderr: "" };
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      },
+      readRoster: () => null,
+      writeRoster: () => {},
+      now: () => new Date(now),
+      log: () => {},
+    };
+    const found = await runningSessions(d);
+    expect(found).toHaveLength(1);
+    expect(found[0]?.argv).toEqual(hermesRelaunch);
+    const [e] = adoptEntries(found, [], now);
+    expect(e?.kind).toBe("hermes");
+    expect(e?.command.slice(0, 7)).toEqual(["tmux", "new-session", "-d", "-s", "suite-scribe", "-c", "/srv/agents/scribe"]);
+    expect(e?.command[7]).toBe(BUN);
   });
 });

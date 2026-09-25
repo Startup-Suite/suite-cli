@@ -289,6 +289,12 @@ export interface SpawnOptions {
    * anything that stays in the process table.
    */
   allowSecretsInArgv?: boolean;
+  /**
+   * Bytes written to the child's stdin, then closed. The sanctioned channel
+   * for handing a secret to a short-lived installer: a pipe is not in the
+   * process table and not in the child's environment.
+   */
+  stdin?: string;
 }
 
 /**
@@ -309,7 +315,8 @@ export async function spawnWithSecrets(
   if (argv.length === 0) throw new Error("spawnWithSecrets requires a command");
   if (options.allowSecretsInArgv !== true) assertNoSecretsInArgv(argv, store);
   const env = { ...(options.env ?? process.env), ...(options.secretEnv ?? {}) } as Record<string, string>;
-  const proc = Bun.spawn(argv, { cwd: options.cwd, env, stdout: "pipe", stderr: "pipe" });
+  const stdin = options.stdin === undefined ? "ignore" : new Blob([options.stdin]);
+  const proc = Bun.spawn(argv, { cwd: options.cwd, env, stdin, stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),

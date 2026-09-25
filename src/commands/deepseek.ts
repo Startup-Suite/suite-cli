@@ -25,6 +25,7 @@
  *     name a plugin path that is correct on two machines, so the patch is
  *     written at run time with this machine's resolved paths baked in.
  */
+import { runForwardingSignals } from "../child_signals.ts";
 import { mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -507,15 +508,32 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
  * recycled rather than joined — the same three-way handling `suite claude`
  * documents at length.
  */
-async function runInSession(
+export interface SessionOptions {
+  /** The program name `detectState` looks for in the pane's process tree. */
+  agentName?: string;
+  /** Injected in tests; defaults to the live tmux on `env`. */
+  tmux?: TmuxDeps;
+  /** Called with the exact `tmux new-session` argv once a session was created. */
+  onCreated?(createArgv: string[]): void;
+  /**
+   * Whether the roster records this session as launched. tmux reports `none`
+   * for an agent that died with its pane (the server exits with its last
+   * session), and `suite status` calls that `stale`; the relaunch then says so
+   * rather than announcing a first start.
+   */
+  wasRecorded?(): boolean;
+}
+
+export async function runInSession(
   session: string,
   argv: string[],
   cwd: string,
   env: Record<string, string>,
   store: CredentialStore,
-  deps: DeepseekDeps,
+  deps: Pick<DeepseekDeps, "isTTY" | "exec" | "stderr">,
+  options: SessionOptions = {},
 ): Promise<number> {
-  const tmux: TmuxDeps = liveTmuxDeps(env);
+  const tmux: TmuxDeps = options.tmux ?? liveTmuxDeps(env);
 
   if (tmux.which(TMUX) === null) {
     // Never silently: losing persistence is exactly the kind of downgrade that
@@ -527,11 +545,13 @@ async function runInSession(
     return await deps.exec(argv, { cwd, env });
   }
 
-  const state = await detectState(session, tmux, "dsh");
+  const state = await detectState(session, tmux, options.agentName ?? "dsh");
 
   if (state === "stale") {
     deps.stderr.write(`suite: recycling stale session ${session}\n`);
     await tmux.run([TMUX, "kill-session", "-t", session]);
+  } else if (state === "none" && options.wasRecorded?.() === true) {
+    deps.stderr.write(`suite: previous session ${session} was stale (recorded, no longer running); relaunching\n`);
   }
 
   if (state !== "live") {
@@ -542,6 +562,7 @@ async function runInSession(
       return created.exitCode;
     }
     deps.stderr.write(`suite: started ${session}\n`);
+    options.onCreated?.(create);
   } else {
     deps.stderr.write(`suite: attaching to ${session}\n`);
   }
@@ -620,10 +641,9 @@ export function liveDeepseekDeps(): DeepseekDeps {
       const proc = Bun.spawn(argv, { cwd: opts.cwd, env: { ...process.env, ...(opts.env ?? {}) }, stdout: "inherit", stderr: "inherit" });
       return await proc.exited;
     },
-    exec: async (argv, opts) => {
-      const proc = Bun.spawn(argv, { cwd: opts.cwd, env: opts.env, stdout: "inherit", stderr: "inherit", stdin: "inherit" });
-      return await proc.exited;
-    },
+    // Forwards SIGTERM/SIGHUP (and SIGINT without a terminal) to the child and
+    // waits for it: a signalled wrapper must not leave the harness orphaned.
+    exec: async (argv, opts) => await runForwardingSignals(argv, { cwd: opts.cwd, env: opts.env }),
     stderr: process.stderr,
   };
 }

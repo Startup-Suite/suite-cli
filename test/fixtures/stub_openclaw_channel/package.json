@@ -1,0 +1,10 @@
+{
+  "name": "startup-suite-channel-plugin",
+  "version": "0.0.0-fixture",
+  "type": "module",
+  "main": "dist/index.js",
+  "openclaw": {
+    "extensions": ["./index.ts"],
+    "channel": { "id": "startup-suite" }
+  }
+}
