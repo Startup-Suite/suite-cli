@@ -54,7 +54,6 @@ export function exitStatus(exitCode: number | null, signalCode: string | null): 
  */
 export async function runForwardingSignals(argv: string[], options: ForwardOptions): Promise<number> {
   const child: Subprocess = Bun.spawn(argv, { cwd: options.cwd, env: options.env, stdin: "inherit", stdout: "inherit", stderr: "inherit" });
-  options.onSpawn?.(child.pid);
   const tty = options.stdinIsTTY ?? process.stdin.isTTY === true;
   const handlers = FORWARDED_SIGNALS.map((signal) => {
     const handler = (): void => {
@@ -68,6 +67,11 @@ export async function runForwardingSignals(argv: string[], options: ForwardOptio
     process.on(signal, handler);
     return { signal, handler };
   });
+  // Announce the child only once the handlers exist. Announcing first left a
+  // window where a signal sent on seeing the pid hit the wrapper's DEFAULT
+  // action, killing it and orphaning the child (CI: SIGINT or SIGHUP case
+  // failing intermittently, 3s wait, child still alive).
+  options.onSpawn?.(child.pid);
   try {
     await child.exited;
   } finally {

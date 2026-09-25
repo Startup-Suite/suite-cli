@@ -107,6 +107,16 @@ beforeEach(() => {
 });
 afterEach(() => rmSync(dir, { recursive: true, force: true }));
 
+/**
+ * A `node` at the floor, in the per-test bin, for the --install-openclaw
+ * paths. Without it those tests used whatever node the host has, and the CI
+ * container (ubuntu:24.04) has none, so they were refused `node_missing`.
+ */
+function stubNode(version = "v24.16.0"): void {
+  writeFileSync(join(bin, "node"), `#!/usr/bin/env bash\necho ${version}\n`);
+  chmodSync(join(bin, "node"), 0o755);
+}
+
 function baseEnv(extra: Record<string, string> = {}): Record<string, string> {
   return {
     PATH: `${bin}:${STUB_DIR}:${BUN_DIR}:/usr/bin:/bin`,
@@ -597,6 +607,7 @@ describe("actions are measured, not planned", () => {
   });
 
   test("a harness install that ran before a port refusal is reported, and changed:true", async () => {
+    stubNode();
     let server: Server | null = null;
     let port = 0;
     for (let p = 19500; p < 19600 && server === null; p++) {
@@ -770,6 +781,7 @@ describe("refusals and failures", () => {
   });
 
   test("--install-openclaw installs the pinned package into the data dir, and a re-run does not install again", async () => {
+    stubNode();
     const args = stampArgs().filter((a, i, all) => a !== "--openclaw" && all[i - 1] !== "--openclaw");
     const which = (b: string) => (b === "openclaw" ? null : Bun.which(b, { PATH: baseEnv().PATH ?? "" }));
     const { result, exitCode } = await stamp([...args, "--install-openclaw"], makeDeps({ which }));
