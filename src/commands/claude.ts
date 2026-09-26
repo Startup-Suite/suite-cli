@@ -42,7 +42,9 @@ import {
   killSessionArgv,
   liveTmuxDeps,
   nestingPlan,
+  CONTINUE_WRAPPER_NAME,
   planLaunch,
+  quoteArgv,
   sessionOptionsArgv,
   sessionNameFromConfig,
   TMUX,
@@ -195,11 +197,12 @@ export const DEV_CHANNEL_ARGS = ["--dangerously-load-development-channels", "ser
  * already invoked with by hand; this makes the wrapper produce that argv
  * instead of requiring everyone to remember it.
  *
- * VERIFIED, not assumed: `--continue` in a directory with NO prior conversation
- * does not error — it simply starts a fresh session (checked against Claude
- * Code 2.1.232 on 2026-08-14, `claude --continue -p …` in an empty directory,
- * which answered normally). So it is safe to inject unconditionally and needs
- * no "does a session exist" probe.
+ * NOT SAFE ON ITS OWN in an interactive session. `claude --continue -p …` in an
+ * empty directory answers normally (Claude Code 2.1.232, 2026-08-14), but the
+ * INTERACTIVE form prints "No conversation found to continue" and exits 1
+ * (reproduced 2026-09-26 on 2.1.281). So an interactive launch is wrapped in
+ * {@link continueFallbackArgv}, which relaunches without the flag when the
+ * `--continue` attempt fails; `-p` is left bare.
  *
  * `--resume` is the one conflict: it and `--continue` both choose a session, so
  * a user who names one must not be handed the other. See {@link agentArgv}.
@@ -246,6 +249,82 @@ export function stripTerminator(args: string[]): string[] {
  */
 export function agentArgv(userArgs: string[]): string[] {
   return [AGENT, ...DEV_CHANNEL_ARGS, ...suiteArgs(userArgs), ...stripTerminator(userArgs)];
+}
+
+/**
+ * How long a failed `--continue` attempt may have run and still be retried
+ * fresh. Seconds, measured in the pane from launch to exit.
+ *
+ * WHY A WINDOW AT ALL. The fallback exists for "there was nothing to continue",
+ * which fails as soon as Claude looks — right after any pre-launch dialog is
+ * answered. An agent that ran for an hour on a continued conversation and THEN
+ * exited non-zero is a crash, not a first run; relaunching it fresh would keep
+ * the pane up while silently dropping the conversation, where today the session
+ * ends and the next `suite claude` continues it. The window keeps that case
+ * exactly as it was. Five minutes covers a human reading the development-
+ * channels and workspace-trust dialogs, which `suite claude` attaches them to
+ * immediately; a dialog left unanswered longer than that gets today's
+ * behaviour (the session ends) and the next launch retries.
+ */
+export const CONTINUE_FALLBACK_WINDOW_S = 300;
+
+/**
+ * The pane command's shell program. Static text: every value it touches
+ * arrives as a positional parameter, so nothing is ever interpolated into it
+ * (the only interpolations are our own two constants).
+ *
+ *   - exit 0, or death by signal (> 128): pass the status through, no retry;
+ *   - a non-zero exit after {@link CONTINUE_FALLBACK_WINDOW_S}: pass through;
+ *   - otherwise drop the FIRST `--continue` — ours, since the injected flags
+ *     precede every user argument — and `exec` the rest, so the relaunched
+ *     claude replaces the shell and a failure there ends the pane as before.
+ *
+ * `date +%s` is not POSIX but is on macOS, GNU and busybox; if it yields
+ * nothing, the run is treated as inside the window.
+ */
+export const CONTINUE_FALLBACK_SCRIPT = [
+  "t0=$(date +%s 2>/dev/null)",
+  '"$@"',
+  "rc=$?",
+  '[ "$rc" -eq 0 ] && exit 0',
+  '[ "$rc" -gt 128 ] && exit "$rc"',
+  "t1=$(date +%s 2>/dev/null)",
+  `[ -n "$t0" ] && [ -n "$t1" ] && [ $((t1 - t0)) -ge ${CONTINUE_FALLBACK_WINDOW_S} ] && exit "$rc"`,
+  "found=0",
+  `for a in "$@"; do shift; if [ "$found" = 0 ] && [ "$a" = ${CONTINUE_ARG} ]; then found=1; else set -- "$@" "$a"; fi; done`,
+  '[ "$found" = 1 ] || exit "$rc"',
+  `echo "suite: exit $rc with ${CONTINUE_ARG}; starting a fresh session (no conversation here to continue)" >&2`,
+  'exec "$@"',
+].join("; ");
+
+/**
+ * (agent argv) → the pane command, with the no-conversation fallback built in.
+ *
+ * WHY IN THE PANE, NOT IN THE WRAPPER. The first fix (PR #21) retried from
+ * `runClaude` when the session was dead after SETTLE_MS. That is keyed on
+ * timing, and any pre-launch dialog defeats it: Claude's development-channels
+ * warning (and, in a new directory, the workspace-trust prompt) holds the
+ * process alive for as long as nobody answers, so at 1.5 s the session reads
+ * LIVE, the retry never fires, and the `--continue` failure comes later. The
+ * shell in the pane sees the actual exit, whenever it happens.
+ *
+ * `sh -c SCRIPT NAME ARG…` — the argv stays an argv: each argument is a
+ * positional parameter and reaches claude via `"$@"`, never through shell
+ * text, so spaces, quotes and `$HOME` stay literal exactly as in the unwrapped
+ * form. NAME ({@link CONTINUE_WRAPPER_NAME}) is `$0`, which is how restore's
+ * adoption recognises the shell and skips it.
+ *
+ * Only wraps when `--continue` was injected by us: a user who chose a session
+ * gets exactly what they asked for.
+ */
+export function continueFallbackArgv(command: string[], injected: boolean): string[] {
+  if (!injected || !command.includes(CONTINUE_ARG)) return [...command];
+  return ["/bin/sh", "-c", CONTINUE_FALLBACK_SCRIPT, CONTINUE_WRAPPER_NAME, ...command];
+}
+
+/** The pane command for an interactive launch. */
+export function paneCommand(userArgs: string[]): string[] {
+  return continueFallbackArgv(agentArgv(userArgs), suiteArgs(userArgs).includes(CONTINUE_ARG));
 }
 
 /**
@@ -425,11 +504,12 @@ export interface ClaudePlan {
  * through a test that launches an agent.
  */
 export function decide(input: DecideInput, deps: TmuxDeps): ClaudePlan {
-  const command = agentArgv(input.userArgs);
-
   if (isNonInteractive(input.userArgs)) {
-    return { notes: [], direct: command };
+    return { notes: [], direct: agentArgv(input.userArgs) };
   }
+  // Interactive: tmux or not, the pane (or the direct exec) carries the
+  // no-conversation fallback. See continueFallbackArgv.
+  const command = paneCommand(input.userArgs);
 
   const notes: string[] = [];
   const wantsExisting = !input.force && input.state === "live";
@@ -575,11 +655,6 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
 
   if (plan.kill !== undefined) await deps.tmux.run(plan.kill);
   if (plan.create !== undefined) {
-    // What actually launched. Diverges from `plan.create` only on the
-    // no-conversation-to-continue retry below, and it is what gets recorded for
-    // restore-on-boot — replaying a command that did not work is worse than
-    // replaying none.
-    let launched = plan.create;
     const created = await deps.tmux.run(plan.create);
     if (created.exitCode !== 0) {
       deps.err(`tmux could not create ${session}: ${created.stderr.trim()}`);
@@ -616,42 +691,24 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     // startup failure; an agent that dies an hour later is the watchdog's job,
     // not this one's.
     await (deps.sleep ?? realSleep)(SETTLE_MS);
-    let state = await detectState(session, deps.tmux);
+    const state = await detectState(session, deps.tmux);
 
-    // A FIRST RUN HAS NOTHING TO CONTINUE.
-    //
-    // `suiteArgs` injects `--continue` so a restarted agent picks up where it
-    // left off. In a directory that has never held a conversation Claude
-    // answers "No conversation found to continue" and exits 1, so the very
-    // first launch of every new agent died — reproduced in the directory of a
-    // real one, where the identical command without `--continue` stayed up.
-    //
-    // Retrying WITHOUT the flag rather than predicting when it is safe: the
-    // question "is there a resumable conversation" is Claude's to answer, and
-    // any rule we invent here (a transcript file exists, a lastSessionId is
-    // recorded) is a guess about someone else's state that will be wrong in
-    // some case we have not seen. Asking, failing, and adapting is correct for
-    // all of them.
-    if (state !== "live" && launched.includes(CONTINUE_ARG)) {
-      const withoutContinue = launched.filter((a) => a !== CONTINUE_ARG);
-      const retried = await deps.tmux.run(withoutContinue);
-      if (retried.exitCode === 0) {
-        await (deps.sleep ?? realSleep)(SETTLE_MS);
-        state = await detectState(session, deps.tmux);
-        if (state === "live") {
-          deps.out(`${session}: started fresh — there was no previous conversation to continue.`);
-          launched = withoutContinue;
-        }
-      }
-    }
-
+    // A FIRST RUN HAS NOTHING TO CONTINUE — handled in the pane itself, not
+    // here. This check used to retry without `--continue` when the session was
+    // dead at SETTLE_MS, which any pre-launch dialog defeats (the process is
+    // alive while the dialog is up). See continueFallbackArgv. What remains
+    // here is the instant-death check, for failures that no retry can fix.
     if (state !== "live") {
+      const injectedContinue = suiteArgs(options.userArgs).includes(CONTINUE_ARG);
       deps.err(
         [
           `${session} was created and exited immediately — the agent did not stay up.`,
           `  Nothing was recorded for restore-on-boot, because there is nothing running to restore.`,
+          // The last thing the pane ran: without --continue when we injected it,
+          // since the fallback already tried that form. Printing the --continue
+          // form would send a new agent's operator to "No conversation found".
           `  Run the command by hand in this directory to see what it printed:`,
-          `    ${launched.slice(launched.indexOf("-c") + 2).join(" ")}`,
+          `    ${quoteArgv(agentArgv(options.userArgs).filter((a) => !(injectedContinue && a === CONTINUE_ARG)))}`,
           `  If it says the working directory was deleted, the tmux SERVER's own cwd is gone —`,
           `  every new pane inherits it. \`tmux kill-server\` fixes that, and kills every session on this box.`,
         ].join("\n"),
@@ -668,7 +725,7 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     if (deps.restore) {
       recordLaunch(deps.restore, deps.env.HOME ?? "", {
         session,
-        command: launched,
+        command: plan.create,
         cwd: deps.cwd,
         kind: "claude",
       });

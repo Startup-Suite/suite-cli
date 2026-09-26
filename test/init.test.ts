@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -25,6 +25,11 @@ import {
   toolsHttpUrl,
   whichBin,
   type InitDeps,
+  MCP_SCOPE,
+  claudeJsonPath,
+  registerServers,
+  userScopeChannelRuntime,
+  userScopeLines,
 } from "../src/commands/init.ts";
 import { CLAUDE_MD } from "../src/claude_md.ts";
 import { createStore, spawnWithSecrets, type Prompter } from "../src/secrets.ts";
@@ -250,7 +255,7 @@ describe("init on a machine where nothing is installed", () => {
     expect(calls).toEqual([]);
   });
 
-  test("takes the clone path, runs bun install, and registers both entries at user scope", async () => {
+  test("takes the clone path, runs bun install, and registers both entries at LOCAL scope", async () => {
     const fx = makeFixture();
     const prompter = scriptedPrompter(credentialAnswers());
     const deps = makeDeps(fx, prompter);
@@ -269,10 +274,10 @@ describe("init on a machine where nothing is installed", () => {
 
     const channel = invocation(fx, ["claude", "mcp", "add", CHANNEL_SERVER]);
     expect(channel).not.toBeNull();
-    // Scope is explicit. The `claude mcp add` default is `local`, so omitting
-    // this flag would quietly write an entry scoped to one directory.
+    // Scope is explicit and LOCAL: one entry per agent directory. User scope
+    // is one entry per machine, so a second agent's init re-pointed the first.
     expect(channel).toContain("-s");
-    expect(channel?.[channel.indexOf("-s") + 1]).toBe("user");
+    expect(channel?.[channel.indexOf("-s") + 1]).toBe("local");
     expect(channel).toContain(`SUITE_URL=wss://suite.example.invalid/runtime/ws`);
     expect(channel).toContain(`SUITE_RUNTIME_ID=${RUNTIME_ID}`);
     expect(channel).toContain("SUITE_ALLOW_PERMISSION_RELAY=0");
@@ -284,7 +289,7 @@ describe("init on a machine where nothing is installed", () => {
 
     const tools = invocation(fx, ["claude", "mcp", "add", TOOLS_SERVER]);
     expect(tools).not.toBeNull();
-    expect(tools?.[tools.indexOf("-s") + 1]).toBe("user");
+    expect(tools?.[tools.indexOf("-s") + 1]).toBe("local");
     expect(tools?.[tools.indexOf("-t") + 1]).toBe("http");
     expect(tools).toContain("https://suite.example.invalid/mcp");
     expect(tools).toContain(`${HEADER_NAME}: ${HEADER_VALUE}`);
@@ -742,7 +747,7 @@ describe("re-running init over entries it already registered", () => {
             return {
               exitCode: 1,
               stdout: "",
-              stderr: `MCP server ${argv[3]} already exists in user config`,
+              stderr: `MCP server ${argv[3]} already exists in local config`,
             };
           }
           return { exitCode: 0, stdout: "", stderr: "" };
@@ -755,9 +760,9 @@ describe("re-running init over entries it already registered", () => {
 
     const removes = calls.filter((c) => c[1] === "mcp" && c[2] === "remove");
     expect(removes.map((c) => c[3]).sort()).toEqual([CHANNEL_SERVER, TOOLS_SERVER].sort());
-    // Removed at USER scope — the scope the entry was registered in. A remove
-    // at the default scope silently deletes nothing and the retry fails again.
-    for (const r of removes) expect(r.slice(4)).toEqual(["-s", "user"]);
+    // Removed at LOCAL scope — the scope the entry was registered in, and the
+    // only one that cannot reach another agent's entry. Never `-s user`.
+    for (const r of removes) expect(r.slice(4)).toEqual(["-s", "local"]);
     expect(calls.filter((c) => c[1] === "mcp" && c[2] === "add")).toHaveLength(4);
   });
 
@@ -869,9 +874,9 @@ describe("mcp add argv", () => {
     indexPath: "/abs/claude-code-suite-channel/src/index.ts",
   };
 
-  test("the channel entry carries -s user and terminates its flags with --", () => {
+  test("the channel entry carries -s local and terminates its flags with --", () => {
     const argv = channelAddArgs(entry);
-    expect(argv.slice(0, 6)).toEqual(["claude", "mcp", "add", CHANNEL_SERVER, "-s", "user"]);
+    expect(argv.slice(0, 6)).toEqual(["claude", "mcp", "add", CHANNEL_SERVER, "-s", "local"]);
     expect(argv.slice(-3)).toEqual(["--", "bun", entry.indexPath]);
   });
 
@@ -958,5 +963,101 @@ describe("${ENV_VAR} interpolation, settled empirically", () => {
     });
     expect(argv).toContain("SUITE_TOKEN=${SUITE_TOKEN}");
     expect(argv.join(" ")).not.toContain(TOKEN);
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* One agent's entries never reach another agent (local scope)                */
+/* ------------------------------------------------------------------------- */
+
+describe("MCP entries are per agent directory", () => {
+  const OTHER_RUNTIME = "runtime_11111111-1111-1111-1111-111111111111";
+
+  function claudeJson(home: string, userChannelRuntime: string | null): void {
+    const body =
+      userChannelRuntime === null
+        ? { projects: {} }
+        : {
+            mcpServers: {
+              [CHANNEL_SERVER]: {
+                type: "stdio",
+                command: "bun",
+                env: { SUITE_RUNTIME_ID: userChannelRuntime, SUITE_TOKEN: TOKEN },
+              },
+            },
+          };
+    writeFileSync(resolve(home, ".claude.json"), JSON.stringify(body));
+  }
+
+  function recordingRun(calls: Array<{ argv: string[]; cwd?: string }>): InitDeps["run"] {
+    return async (argv, opts) => {
+      calls.push({ argv, cwd: opts?.cwd });
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+  }
+
+  const invocations = () => [
+    channelAddArgs({ suiteUrl: SUITE_URL, runtimeId: RUNTIME_ID, tokenLiteral: TOKEN, indexPath: "/x/src/index.ts" }),
+    toolsAddArgs(SUITE_URL, TOKEN, []),
+  ];
+
+  test("every claude mcp call runs IN the agent directory, at local scope, never user", async () => {
+    const home = mkdtempSync(resolve(tmpdir(), "suite-cli-scope-"));
+    const agent = resolve(home, "agents", "one");
+    mkdirSync(agent, { recursive: true });
+    const calls: Array<{ argv: string[]; cwd?: string }> = [];
+    let first = true;
+    const run: InitDeps["run"] = async (argv, opts) => {
+      calls.push({ argv, cwd: opts?.cwd });
+      if (argv[2] === "add" && first) {
+        first = false;
+        return { exitCode: 1, stdout: "", stderr: `MCP server ${argv[3]} already exists in local config` };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    await registerServers({ run, cwd: agent, env: { HOME: home } }, invocations(), RUNTIME_ID);
+    expect(calls.length).toBeGreaterThan(0);
+    for (const c of calls) {
+      expect(c.cwd).toBe(agent);
+      expect(c.argv[c.argv.indexOf("-s") + 1]).toBe(MCP_SCOPE);
+      expect(c.argv).not.toContain("user");
+    }
+    // The clash was resolved by removing THIS directory's local entry only.
+    expect(calls.filter((c) => c.argv[2] === "remove").map((c) => c.argv.slice(3))).toEqual([
+      [CHANNEL_SERVER, "-s", "local"],
+    ]);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("a user-scope entry naming ANOTHER runtime is left byte-for-byte alone, and warned about", async () => {
+    const home = mkdtempSync(resolve(tmpdir(), "suite-cli-scope-"));
+    claudeJson(home, OTHER_RUNTIME);
+    const before = readFileSync(resolve(home, ".claude.json"), "utf8");
+    const calls: Array<{ argv: string[]; cwd?: string }> = [];
+    const lines = await registerServers(
+      { run: recordingRun(calls), cwd: home, env: { HOME: home } },
+      invocations(),
+      RUNTIME_ID,
+    );
+    const said = lines.join("\n");
+    expect(said).toContain("warning");
+    expect(said).toContain(OTHER_RUNTIME);
+    expect(said).toContain("left alone");
+    // The token sitting next to it is never echoed.
+    expect(said).not.toContain(TOKEN);
+    expect(readFileSync(resolve(home, ".claude.json"), "utf8")).toBe(before);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  test("CONTROL: the same runtime is noted, not warned; no user entry says nothing", () => {
+    expect(userScopeLines({ present: true, runtimeId: RUNTIME_ID }, RUNTIME_ID).join("\n")).not.toContain("warning");
+    expect(userScopeLines({ present: false, runtimeId: null }, RUNTIME_ID)).toEqual([]);
+    expect(userScopeChannelRuntime("not json")).toEqual({ present: false, runtimeId: null });
+    expect(userScopeChannelRuntime(JSON.stringify({ projects: {} }))).toEqual({ present: false, runtimeId: null });
+  });
+
+  test("CLAUDE_CONFIG_DIR moves the file claude reads, so it moves ours", () => {
+    expect(claudeJsonPath({ HOME: "/h" })).toBe("/h/.claude.json");
+    expect(claudeJsonPath({ HOME: "/h", CLAUDE_CONFIG_DIR: "/c" })).toBe("/c/.claude.json");
   });
 });

@@ -324,6 +324,28 @@ export function looksLikeAgent(proc: ProcessRow, name: string = AGENT_NAME): boo
 }
 
 /**
+ * `$0` of the `/bin/sh -c` pane command that `suite claude` wraps the agent in
+ * (see `continueFallbackArgv` in `src/commands/claude.ts`).
+ *
+ * Lives here, not in claude.ts, because restore's adoption needs it and
+ * claude.ts already imports restore.ts. It is a whole argv element, so it
+ * appears in `ps` output as its own whitespace-separated token.
+ */
+export const CONTINUE_WRAPPER_NAME = "suite-claude-continue";
+
+/**
+ * Is this process the fallback shell rather than the agent itself?
+ *
+ * The shell's argv carries `claude` as a word, so {@link looksLikeAgent} matches
+ * it — which is RIGHT for liveness (the shell only lives while it has a claude
+ * child or is about to exec one) and WRONG for adoption, where its args are
+ * re-split on whitespace and the script would be shredded into words.
+ */
+export function isContinueWrapper(proc: ProcessRow): boolean {
+  return proc.args.split(/\s+/).includes(CONTINUE_WRAPPER_NAME);
+}
+
+/**
  * Every descendant of `roots`, inclusive, from a process snapshot.
  *
  * The walk is why detection is honest. The pane's own `pane_current_command` is

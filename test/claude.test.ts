@@ -30,7 +30,11 @@ import {
   missingClaudeInstallTools,
   MISSING_AGENT_EXIT,
   type ClaudeDeps,
+  continueFallbackArgv,
+  paneCommand,
+  CONTINUE_FALLBACK_SCRIPT,
 } from "../src/commands/claude.ts";
+import { CONTINUE_WRAPPER_NAME, isContinueWrapper, looksLikeAgent, parseProcesses } from "../src/tmux.ts";
 import { CLAUDE_CODE_URL } from "../src/commands/doctor.ts";
 import type { Prompter } from "../src/secrets.ts";
 import { sessionNameFromConfig } from "../src/tmux.ts";
@@ -856,17 +860,12 @@ describe("a session that is created and does not survive", () => {
   });
 
   /**
-   * A FIRST RUN HAS NOTHING TO CONTINUE.
-   *
-   * `suiteArgs` injects `--continue` so a restarted agent resumes. In a
-   * directory that has never held a conversation Claude answers "No
-   * conversation found to continue" and exits 1 — so the very first launch of
-   * every new agent died. Reproduced in a real agent's directory, where the
-   * identical command without `--continue` stayed up.
+   * THE RETRY LIVES IN THE PANE NOW. The old in-process retry (PR #21) created
+   * a second session when the first was dead at SETTLE_MS; a pre-launch dialog
+   * holds the process alive past that, so it never fired. `runClaude` must no
+   * longer try: one create, carrying the fallback shell, recorded as launched.
    */
-  test("retries without --continue when the first launch had nothing to resume", async () => {
-    let session: string | null = null;
-    let attempts = 0;
+  test("creates ONE session whose pane command carries the --continue fallback", async () => {
     const written: string[] = [];
     const r = recorder(
       {
@@ -878,43 +877,25 @@ describe("a session that is created and does not survive", () => {
           log: () => {},
         },
       },
-      async (argv) => {
-        if (argv.includes("new-session")) {
-          attempts += 1;
-          const i = argv.indexOf("-s");
-          session = argv[i + 1] ?? null;
-          return { exitCode: 0, stdout: "", stderr: "" };
-        }
-        if (argv.includes("list-panes")) {
-          return { exitCode: 0, stdout: session === null ? "" : `${session}\t4242\tzsh\n`, stderr: "" };
-        }
-        if (argv[0] === "ps") {
-          // The agent survives only the attempt that omitted --continue.
-          const alive = attempts >= 2;
-          return {
-            exitCode: 0,
-            stdout: alive
-              ? "  4242     1 zsh              -zsh\n  4243  4242 claude           claude\n"
-              : "  4242     1 zsh              -zsh\n",
-            stderr: "",
-          };
-        }
-        return { exitCode: 0, stdout: "", stderr: "" };
-      },
+      liveSessionRun(),
     );
-
-    const code = await runClaude(r.deps, { userArgs: [], force: false });
-    expect(code).not.toBe(SESSION_DIED_EXIT);
-
+    expect(await runClaude(r.deps, { userArgs: [], force: false })).not.toBe(SESSION_DIED_EXIT);
     const creates = r.ran.filter((a) => a.includes("new-session"));
-    expect(creates).toHaveLength(2);
-    expect(creates[0]).toContain(CONTINUE_ARG);
-    expect(creates[1]).not.toContain(CONTINUE_ARG);
-    expect([...r.out, ...r.err].join("\n")).toContain("no previous conversation");
+    expect(creates).toHaveLength(1);
+    const create = creates[0] as string[];
+    expect(create).toContain(CONTINUE_WRAPPER_NAME);
+    expect(create.slice(-HEAD.length)).toEqual([...HEAD]);
+    // Restore replays the recorded argv verbatim, so it must be the wrapped one.
+    expect(JSON.parse(written.at(-1) as string).agents[0].command).toEqual(create);
+  });
 
-    // The ROSTER must hold what actually worked. Recording the --continue form
-    // would make restore-on-boot replay the command that just failed.
-    expect(written.join("")).not.toContain(CONTINUE_ARG);
+  test("a dead session names the command WITHOUT --continue, which is what the pane ran last", async () => {
+    const r = recorder({}, deadSessionRun());
+    await runClaude(r.deps, { userArgs: [], force: false });
+    const said = r.err.join("\n");
+    expect(said).toContain("'--dangerously-skip-permissions'");
+    expect(said).not.toContain(CONTINUE_ARG);
+    expect(said).not.toContain("/bin/sh");
   });
 
   test("does not retry when --continue was not the wrapper's idea", async () => {
@@ -956,5 +937,116 @@ describe("a session that is created and does not survive", () => {
     expect(code).not.toBe(SESSION_DIED_EXIT);
     expect([...r.out, ...r.err].join("\n")).toContain("survives this terminal");
     expect(written.length).toBeGreaterThan(0);
+  });
+});
+
+/* ------------------------------------------------------------------------- */
+/* The pane's --continue fallback                                             */
+/* ------------------------------------------------------------------------- */
+
+describe("the --continue fallback in the pane command", () => {
+  test("wraps only when --continue was injected by us", () => {
+    const wrapped = paneCommand([]);
+    expect(wrapped.slice(0, 4)).toEqual(["/bin/sh", "-c", CONTINUE_FALLBACK_SCRIPT, CONTINUE_WRAPPER_NAME]);
+    expect(wrapped.slice(4)).toEqual([...HEAD]);
+    // A user who chose a session gets the bare command: nothing to fall back from.
+    for (const sel of ["--resume", "--continue", "-c"]) {
+      expect(paneCommand([sel])[0]).toBe(AGENT);
+    }
+    expect(continueFallbackArgv([AGENT, "--model", "x"], true)).toEqual([AGENT, "--model", "x"]);
+  });
+
+  test("-p is never wrapped", () => {
+    const plan = planFor("none", { userArgs: ["-p", "hi"] });
+    expect(plan.direct?.[0]).toBe(AGENT);
+  });
+
+  test("tmux absent: the direct exec carries the fallback too", () => {
+    const plan = decide(
+      { session: "s", userArgs: [], cwd: "/w", state: "none", force: false, env: {}, store: createStore() },
+      fakeTmux({ which: () => null }),
+    );
+    expect(plan.direct?.slice(0, 4)).toEqual(["/bin/sh", "-c", CONTINUE_FALLBACK_SCRIPT, CONTINUE_WRAPPER_NAME]);
+  });
+
+  test("the shell reads as the agent for liveness, and is recognisable for adoption", () => {
+    const argv = paneCommand([]);
+    const [row] = parseProcesses(`  100     1 sh               ${argv.join(" ")}\n`);
+    expect(row).toBeDefined();
+    expect(looksLikeAgent(row!)).toBe(true);
+    expect(isContinueWrapper(row!)).toBe(true);
+    const [bare] = parseProcesses(`  101   100 claude           ${[...HEAD].join(" ")}\n`);
+    expect(isContinueWrapper(bare!)).toBe(false);
+  });
+
+  /**
+   * The script itself, under a real /bin/sh, with a fake claude that records
+   * each launch's argv as JSON and exits with a chosen status per attempt.
+   * `date` is shimmed so the fallback window is testable without waiting.
+   */
+  function runScript(opts: { firstExit: number; secondsElapsed?: number; userArgs?: string[] }) {
+    const dir = tempHome();
+    const log = resolve(dir, "launches");
+    const fake = resolve(dir, "claude");
+    Bun.write(
+      fake,
+      [
+        "#!/bin/sh",
+        `n=$(cat '${log}.n' 2>/dev/null || echo 0); n=$((n + 1)); echo $n > '${log}.n'`,
+        // One JSON array per line, built from argv without the shell touching it.
+        `bun -e 'console.log(JSON.stringify(process.argv.slice(1)))' -- "$@" >> '${log}'`,
+        `[ "$n" = 1 ] && exit ${opts.firstExit}`,
+        "exit 0",
+        "",
+      ].join("\n"),
+    );
+    Bun.spawnSync(["chmod", "755", fake]);
+    const dateShim = resolve(dir, "date");
+    const elapsed = opts.secondsElapsed ?? 1;
+    Bun.write(
+      dateShim,
+      `#!/bin/sh\nif [ -e '${dir}/d' ]; then echo ${1000 + elapsed}; else : > '${dir}/d'; echo 1000; fi\n`,
+    );
+    Bun.spawnSync(["chmod", "755", dateShim]);
+    const argv = paneCommand(opts.userArgs ?? []);
+    argv[4] = fake;
+    const p = Bun.spawnSync(argv, {
+      env: { ...process.env, PATH: `${dir}:${process.env.PATH ?? ""}` },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const text = Bun.file(log).size > 0 ? require("node:fs").readFileSync(log, "utf8") : "";
+    const launches = text.split("\n").filter((l: string) => l !== "").map((l: string) => JSON.parse(l) as string[]);
+    return { exit: p.exitCode, launches, stderr: p.stderr.toString() };
+  }
+
+  test("exit 1 with --continue relaunches once, without it, every other argument intact", () => {
+    const hazard = ["a b", "it's", '"q"', "$HOME", "`x`", "--continue-ish", "-x"];
+    const r = runScript({ firstExit: 1, userArgs: hazard });
+    expect(r.launches).toHaveLength(2);
+    expect(r.launches[0]).toEqual([...DEV_CHANNEL_ARGS, SKIP_PERMISSIONS_ARG, CONTINUE_ARG, ...hazard]);
+    expect(r.launches[1]).toEqual([...DEV_CHANNEL_ARGS, SKIP_PERMISSIONS_ARG, ...hazard]);
+    expect(r.exit).toBe(0);
+    expect(r.stderr).toContain("starting a fresh session");
+  });
+
+  test("exit 0 is passed through: no second launch", () => {
+    const r = runScript({ firstExit: 0 });
+    expect(r.launches).toHaveLength(1);
+    expect(r.exit).toBe(0);
+  });
+
+  test("death by signal is passed through: no second launch", () => {
+    const r = runScript({ firstExit: 143 });
+    expect(r.launches).toHaveLength(1);
+    expect(r.exit).toBe(143);
+  });
+
+  test("a failure AFTER the window is a crash, not a first run: passed through", () => {
+    const r = runScript({ firstExit: 1, secondsElapsed: 301 });
+    expect(r.launches).toHaveLength(1);
+    expect(r.exit).toBe(1);
+    // CONTROL: just inside the window it does fall back.
+    expect(runScript({ firstExit: 1, secondsElapsed: 299 }).launches).toHaveLength(2);
   });
 });
