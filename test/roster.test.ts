@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { CONTINUE_WRAPPER_NAME } from "../src/tmux.ts";
 import {
   type RosterEntry,
   adoptEntries,
@@ -267,7 +268,7 @@ describe("reading the running agents off the process table", () => {
     "",
   ].join("\n");
 
-  function psDeps(): RestoreDeps {
+  function psDeps(ps: string = PS): RestoreDeps {
     return {
       tmux: {
         env: {},
@@ -280,7 +281,7 @@ describe("reading the running agents off the process table", () => {
             // a drifted format fails loudly instead of half-working.
             const fmt = argv[2] ?? "";
             return fmt === "pid=,ppid=,comm=,args="
-              ? { exitCode: 0, stdout: PS, stderr: "" }
+              ? { exitCode: 0, stdout: ps, stderr: "" }
               : { exitCode: 0, stdout: "", stderr: "" };
           }
           return { exitCode: 0, stdout: "", stderr: "" };
@@ -304,6 +305,29 @@ describe("reading the running agents off the process table", () => {
     const afterCwd = e?.command[e.command.indexOf("/Volumes/Dev/agents/brosnan") + 1];
     expect(afterCwd).toBe("claude");
     expect(afterCwd?.startsWith("-")).toBe(false);
+  });
+
+  /**
+   * `suite claude` now runs the agent under a `/bin/sh -c` fallback shell, so
+   * the PANE process is the shell. Its args carry `claude` as a word and match
+   * `looksLikeAgent`; adopting it would split a shell script on whitespace.
+   * The claude child is what must be adopted.
+   */
+  test("adopts the claude under the --continue fallback shell, never the shell", async () => {
+    const wrapped = [
+      "  685     1 tmux             tmux new-session -d -s suite-brosnan",
+      `39909   685 sh               /bin/sh -c t0=$(date +%s 2>/dev/null); "$@"; rc=$? ${CONTINUE_WRAPPER_NAME} claude --dangerously-load-development-channels server:suite-channel --continue`,
+      "39910 39909 claude           claude --dangerously-load-development-channels server:suite-channel --continue",
+      "",
+    ].join("\n");
+    const found = await runningSessions(psDeps(wrapped));
+    expect(found).toHaveLength(1);
+    expect(found[0]?.argv).toEqual([
+      "claude",
+      "--dangerously-load-development-channels",
+      "server:suite-channel",
+      "--continue",
+    ]);
   });
 });
 

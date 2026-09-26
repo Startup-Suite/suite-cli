@@ -860,10 +860,20 @@ look at the next one.** The seen-flag is stored in
 ## MCP registration
 
 `suite init` writes both MCP entries with `claude mcp add` rather than editing
-`.mcp.json` by hand — the file format is Claude Code's to change, and only
-`claude mcp add` decides scope. **The scope default is `local`**, so `-s user`
-is passed explicitly on every invocation; omitting it silently scopes the entry
-to one directory.
+`.mcp.json` by hand — the file format is Claude Code's to change. They are
+registered at **local scope** (`-s local`, passed explicitly), run from the
+agent directory: private to that directory, stored in `~/.claude.json` under
+its key (or under the enclosing git work tree's root, if it is inside one), and
+never written into the directory itself.
+
+**Not user scope.** User scope is one entry for every Claude on the machine, so
+before 0.5.0 installing a second agent silently re-pointed the first at the
+second one's Suite and runtime. **Not project scope** (`.mcp.json`) either:
+that puts the token inside the agent directory, where a repository can commit
+it, and each server then needs approving. A user-scope entry left by an older
+`suite init` is **left alone** — another agent directory may still be running
+on it — and `init` warns when it names a different runtime; this directory's
+local entry takes precedence here regardless.
 
 Being written is not being connected, so `init` finishes by health-checking
 with `claude mcp list` and requires both `suite-channel` and `startup-suite` to
@@ -884,7 +894,7 @@ own environment:
 That last case decides the default. An env reference that quietly hands
 `${SUITE_TOKEN}` to the channel as a bearer token produces a session that
 authenticates with garbage and names no cause. So the **default is an inline
-value at user scope**, and the reference form is opt-in for operators keeping
+value at local scope** (in the mode-600 `~/.claude.json`), and the reference form is opt-in for operators keeping
 secrets in a manager: `suite init --token-from-env SUITE_TOKEN`, which then
 requires that variable to be exported wherever `claude` is launched.
 

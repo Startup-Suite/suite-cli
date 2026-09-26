@@ -12,11 +12,14 @@
  *
  * Two rules the rest of the file exists to keep:
  *
- *  1. MCP ENTRIES ARE WRITTEN BY `claude mcp add`, NEVER BY HAND. Hand-rolling
- *     `.mcp.json` means owning a file format we do not control and cannot see
- *     change. `claude mcp add` also decides scope, and its scope DEFAULT IS
- *     `local` — `-s user` is passed explicitly on every invocation because user
- *     scope is not what omission gives you.
+ *  1. MCP ENTRIES ARE WRITTEN BY `claude mcp add`, NEVER BY HAND, AT LOCAL
+ *     SCOPE. Hand-rolling `.mcp.json` means owning a file format we do not
+ *     control and cannot see change. The scope is `-s local` (passed
+ *     explicitly): an entry private to THIS agent directory, stored in
+ *     `~/.claude.json` under the directory's key, never in the directory
+ *     itself. It used to be `-s user`, which is ONE entry for every Claude on
+ *     the machine, so installing a second agent re-pointed the first one at the
+ *     second one's Suite and runtime. See {@link registerServers}.
  *  2. WRITTEN IS NOT CONNECTED. Step 7 health-checks. An entry that was written
  *     perfectly and cannot connect is the exact failure this tool exists to
  *     stop someone debugging by hand, so a green result requires seeing the
@@ -24,7 +27,7 @@
  *     prints the raw line — never a false green.
  */
 import { resolve } from "node:path";
-import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import {
   createStore,
@@ -74,7 +77,7 @@ import {
  * That last case decides the default. An env reference that silently delivers
  * the four characters `${V}` as your bearer token produces a channel that
  * authenticates with garbage and reports no cause — the same class of silent
- * failure this CLI exists to prevent. So the DEFAULT is an inline value at user
+ * failure this CLI exists to prevent. So the DEFAULT is an inline value at local
  * scope (`~/.claude.json`, mode-protected, outside any repo), and an env
  * reference is available for operators who want their secret in a secret
  * manager instead: {@link InitOptions.tokenFromEnv}. Documented, not implicit.
@@ -139,6 +142,33 @@ export const PLUGIN_REPO = "https://github.com/Startup-Suite/claude-code-suite-c
 export const PLUGIN_DIRNAME = "claude-code-suite-channel";
 export const CHANNEL_SERVER = "suite-channel";
 export const TOOLS_SERVER = "startup-suite";
+
+/**
+ * The scope both MCP entries are registered at. `local`, NOT `user`.
+ *
+ * MEASURED against Claude Code 2.1.281 on a throwaway HOME (2026-09-26):
+ *   - `claude mcp add NAME -s local` writes `~/.claude.json` (mode 600) under
+ *     `projects[<dir>].mcpServers`, where <dir> is the working directory, or
+ *     the enclosing git work tree's root when there is one. Nothing is written
+ *     into the directory itself.
+ *   - In that directory the local entry WINS over a user-scope entry of the
+ *     same name; a sibling directory still sees the user-scope one.
+ *   - It needs no approval, unlike a project-scope `.mcp.json`.
+ *
+ * WHY NOT `user`: user scope is one entry per machine. Installing a second
+ * agent replaced the first agent's entries with the second one's Suite and
+ * runtime, so the first agent's next restart would have federated as the
+ * wrong runtime into the wrong install (found on a real host, 2026-09-26).
+ *
+ * WHY NOT `project` (`<dir>/.mcp.json`): that file carries the token INSIDE the
+ * agent directory, where a repository can commit it — the one write this CLI
+ * refuses everywhere else (see `src/paths.ts`) — and each server then needs
+ * approving before it loads.
+ *
+ * Every `claude mcp` call that reads or writes these entries runs with the
+ * agent directory as its cwd, because that is what `local` is keyed by.
+ */
+export const MCP_SCOPE = "local";
 
 export function defaultCheckout(env: Record<string, string | undefined>): string {
   return resolve(dataDir(env), PLUGIN_DIRNAME);
@@ -501,7 +531,7 @@ export function channelAddArgs(entry: ChannelEntry): string[] {
     "add",
     CHANNEL_SERVER,
     "-s",
-    "user",
+    MCP_SCOPE,
     "-e",
     `SUITE_URL=${channelWsUrl(entry.suiteUrl)}`,
     "-e",
@@ -539,7 +569,7 @@ export function toolsAddArgs(
     "add",
     TOOLS_SERVER,
     "-s",
-    "user",
+    MCP_SCOPE,
     "-t",
     "http",
     toolsHttpUrl(suiteUrl),
@@ -612,7 +642,8 @@ export function parseServerStatus(listOutput: string, name: string): ServerStatu
 }
 
 export async function verifyConnections(deps: InitDeps): Promise<ServerStatus[]> {
-  const r = await deps.run(["claude", "mcp", "list"]);
+  // In the agent directory: local-scope entries are only listed there.
+  const r = await deps.run(["claude", "mcp", "list"], { cwd: deps.cwd });
   const text = `${r.stdout}\n${r.stderr}`;
   return [CHANNEL_SERVER, TOOLS_SERVER].map((n) => parseServerStatus(text, n));
 }
@@ -642,6 +673,120 @@ export function connectionReport(statuses: ServerStatus[]): { ok: boolean; lines
     }
   }
   return { ok, lines };
+}
+
+/* ------------------------------------------------------------------------- */
+/* Registration                                                               */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Where Claude Code keeps user- and local-scope MCP entries. Read-only here:
+ * this CLI never writes it except through `claude mcp`.
+ */
+export function claudeJsonPath(env: Record<string, string | undefined>): string {
+  const dir = env.CLAUDE_CONFIG_DIR;
+  return dir !== undefined && dir !== "" ? resolve(dir, ".claude.json") : resolve(env.HOME ?? "", ".claude.json");
+}
+
+/**
+ * The runtime id a USER-scope channel entry names, or null when there is none.
+ *
+ * Reads exactly one field. The file holds tokens, so nothing else from it is
+ * ever returned, logged or compared.
+ */
+export function userScopeChannelRuntime(text: string): { present: boolean; runtimeId: string | null } {
+  try {
+    const raw = JSON.parse(text) as { mcpServers?: Record<string, { env?: Record<string, unknown> }> };
+    const entry = raw.mcpServers?.[CHANNEL_SERVER];
+    if (entry === undefined) return { present: false, runtimeId: null };
+    const id = entry.env?.SUITE_RUNTIME_ID;
+    return { present: true, runtimeId: typeof id === "string" ? id : null };
+  } catch {
+    return { present: false, runtimeId: null };
+  }
+}
+
+/**
+ * What to say about a user-scope entry left behind by an older `suite init`.
+ *
+ * LEFT ALONE, NEVER REMOVED OR MIGRATED. Another agent directory on this
+ * machine may have no entry of its own and be running on that one right now;
+ * removing it would take that agent off Suite at its next restart, and nothing
+ * in the file says which directory it belongs to, so it cannot be moved there.
+ * This directory's local entry takes precedence here regardless.
+ */
+export function userScopeLines(found: { present: boolean; runtimeId: string | null }, runtimeId: string): string[] {
+  if (!found.present) return [];
+  const named = found.runtimeId === null ? "an unreadable runtime id" : `runtime ${found.runtimeId}`;
+  if (found.runtimeId === runtimeId) {
+    return [
+      row("", "", `a user-scope ${CHANNEL_SERVER} entry (${named}) is also present; left alone`),
+      row("", "", "this directory uses its own entry, which takes precedence here"),
+    ];
+  }
+  return [
+    row("warning", "", `a user-scope ${CHANNEL_SERVER} entry names ${named}, not ${runtimeId}; left alone`),
+    row("", "", "this directory uses its own entry, which takes precedence here. Any other agent"),
+    row("", "", "directory WITHOUT its own entry still runs as that runtime: run suite init there."),
+  ];
+}
+
+/**
+ * Register both entries at {@link MCP_SCOPE} in the agent directory.
+ *
+ * Returns the report lines. Never touches user scope: a clash is resolved by
+ * removing THIS directory's local entry and re-adding, never anything wider.
+ */
+export async function registerServers(
+  deps: Pick<InitDeps, "run" | "cwd" | "env">,
+  invocations: string[][],
+  runtimeId: string,
+): Promise<string[]> {
+  const lines: string[] = [];
+  for (const argv of invocations) {
+    // A short-lived, directly spawned process: no shell, so no history, and the
+    // command line is gone before anyone can read it out of `ps`. This is the
+    // one place stage 2 sanctions a secret in argv, and the constructed command
+    // line is NEVER logged — it carries the token.
+    let r = await deps.run(argv, { allowSecretsInArgv: true, cwd: deps.cwd });
+
+    // A SECOND `suite init` MUST CONVERGE, NOT FAIL. `claude mcp add` refuses a
+    // name that is already registered in that scope, so once init had
+    // succeeded it could never be run again — which is precisely when you run
+    // it: after fixing a URL, rotating a token, or moving the checkout. The
+    // values were just re-collected from the operator, so replacing THIS
+    // directory's two entries is the intended outcome. The remove is scoped to
+    // local, in this directory: it cannot reach another agent's entry.
+    if (r.exitCode !== 0 && alreadyRegistered(r.stderr || r.stdout)) {
+      const name = argv[3] as string;
+      await deps.run(["claude", "mcp", "remove", name, "-s", MCP_SCOPE], { cwd: deps.cwd });
+      r = await deps.run(argv, { allowSecretsInArgv: true, cwd: deps.cwd });
+      if (r.exitCode === 0) lines.push(row(name, "replaced", "this directory already had an entry"));
+    }
+
+    if (r.exitCode !== 0) {
+      // The argv is unlogged because it carries the token; claude's own stderr
+      // does not, and it is the only thing that says WHY. Reporting the exit
+      // code alone hands the operator a number and no next step — which is what
+      // `claude mcp add suite-channel failed with exit 1` did on a real host.
+      throw new Error(
+        [`claude mcp add ${argv[3]} failed with exit ${r.exitCode}:`, (r.stderr || r.stdout).trim()]
+          .filter((l) => l !== "")
+          .join("\n"),
+      );
+    }
+  }
+  lines.push(row(CHANNEL_SERVER, "registered", `local scope: ${deps.cwd}`));
+  lines.push(row(TOOLS_SERVER, "registered", `local scope: ${deps.cwd}`));
+
+  let text: string | null = null;
+  try {
+    text = readFileSync(claudeJsonPath(deps.env), "utf8");
+  } catch {
+    text = null;
+  }
+  if (text !== null) lines.push(...userScopeLines(userScopeChannelRuntime(text), runtimeId));
+  return lines;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -802,40 +947,7 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
     toolsAddArgs(suiteUrl, tokenLiteral, headers),
   ];
 
-  for (const argv of invocations) {
-    // A short-lived, directly spawned process: no shell, so no history, and the
-    // command line is gone before anyone can read it out of `ps`. This is the
-    // one place stage 2 sanctions a secret in argv, and the constructed command
-    // line is NEVER logged — it carries the token.
-    let r = await deps.run(argv, { allowSecretsInArgv: true });
-
-    // A SECOND `suite init` MUST CONVERGE, NOT FAIL. `claude mcp add` refuses a
-    // name that is already registered, so once init had succeeded it could
-    // never be run again — which is precisely when you run it: after fixing a
-    // URL, rotating a token, or moving the checkout. Re-registering is this
-    // command's whole job, and the values were just re-collected from the
-    // operator, so replacing our own two entries is the intended outcome.
-    if (r.exitCode !== 0 && alreadyRegistered(r.stderr || r.stdout)) {
-      const name = argv[3] as string;
-      await deps.run(["claude", "mcp", "remove", name, "-s", "user"]);
-      r = await deps.run(argv, { allowSecretsInArgv: true });
-      if (r.exitCode === 0) say(row(name, "replaced", "an entry was already registered"));
-    }
-
-    if (r.exitCode !== 0) {
-      // The argv is unlogged because it carries the token; claude's own stderr
-      // does not, and it is the only thing that says WHY. Reporting the exit
-      // code alone hands the operator a number and no next step — which is what
-      // `claude mcp add suite-channel failed with exit 1` did on a real host.
-      throw new Error(
-        [`claude mcp add ${argv[3]} failed with exit ${r.exitCode}:`, (r.stderr || r.stdout).trim()]
-          .filter((l) => l !== "")
-          .join("\n"),
-      );
-    }
-  }
-  say(row(CHANNEL_SERVER, "registered", "user scope"));
-  say(row(TOOLS_SERVER, "registered", "user scope"));
+  for (const line of await registerServers(deps, invocations, runtimeId)) say(line);
   if (usingReference) {
     say(row("", "", `token read from ${options.tokenFromEnv} at launch; export it or the channel will not authenticate`));
   }

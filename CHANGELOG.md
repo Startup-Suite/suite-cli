@@ -10,6 +10,42 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.5.0
+
+- **`suite init` registers the MCP entries per agent directory, not per
+  machine.** Both `suite-channel` and `startup-suite` are now added at local
+  scope, from the agent directory. They used to be added at user scope, which
+  is one entry shared by every Claude on the machine, so installing a second
+  agent replaced the first agent's entries with the second one's Suite and
+  runtime. On a real host that meant an agent's next restart would have
+  federated into the other install as the other runtime. Nothing is written
+  into the agent directory; the entries live in the mode-600 `~/.claude.json`
+  under the directory's key. `init` never removes or rewrites a user-scope
+  entry, because another agent may still depend on it. It warns when that entry
+  names a different runtime, and this directory's own entry takes precedence
+  here. A re-run replaces only this directory's entries. Agents that relied on
+  the old user-scope entry keep working until you run `suite init` in their
+  directory.
+
+- **A new agent's first `suite claude` stays up again.** `suite claude` injects
+  `--continue`, and in a directory with no conversation Claude exits 1 with "No
+  conversation found to continue". The earlier retry (PR #21) ran from `suite
+  claude` when the session was dead 1.5 s after launch, but Claude's development-channels warning
+  (and, in a new directory, the workspace-trust prompt) keeps the process alive
+  until it is answered. So the retry never fired, `suite claude` printed
+  "started …", and the agent exited as soon as the dialog was accepted. The
+  fallback now runs in the pane itself: `/bin/sh -c` runs claude with
+  `--continue`, and if that exits non-zero it `exec`s claude without it. The
+  relaunch shows the development-channels warning again, so a new agent asks
+  for it twice. The
+  argv still reaches claude as positional parameters and is never parsed as
+  shell text. It does not retry after exit 0, after death by signal, or when the
+  first run lasted 5 minutes or more, because a continued conversation that
+  exits non-zero after that long has crashed, and restarting it fresh would drop
+  the conversation without saying so. The restore roster records the wrapped
+  command, and `suite restore --adopt` adopts the claude process under the
+  shell, not the shell.
+
 ## 0.4.0
 
 - **`suite hermes` and `suite openclaw`: stamp a Hermes or OpenClaw agent root

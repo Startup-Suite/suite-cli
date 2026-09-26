@@ -23,6 +23,7 @@ import {
 import {
   type TmuxDeps,
   descendants,
+  isContinueWrapper,
   liveTmuxDeps,
   looksLikeAgent,
   parsePanes,
@@ -155,7 +156,11 @@ export async function runningSessions(
       }
       continue;
     }
-    const kids = descendants(procs, [Number(pid)]);
+    // The `suite claude` fallback shell is skipped: its args are a shell script
+    // plus positional arguments, and splitting them on whitespace (below) would
+    // record a command that cannot be replayed. The claude process under it is
+    // what gets adopted, exactly as for a pane that runs claude directly.
+    const kids = descendants(procs, [Number(pid)]).filter((k) => !isContinueWrapper(k));
     // The stamp relaunch first: it is the pane's own process in a `suite
     // hermes` / `suite openclaw` session, and the command that re-creates it.
     // Its gateway child is only a fallback, for a gateway started by hand.
