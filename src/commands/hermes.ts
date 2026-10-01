@@ -181,39 +181,49 @@ export const MODEL_KEY_ENV = "CUSTOM_MODEL_API_KEY";
 export const TOOLSET_KEY = "platform_toolsets.startup_suite";
 
 /**
- * The lean default for that key. PRODUCT DEFAULT (2026-09-25, task owner's
- * decision, reversible): a Suite channel agent reaches its capabilities
- * through the Suite MCP bundle, and giving a chat-driven agent shell and file
- * tools by default widens what untrusted chat can reach. MEASURED at
- * fdec926e: with the key unset the first prompt of a turn is 16,633 tokens,
- * which a 16K-context model cannot answer. `hermes-webhook` is
- * web_search/web_extract/vision_analyze/clarify (toolsets.py:44,244), and an
- * explicit list with no MCP server named in it still merges every enabled
- * MCP server (`_merge_mcp_servers`), so the Suite bridge stays. `--full-toolset`
- * opts out.
+ * The managed headless default for that key. `suite hermes` is an unattended
+ * coding harness, not a chat-only webhook: without terminal + file it resorts
+ * to application-specific escape hatches (the originating incident used
+ * Godot's OS.exec) and cannot maintain its own workspace. Keep the list
+ * explicit so a small-context model does not receive every Hermes tool.
+ * `--full-toolset` still opts out to Hermes's own platform default.
  */
-export const LEAN_TOOLSET: readonly string[] = ["hermes-webhook"];
+export const HEADLESS_TOOLSET: readonly string[] = ["hermes-webhook", "terminal", "file", "todo", "skills", "web"];
+export const LEGACY_LEAN_TOOLSET: readonly string[] = ["hermes-webhook"];
 
-/** Whether a config.yaml value is exactly the lean default this verb writes. */
-export function isLeanToolset(value: unknown): boolean {
-  return Array.isArray(value) && value.length === LEAN_TOOLSET.length && value.every((v, i) => v === LEAN_TOOLSET[i]);
+/** Persistent equivalents of `--yolo --accept-hooks` for gateway turns. */
+export const HEADLESS_CONFIG_DEFAULTS: readonly (readonly [string, string])[] = [
+  ["approvals.mode", "off"],
+  ["hooks_auto_accept", "true"],
+] as const;
+
+/** Whether a config.yaml value is exactly the managed headless default. */
+export function isHeadlessToolset(value: unknown): boolean {
+  return Array.isArray(value) && value.length === HEADLESS_TOOLSET.length && value.every((v, i) => v === HEADLESS_TOOLSET[i]);
+}
+
+/** Includes the old chat-only list so a repeat stamp upgrades it once. */
+export function isManagedToolset(value: unknown): boolean {
+  const same = (wanted: readonly string[]) =>
+    Array.isArray(value) && value.length === wanted.length && value.every((v, i) => v === wanted[i]);
+  return same(HEADLESS_TOOLSET) || same(LEGACY_LEAN_TOOLSET);
 }
 
 /**
- * The toolset key's planned outcome. An operator's own value (anything that is
- * neither absent nor exactly the lean default) is never rewritten, in either
- * mode. Default mode writes the lean list when absent; `--full-toolset`
- * removes the key only when it holds exactly the lean list.
+ * The toolset key's planned outcome. An operator's own value is never
+ * rewritten. Default mode upgrades the old managed list; `--full-toolset`
+ * removes either managed list and leaves Hermes to choose its platform default.
  */
 export function toolsetOutcome(current: unknown, fullToolset: boolean, absent: "written" | "repaired"): "written" | "repaired" | "unchanged" {
   const unset = current === undefined || current === null;
-  if (fullToolset) return isLeanToolset(current) ? "repaired" : "unchanged";
-  return unset ? absent : "unchanged";
+  if (fullToolset) return isManagedToolset(current) ? "repaired" : "unchanged";
+  if (unset) return absent;
+  return isManagedToolset(current) && !isHeadlessToolset(current) ? "repaired" : "unchanged";
 }
 
 /** Whether `current` is an operator's own toolset value, preserved as-is. */
 export function isOperatorToolset(current: unknown): boolean {
-  return current !== undefined && current !== null && !isLeanToolset(current);
+  return current !== undefined && current !== null && !isManagedToolset(current);
 }
 
 /** Where `--install-hermes` leaves the launcher, relative to HERMES_HOME. */
@@ -241,7 +251,7 @@ export interface HermesOptions {
   allowedUsers?: string;
   hermes?: string;
   installHermes: boolean;
-  /** Leave `platform_toolsets.startup_suite` to Hermes's own default (see {@link LEAN_TOOLSET}). */
+  /** Leave `platform_toolsets.startup_suite` to Hermes's own default (see {@link HEADLESS_TOOLSET}). */
   fullToolset: boolean;
   hermesHome: string;
   stampOnly: boolean;
@@ -531,6 +541,7 @@ export function desiredModelKeys(opts: HermesOptions): [string, string][] {
 export function sameConfigValue(current: unknown, desired: string): boolean {
   if (current === undefined || current === null) return false;
   if (typeof current === "number") return String(current) === desired;
+  if (typeof current === "boolean") return String(current) === desired;
   return typeof current === "string" && current === desired;
 }
 
@@ -1030,8 +1041,17 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
       actions.push(planned("config_set", TOOLSET_KEY, toolsetOutcome(toolsets, o.fullToolset, absent)));
       if (isOperatorToolset(toolsets)) {
         state.warnings.push(
-          `${TOOLSET_KEY} holds an operator-set value; left unchanged (the stamp's own default is ${JSON.stringify(LEAN_TOOLSET)}, and it never overwrites another value)`,
+          `${TOOLSET_KEY} holds an operator-set value; left unchanged (the stamp's own default is ${JSON.stringify(HEADLESS_TOOLSET)}, and it never overwrites another value)`,
         );
+      }
+
+      for (const [key, value] of HEADLESS_CONFIG_DEFAULTS) {
+        const current = lookupKey(config, key);
+        const unset = current === undefined || current === null;
+        actions.push(planned("config_set", key, unset ? absent : "unchanged"));
+        if (!unset && !sameConfigValue(current, value)) {
+          state.warnings.push(key + " holds an operator-set value; left unchanged (the unattended default is " + value + ")");
+        }
       }
 
       if (o.modelApiKeyRef !== undefined) {
@@ -1136,7 +1156,7 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
 
       const wanted = new Map(desiredModelKeys(o));
       for (const a of actions) {
-        if (a.kind !== "config_set" || a.outcome === "unchanged" || a.target === TOOLSET_KEY) continue;
+        if (a.kind !== "config_set" || a.outcome === "unchanged" || a.target === TOOLSET_KEY || !wanted.has(a.target)) continue;
         const value = wanted.get(a.target) as string;
         const r = await spawn([bin, "config", "set", a.target, value]);
         if (r.exitCode !== 0) throw fail("config_set_failed", `hermes config set ${a.target} exited ${r.exitCode}: ${lastLine(r.stderr || r.stdout)}`);
@@ -1150,15 +1170,26 @@ export function hermesWriter(ctx: { opts: HermesOptions | null }, deps: HermesDe
         if (a !== undefined) a.applied = true;
       }
 
-      // The toolset key: set the lean list, or (--full-toolset) remove the
-      // lean list a previous stamp wrote. `unset` is Hermes's own remover.
+      const headlessDefaults = new Map(HEADLESS_CONFIG_DEFAULTS);
+      for (const a of actions) {
+        const value = headlessDefaults.get(a.target);
+        if (a.kind !== "config_set" || value === undefined || a.outcome === "unchanged") continue;
+        const r = await spawn([bin, "config", "set", a.target, value]);
+        if (r.exitCode !== 0) throw fail("config_set_failed", `hermes config set ${a.target} exited ${r.exitCode}: ${lastLine(r.stderr || r.stdout)}`);
+        const now = lookupKey(readHermesConfig(home), a.target);
+        if (!sameConfigValue(now, value)) throw fail("config_set_ineffective", `hermes config set ${a.target} exited 0 but config.yaml does not hold the value`);
+        a.applied = true;
+      }
+
+      // The toolset key: set the managed headless list, or (--full-toolset)
+      // remove a managed list a previous stamp wrote. `unset` is Hermes's own remover.
       const ts = actions.find((a) => a.kind === "config_set" && a.target === TOOLSET_KEY);
       if (ts !== undefined && ts.outcome !== "unchanged") {
-        const argv = o.fullToolset ? [bin, "config", "unset", TOOLSET_KEY] : [bin, "config", "set", TOOLSET_KEY, JSON.stringify(LEAN_TOOLSET)];
+        const argv = o.fullToolset ? [bin, "config", "unset", TOOLSET_KEY] : [bin, "config", "set", TOOLSET_KEY, JSON.stringify(HEADLESS_TOOLSET)];
         const r = await spawn(argv);
         if (r.exitCode !== 0) throw fail("config_set_failed", `hermes config ${argv[2]} ${TOOLSET_KEY} exited ${r.exitCode}: ${lastLine(r.stderr || r.stdout)}`);
         const now = lookupKey(readHermesConfig(home), TOOLSET_KEY);
-        const held = o.fullToolset ? now === undefined || now === null : isLeanToolset(now);
+        const held = o.fullToolset ? now === undefined || now === null : isHeadlessToolset(now);
         if (!held) throw fail("config_set_ineffective", `hermes config ${argv[2]} ${TOOLSET_KEY} exited 0 but config.yaml does not reflect it`);
         ts.applied = true;
       }

@@ -19,7 +19,8 @@ import {
   HERMES_AGENT_COMM,
   HERMES_AGENT_REF,
   HERMES_CHANNEL_REF,
-  LEAN_TOOLSET,
+  HEADLESS_TOOLSET,
+  LEGACY_LEAN_TOOLSET,
   MCP_SDK_PIN,
   TOOLSET_KEY,
   MODEL_KEY_ENV,
@@ -491,7 +492,7 @@ describe("idempotence and repair", () => {
   });
 });
 
-describe("the Suite platform toolset (product default: lean, --full-toolset opts out)", () => {
+describe("the Suite platform headless defaults (--full-toolset opts out)", () => {
   const cfgPath = (): string => join(hermesHome, "config.yaml");
   const toolsetValue = (): unknown => lookupKey(parseYaml(readFileSync(cfgPath(), "utf8")), TOOLSET_KEY);
   /** Every stub call that writes or removes the toolset key. */
@@ -501,17 +502,22 @@ describe("the Suite platform toolset (product default: lean, --full-toolset opts
   const configWrites = (calls: StubCall[]): StubCall[] =>
     calls.filter((c) => c.argv[0] === "config" && (c.argv[1] === "set" || c.argv[1] === "unset"));
 
-  test("the default sets exactly platform_toolsets.startup_suite to [hermes-webhook], and no other toolset key", async () => {
+  test("the default grants the bounded headless toolset and unattended approvals", async () => {
     makeManagedPython();
     const { result, exitCode } = await stamp();
     expect(exitCode).toBe(0);
-    expect(toolsetWrites(stubCalls())).toEqual([["config", "set", "platform_toolsets.startup_suite", '["hermes-webhook"]']]);
+    expect(toolsetWrites(stubCalls())).toEqual([["config", "set", "platform_toolsets.startup_suite", JSON.stringify(HEADLESS_TOOLSET)]]);
     // No other platform's toolsets and no global default are touched.
     const others = configWrites(stubCalls()).filter((c) => /toolset/.test(c.argv[2] ?? "") && c.argv[2] !== TOOLSET_KEY);
     expect(others).toEqual([]);
-    const pts = lookupKey(parseYaml(readFileSync(cfgPath(), "utf8")), "platform_toolsets");
-    expect(pts).toEqual({ startup_suite: ["hermes-webhook"] });
-    expect(LEAN_TOOLSET).toEqual(["hermes-webhook"]);
+    const parsed = parseYaml(readFileSync(cfgPath(), "utf8")) as Record<string, unknown>;
+    const pts = lookupKey(parsed, "platform_toolsets");
+    expect(pts).toEqual({ startup_suite: HEADLESS_TOOLSET });
+    expect(HEADLESS_TOOLSET).toContain("terminal");
+    expect(HEADLESS_TOOLSET).toContain("file");
+    expect(lookupKey(parsed, "approvals.mode")).toBe("off");
+    const hooks = lookupKey(parsed, "hooks_auto_accept");
+    expect(hooks === true || hooks === "true").toBe(true);
     const a = result.actions.find((x) => x.kind === "config_set" && x.target === TOOLSET_KEY);
     expect(a).toEqual({ kind: "config_set", target: TOOLSET_KEY, outcome: "written", applied: true });
   });
@@ -522,7 +528,7 @@ describe("the Suite platform toolset (product default: lean, --full-toolset opts
     writeFileSync(cfgPath(), stringifyYaml({ platform_toolsets: { cli: ["hermes-cli"], telegram: ["hermes-telegram"] }, toolsets: ["kanban"] }));
     expect((await stamp()).exitCode).toBe(0);
     const cfg = parseYaml(readFileSync(cfgPath(), "utf8")) as Record<string, unknown>;
-    expect(cfg.platform_toolsets).toEqual({ cli: ["hermes-cli"], telegram: ["hermes-telegram"], startup_suite: ["hermes-webhook"] });
+    expect(cfg.platform_toolsets).toEqual({ cli: ["hermes-cli"], telegram: ["hermes-telegram"], startup_suite: HEADLESS_TOOLSET });
     expect(cfg.toolsets).toEqual(["kanban"]);
   });
 
@@ -552,6 +558,29 @@ describe("the Suite platform toolset (product default: lean, --full-toolset opts
     expect(toolsetWrites(stubCalls())).toEqual([]);
   });
 
+  test("upgrades the old managed chat-only list to the headless list", async () => {
+    makeManagedPython();
+    mkdirSync(hermesHome, { recursive: true });
+    writeFileSync(cfgPath(), stringifyYaml({ platform_toolsets: { startup_suite: LEGACY_LEAN_TOOLSET } }));
+    const { result, exitCode } = await stamp();
+    expect(exitCode).toBe(0);
+    expect(toolsetValue()).toEqual(HEADLESS_TOOLSET);
+    expect(outcomes(result)[`config_set ${TOOLSET_KEY}`]).toBe("repaired");
+  });
+
+  test("preserves explicit approval and hook policy overrides", async () => {
+    makeManagedPython();
+    mkdirSync(hermesHome, { recursive: true });
+    writeFileSync(cfgPath(), stringifyYaml({ approvals: { mode: "manual" }, hooks_auto_accept: false }));
+    const { result, exitCode } = await stamp();
+    expect(exitCode).toBe(0);
+    const cfg = parseYaml(readFileSync(cfgPath(), "utf8")) as Record<string, unknown>;
+    expect(lookupKey(cfg, "approvals.mode")).toBe("manual");
+    expect(lookupKey(cfg, "hooks_auto_accept")).toBe(false);
+    expect(result.warnings.some((w) => w.includes("approvals.mode") && w.includes("operator"))).toBe(true);
+    expect(result.warnings.some((w) => w.includes("hooks_auto_accept") && w.includes("operator"))).toBe(true);
+  });
+
   test("a re-run makes 0 config writes of any key, in either mode", async () => {
     for (const extra of [[], ["--full-toolset"]]) {
       rmSync(root, { recursive: true, force: true });
@@ -565,10 +594,10 @@ describe("the Suite platform toolset (product default: lean, --full-toolset opts
     }
   });
 
-  test("flipping default -> --full-toolset removes the lean list (repaired); flipping back writes it again (repaired)", async () => {
+  test("flipping default -> --full-toolset removes the managed list (repaired); flipping back writes it again (repaired)", async () => {
     makeManagedPython();
     expect((await stamp()).exitCode).toBe(0);
-    expect(toolsetValue()).toEqual(["hermes-webhook"]);
+    expect(toolsetValue()).toEqual(HEADLESS_TOOLSET);
 
     let before = stubCalls().length;
     const full = await stamp(stampArgs(["--full-toolset"]));
@@ -579,11 +608,11 @@ describe("the Suite platform toolset (product default: lean, --full-toolset opts
     expect(toolsetValue()).toBeUndefined();
 
     before = stubCalls().length;
-    const lean = await stamp();
-    expect(lean.exitCode).toBe(0);
-    expect(toolsetWrites(stubCalls().slice(before))).toEqual([["config", "set", TOOLSET_KEY, '["hermes-webhook"]']]);
-    expect(outcomes(lean.result)[`config_set ${TOOLSET_KEY}`]).toBe("repaired");
-    expect(toolsetValue()).toEqual(["hermes-webhook"]);
+    const headless = await stamp();
+    expect(headless.exitCode).toBe(0);
+    expect(toolsetWrites(stubCalls().slice(before))).toEqual([["config", "set", TOOLSET_KEY, JSON.stringify(HEADLESS_TOOLSET)]]);
+    expect(outcomes(headless.result)[`config_set ${TOOLSET_KEY}`]).toBe("repaired");
+    expect(toolsetValue()).toEqual(HEADLESS_TOOLSET);
   });
 
   test("--full-toolset takes no value", () => {
