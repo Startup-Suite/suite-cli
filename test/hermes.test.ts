@@ -24,6 +24,7 @@ import {
   MCP_SDK_PIN,
   TOOLSET_KEY,
   MODEL_KEY_ENV,
+  desiredModelKeys,
   agentNameForRoot,
   channelCheckoutDir,
   findHermesPython,
@@ -320,6 +321,30 @@ describe("options", () => {
     const o = parseHermesOptions(["--root", root, "--model-base-url", "u", "--model", "m"]);
     expect(o.hermesHome).toBe(join(root, ".hermes"));
     expect(o.hermesHome).not.toBe(join(process.env.HOME ?? "", ".hermes"));
+  });
+
+  test("the official Codex backend selects its OAuth-aware provider; an explicit provider still wins", () => {
+    const inferred = parseHermesOptions([
+      "--root",
+      root,
+      "--model-base-url",
+      "https://chatgpt.com/backend-api/codex/",
+      "--model",
+      "gpt-6-astra",
+    ]);
+    expect(desiredModelKeys(inferred)[0]).toEqual(["model.provider", "openai-codex"]);
+
+    const explicit = parseHermesOptions([
+      "--root",
+      root,
+      "--model-base-url",
+      "https://chatgpt.com/backend-api/codex",
+      "--model-provider",
+      "custom",
+      "--model",
+      "gpt-6-astra",
+    ]);
+    expect(desiredModelKeys(explicit)[0]).toEqual(["model.provider", "custom"]);
   });
 
   test("parsing stops at --; what follows goes to the gateway untouched", () => {
