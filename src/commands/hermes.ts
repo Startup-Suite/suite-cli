@@ -245,6 +245,8 @@ export interface HermesOptions {
   tokenRef?: string;
   keychainService?: string;
   modelBaseUrl?: string;
+  /** Hermes inference provider. Defaults from the base URL when omitted. */
+  modelProvider?: string;
   model?: string;
   contextLength?: number;
   modelApiKeyRef?: string;
@@ -269,6 +271,7 @@ const VALUE_FLAGS: Record<string, keyof HermesOptions> = {
   "--suite-url": "suiteUrl",
   "--runtime-id": "runtimeId",
   "--model-base-url": "modelBaseUrl",
+  "--model-provider": "modelProvider",
   "--model": "model",
   "--context-length": "contextLength",
   "--model-api-key-ref": "modelApiKeyRef",
@@ -358,6 +361,7 @@ export function parseHermesOptions(args: string[], cwd: string = process.cwd()):
     tokenRef,
     keychainService,
     modelBaseUrl: raw["--model-base-url"],
+    modelProvider: raw["--model-provider"],
     model: raw["--model"],
     contextLength,
     modelApiKeyRef: raw["--model-api-key-ref"],
@@ -525,10 +529,28 @@ export function lookupKey(data: Record<string, unknown> | null, key: string): un
   return node;
 }
 
+export const CODEX_BACKEND_BASE_URL = "https://chatgpt.com/backend-api/codex";
+
+/**
+ * The official Codex OAuth endpoint is not an OpenAI-compatible chat-completions
+ * endpoint. Hermes openai-codex provider owns its Responses transport and
+ * OAuth token handling; stamping it as custom makes Hermes append
+ * /chat/completions and every turn fails with HTTP 404.
+ *
+ * Keep custom as the general endpoint default, but recognize the one canonical
+ * provider-specific URL. An explicit flag wins for operators with a proxy or a
+ * future provider implementation.
+ */
+export function modelProviderFor(opts: HermesOptions): string {
+  if (opts.modelProvider !== undefined) return opts.modelProvider;
+  const baseUrl = (opts.modelBaseUrl ?? "").replace(/\/+$/, "");
+  return baseUrl === CODEX_BACKEND_BASE_URL ? "openai-codex" : "custom";
+}
+
 /** The model keys this verb manages, in write order. Values are never secret. */
 export function desiredModelKeys(opts: HermesOptions): [string, string][] {
   const out: [string, string][] = [
-    ["model.provider", "custom"],
+    ["model.provider", modelProviderFor(opts)],
     ["model.base_url", opts.modelBaseUrl ?? ""],
     ["model.default", opts.model ?? ""],
   ];

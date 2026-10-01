@@ -262,7 +262,8 @@ suite hermes --root ~/agents/scribe \
 | `--root DIR` | Required. The agent root; its directory name is the agent name |
 | `--suite-url URL`, `--runtime-id ID` | The Suite runtime. Recorded in `<root>/suite.json`, so a re-run may omit them |
 | `--token-ref REF`, `--keychain-service SVC` | The runtime token, by reference only (see [token refs](#token-refs)) |
-| `--model-base-url URL`, `--model ID` | Required. An OpenAI-compatible endpoint and model id |
+| `--model-base-url URL`, `--model ID` | Required. The inference endpoint and model id |
+| `--model-provider PROVIDER` | Optional Hermes provider override. Defaults to `openai-codex` for the official ChatGPT Codex backend, otherwise `custom` |
 | `--context-length N` | Optional `model.context_length` |
 | `--model-api-key-ref REF` | Optional model key, by reference |
 | `--allowed-users LIST` | Passed to the channel installer; without it, `--allow-all-users` |
