@@ -27,6 +27,7 @@
  */
 import { runForwardingSignals } from "../child_signals.ts";
 import { mkdir } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readConfig, type SuiteConfig } from "../config.ts";
@@ -206,8 +207,13 @@ export function renderPatch(pluginPath: string, headerNames: string[]): string {
         api: openai-completions
         baseURL: https://openrouter.ai/api/v1
         models:
-          - id: moonshotai/kimi-k3
-            contextWindow: 1000000
+          # DECLARED FROM THE SAME EXPRESSION THAT SELECTS IT. Naming a model
+          # the route does not declare fails at the first turn with
+          # UNKNOWN_MODEL. An agent root that sets DSH_MODEL (its own
+          # .suite-state.json \`env\`) would otherwise select a model this route
+          # has never heard of.
+          - id: !!js process.env.DSH_MODEL || 'moonshotai/kimi-k3'
+            contextWindow: !!js Number(process.env.DSH_CONTEXT_WINDOW || 1000000)
 - id: agent-default-model
   config:
     provider: !!js process.env.DSH_PROVIDER || 'openrouter'
@@ -263,6 +269,10 @@ export interface DeepseekDeps {
   run(argv: string[], opts: { cwd?: string; env?: Record<string, string> }): Promise<number>;
   exec(argv: string[], opts: { cwd: string; env: Record<string, string> }): Promise<never> | Promise<number>;
   stderr: { write(text: string): void };
+  /** The directory the verb was run from. Defaults to `process.cwd()`. */
+  cwd?(): string;
+  /** Injected in tests; defaults to the live tmux. */
+  tmux?: TmuxDeps;
 }
 
 /** Whether the harness is already installed under `dir`. */
@@ -407,13 +417,21 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   // have to overwrite it. So an agent root may carry its own config, and when
   // it does it wins outright rather than merging — a half-inherited identity
   // is how an agent ends up connecting as its neighbour.
-  const rootConfig = options.root === undefined ? null : await readAgentConfig(options.root);
+  //
+  // WHICH ROOT. `--root` wins. Otherwise the directory the verb was run from
+  // is the root when it carries its own suite.json — `cd ~/agents/oddjob &&
+  // suite deepseek` is how a human reaches an agent, the same way `suite
+  // claude` keys off the cwd. Only the cwd itself counts: an ancestor of an
+  // agent root is not that agent.
+  const explicitRoot = options.root ?? cwdAgentRoot(deps.cwd?.() ?? process.cwd());
+  const rootConfig = explicitRoot === undefined ? null : await readAgentConfig(explicitRoot);
   const config = rootConfig ?? (await readConfig());
   if (config === null || config.suiteUrl === "" || config.runtimeId === "") {
     deps.stderr.write(
-      options.root === undefined
-        ? "suite: this machine is not wired to Suite yet. Run `suite init` first.\n"
-        : `suite: no Suite config found. Run \`suite init\`, or put one at ${join(options.root, AGENT_CONFIG_FILE)}\n`,
+      explicitRoot === undefined
+        ? "suite: this machine is not wired to Suite yet. Run `suite init` first,\n" +
+            `suite: or run this from an agent folder that has its own ${AGENT_CONFIG_FILE} (or pass --root).\n`
+        : `suite: no Suite config found. Run \`suite init\`, or put one at ${join(explicitRoot, AGENT_CONFIG_FILE)}\n`,
     );
     return 1;
   }
@@ -422,7 +440,7 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   const credentials =
     rootConfig === null
       ? await loadCredentials(config, deps)
-      : await loadAgentCredentials(options.root as string, config);
+      : await loadAgentCredentials(explicitRoot as string, config);
   for (const [key, value] of Object.entries(credentials)) store.set(key, value);
   if (store.get(TOKEN_KEY) === undefined) {
     deps.stderr.write("suite: no runtime token found. Run `suite init` to capture one.\n");
@@ -430,7 +448,13 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   }
 
   const name = agentNameFromRuntimeId(config.runtimeId);
-  const root = options.root ?? agentRoot(name);
+  const root = explicitRoot ?? agentRoot(name);
+
+  // The agent's own environment: its model provider, model and key. Secret
+  // values are registered in the store BEFORE any argv is checked, so the
+  // guards below cover them exactly as they cover the runtime token.
+  const agentEnv = await readAgentEnv(root);
+  for (const [key, value] of Object.entries(agentEnv.secret)) store.set(`env:${key}`, value);
   const harness = harnessDir();
 
   if (!(await harnessInstalled(harness))) {
@@ -469,7 +493,26 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   ];
   assertNoSecretsInArgv(argv, store);
 
-  const env = { ...process.env, ...publicEnv(config, root), ...secretEnv(config, store) } as Record<string, string>;
+  // Precedence: the agent's own declaration beats both the inherited
+  // environment and this CLI's defaults (e.g. DSH_PERMISSION_MODE's
+  // `workspace-write`). The tmux child does not see the caller's shell
+  // anyway, so "caller wins" would differ between the two launch paths.
+  const env = {
+    ...process.env,
+    ...publicEnv(config, root),
+    ...agentEnv.public,
+    ...secretEnv(config, store),
+    ...agentEnv.secret,
+  } as Record<string, string>;
+  const provider = env.DSH_PROVIDER ?? "openrouter";
+  if (provider === "openrouter" && (env.OPENROUTER_API_KEY ?? "") === "") {
+    // Named, not silent: without it the agent connects, joins, takes work and
+    // fails every turn with MISSING_CREDENTIAL.
+    deps.stderr.write(
+      `suite: OPENROUTER_API_KEY is not set; declare it under "env" in ${join(root, AGENT_STATE_FILE)}.\n` +
+        "suite: the agent will connect and then fail every turn with MISSING_CREDENTIAL.\n",
+    );
+  }
 
   // `--no-session` is what a service manager uses: systemd wants the harness
   // in the foreground of the unit it supervises, not handed to a terminal
@@ -489,7 +532,50 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   // the config and the 0600 credential file itself, so nothing secret is ever
   // in an argv or in tmux's environment.
   const relaunch = [...selfArgv(), "deepseek", "--root", root, "--no-session", ...options.rest];
-  return await runInSession(sessionNameForAgent(name), relaunch, root, env, store, deps);
+  return await runInSession(sessionNameForAgent(name), relaunch, root, env, store, deps, { tmux: deps.tmux });
+}
+
+/**
+ * The agent root the cwd names, if any: the cwd itself when it holds a
+ * suite.json, otherwise undefined. Deliberately not a walk up the tree.
+ */
+export function cwdAgentRoot(cwd: string): string | undefined {
+  return existsSync(join(cwd, AGENT_CONFIG_FILE)) ? cwd : undefined;
+}
+
+/** A `DSH_` name that nonetheless looks like a credential is treated as one. */
+const SECRET_NAME = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL/i;
+
+export interface AgentEnv {
+  /** Plain `DSH_` settings (provider, model, permission mode). Not secret. */
+  public: Record<string, string>;
+  /** Everything else (`*_API_KEY`, `*_KEY`, ...). Environment only, never argv. */
+  secret: Record<string, string>;
+}
+
+/**
+ * The `env` block of an agent root's .suite-state.json.
+ *
+ * This is where a root declares its MODEL credential, which is a different
+ * thing from its Suite one: the runtime token authenticates the agent to
+ * Suite; OPENROUTER_API_KEY authenticates it to whoever serves the model.
+ * Reading only `token` and `headers` produced an agent that connected,
+ * joined, took a dispatch and failed every turn with MISSING_CREDENTIAL.
+ *
+ * Names pass through verbatim: the generated patch's `apiKeyEnv` resolves
+ * the exact name. Empty and non-string values are dropped.
+ */
+export async function readAgentEnv(root: string): Promise<AgentEnv> {
+  const out: AgentEnv = { public: {}, secret: {} };
+  const file = Bun.file(join(root, AGENT_STATE_FILE));
+  if (!(await file.exists())) return out;
+  const raw = (await file.json()) as { env?: Record<string, unknown> };
+  for (const [name, value] of Object.entries(raw.env ?? {})) {
+    if (typeof value !== "string" || value === "") continue;
+    const isPlainSetting = name.startsWith("DSH_") && !SECRET_NAME.test(name);
+    (isPlainSetting ? out.public : out.secret)[name] = value;
+  }
+  return out;
 }
 
 /**

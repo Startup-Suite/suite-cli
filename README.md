@@ -188,7 +188,14 @@ getting out of the way.
 
 ```
 suite deepseek --root ~/agents/oddjob
+# or, equivalently, from the agent's own folder:
+cd ~/agents/oddjob && suite deepseek
 ```
+
+Without `--root`, the current directory is the agent root when it holds its own
+`suite.json` (only the directory itself, not a parent of it). Otherwise the
+machine config is used. If that agent's tmux session is live, the command
+attaches to it. If the session is stale, it is recycled.
 
 On each run it installs the harness if absent, copies the bundled federation
 plugin into place, writes the composition patch, and execs `dsh`. Nothing is
@@ -205,7 +212,14 @@ neighbour:
 | File | Holds |
 | --- | --- |
 | `<root>/suite.json` | Suite URL, runtime id, header **names**. No secret |
-| `<root>/.suite-state.json` | The runtime token and header values. Mode `0600` |
+| `<root>/.suite-state.json` | The runtime token, header values, and an optional `env` block. Mode `0600` |
+
+The `env` block is the agent's model setup: `OPENROUTER_API_KEY`, and `DSH_`
+settings such as `DSH_PROVIDER`, `DSH_MODEL`, `DSH_CONTEXT_WINDOW` and
+`DSH_PERMISSION_MODE`. Each entry goes into the harness environment under its
+own name, and never into an argv. A value set here overrides both the
+inherited environment and this CLI's defaults, so an agent's
+`DSH_PERMISSION_MODE` replaces the `workspace-write` default.
 
 Both have the same shape as the machine-level pair, so a working setup can be
 copied and edited rather than re-derived.

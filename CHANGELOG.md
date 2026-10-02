@@ -10,6 +10,25 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.5.1
+
+- **`suite deepseek` works from the agent's folder.** `cd ~/agents/oddjob &&
+  suite deepseek` now uses that folder's own `suite.json` and
+  `.suite-state.json`, as `--root` does. Before this it fell back to the machine
+  config and said to run `suite init`. When the agent's session is live the
+  command attaches to it, and when the session is stale it is recycled, as
+  `suite claude` does. `--root` still takes precedence. A parent directory of
+  an agent root is not treated as that agent.
+- **`suite deepseek` passes the agent's `env` block to the harness.**
+  The `env` in `<root>/.suite-state.json` (`OPENROUTER_API_KEY`, `DSH_MODEL`,
+  `DSH_PERMISSION_MODE`, ...) was never read. dsh therefore started without its
+  model key, connected, and failed every turn with `MISSING_CREDENTIAL`. Those
+  values now go into the environment only, and the argv guard covers them. The
+  agent's values override both the inherited environment and the defaults. The
+  patch declares the model that `DSH_MODEL` selects, so choosing a model other
+  than the default no longer fails with `UNKNOWN_MODEL`. The command now warns
+  when the OpenRouter route has no key.
+
 ## 0.5.0
 
 - **`suite init` registers the MCP entries per agent directory, not per
