@@ -182,6 +182,7 @@ again from the same place and you are back in the same session.
 | `suite deepseek --root DIR` | The agent's root folder — its cwd, its `DSH_HOME`, and where a per-agent identity may live |
 | `suite hermes --root DIR [...]` | Stamps a Hermes agent root and runs its gateway in tmux. See [`suite hermes`](#suite-hermes) |
 | `suite openclaw --root DIR [...]` | Stamps an OpenClaw agent root and runs its gateway in tmux. See [`suite openclaw`](#suite-openclaw) |
+| `suite codex [--root DIR]` | Runs a Codex agent through `codex app-server`, federated into Suite, in tmux. Logs Codex in with its own device-code flow if needed. See [`suite codex`](#suite-codex) |
 | `suite hermes\|openclaw --stamp-only` | Stamps only, and prints one JSON document. See [the stamp contract](#stamp-contract---stamp-only) |
 | `suite update` | Re-runs the installer to replace this install with the latest published CLI |
 | `suite doctor` | Diagnoses a broken setup in two halves, **install connection** (`→ suite init`) and **claude harness** (mostly `→ suite claude`), with one runnable remedy per failure. A stale session is never reported green |
@@ -448,6 +449,65 @@ With `--install-openclaw` it also writes `~/.local/share/suite/openclaw/`
 **The model key is not stored.** openclaw.json holds an env ref to
 `CUSTOM_API_KEY`, and each launch resolves `--model-api-key-ref` into the
 gateway's environment.
+
+## `suite codex`
+
+A Codex agent, driven through `codex app-server` (JSON-RPC over stdio), the
+same interface OpenClaw and Hermes use. Run it from the agent's folder:
+
+```
+cd ~/agents/oddjob && suite codex
+suite codex --root ~/agents/oddjob --approvals decline --sandbox workspace-write
+```
+
+```
+suite codex                    connection, Codex login, then tmux session suite-<agent>
+  └ suite codex --no-session   the bridge: Suite runtime socket ⇄ app-server
+      └ codex app-server       Suite MCP servers passed as -c overrides
+          └ suite codex --reply-mcp   the suite-channel MCP server (suite_reply …)
+```
+
+- **Connection.** The one `suite init` saved (`~/.config/suite/credentials.json`),
+  or the init questions asked inline from a terminal, as `suite claude` does.
+- **Login is Codex's.** If `codex login status` says no, `suite codex` runs
+  `codex login --device-auth`: a code you enter on any device, so it works over
+  ssh. ChatGPT subscription login is that flow's default. This CLI never sees a
+  token. Off a terminal it refuses and prints the command to run.
+- **`CODEX_HOME` is the agent's**: `<root>/.codex` by default, so the agent's
+  login, threads and config never mix with your own `~/.codex`. Use
+  `--codex-home DIR` to point it somewhere else on purpose.
+- **MCP.** Codex gets two servers as `-c mcp_servers.…` overrides on the
+  app-server command line, so no `config.toml` is edited:
+  - `startup-suite`, the install's `/mcp` endpoint, which has the same tool
+    bundles a Claude agent has. The runtime token reaches Codex only as the
+    environment variable named by `bearer_token_env_var`, never in an argv.
+  - `suite-channel`, which provides `suite_reply`, `suite_typing`,
+    `suite_reply_chunk` and `suite_reply_with_media`, the same names and
+    schemas as the Claude channel plugin. Codex runs it as a child process. It
+    forwards each call over a unix socket to the bridge, which owns the one
+    runtime connection.
+- **One persistent thread per Suite space.** A space is a conversation, and
+  each task already dispatches into its own execution space. Thread ids are
+  saved in `<root>/.suite-codex/threads.json`, so a restart resumes them with
+  `thread/resume`. Turns run one at a time per space and in parallel across
+  spaces.
+- **Replies are the agent's.** Codex's final message is not posted. The agent
+  calls `suite_reply`, exactly as a Claude agent does. A turn that **fails** is
+  reported in the space, so a failure is never mistaken for being ignored.
+- **Approvals: `--approvals accept|decline`, `--sandbox MODE`.** The defaults,
+  `accept` and `danger-full-access`, match `suite claude`'s
+  `--dangerously-skip-permissions`: Codex runs with approval policy `never`.
+  With `decline`, Codex runs with `on-request`, and every command, file-change
+  or permission request is refused. Forms meant for a human (MCP elicitations,
+  requests for user input) are declined under both settings. Every decision is
+  logged in the pane.
+- **Supervision.** The same as `suite claude`: tmux session `suite-<agent>`,
+  recorded for `suite restore`, and the watchdog ensured on create.
+  `--no-session` runs the bridge in the foreground for a service manager. If
+  the app-server exits, the bridge exits non-zero rather than idling.
+- **Not yet:** meeting transcripts are not bridged. Also, core's runtime
+  channel does not yet list `codex_channel` as a client product, so the
+  runtime shows as `unknown` until core adds it.
 
 ## Rules both stamp verbs keep
 

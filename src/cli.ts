@@ -46,6 +46,7 @@ import { liveDeepseekDeps, runDeepseek } from "./commands/deepseek.ts";
 import { liveHermesDeps, runHermes } from "./commands/hermes.ts";
 import { liveOpenclawDeps, runOpenclaw } from "./commands/openclaw.ts";
 import { liveUpdateDeps, runUpdate } from "./commands/update.ts";
+import { liveCodexDeps, runCodex } from "./commands/codex.ts";
 import { ttyPrompter } from "./secrets.ts";
 
 export type Verb =
@@ -55,6 +56,7 @@ export type Verb =
   | "deepseek"
   | "hermes"
   | "openclaw"
+  | "codex"
   | "doctor"
   | "status"
   | "update"
@@ -67,7 +69,7 @@ export interface Dispatch {
   args: string[];
 }
 
-const VERBS = new Set(["init", "claude", "deepseek", "hermes", "openclaw", "doctor", "status", "update", "watch", "restore"]);
+const VERBS = new Set(["init", "claude", "deepseek", "hermes", "openclaw", "codex", "doctor", "status", "update", "watch", "restore"]);
 
 /**
  * Pure: map argv to a verb plus untouched passthrough arguments.
@@ -152,6 +154,7 @@ export function usage(): string {
     row("deepseek", "run a DeepSeek Harness agent federated into Suite"),
     row("hermes", "stamp a Hermes agent root and run its gateway (--stamp-only: JSON contract)"),
     row("openclaw", "stamp an OpenClaw agent root and run its gateway (--stamp-only: JSON contract)"),
+    row("codex", "run a Codex agent through codex app-server, federated into Suite, in a persistent session"),
     row("doctor", "diagnose a broken setup"),
     row("status", "show federation, session state and stamped agents (kind, root, live/stale, last verdict)"),
     row("watch", "recover halted agent sessions (--dry-run, --once, --interval N, --force SESSION)"),
@@ -206,6 +209,11 @@ export async function run(argv: string[]): Promise<number> {
     // Ours up to `--`; everything after it reaches `openclaw gateway run`.
     const { args } = parse(argv);
     return runOpenclaw(args, liveOpenclawDeps());
+  }
+  if (verb === "codex") {
+    // Ours entirely: --root, --no-session, --approvals, --sandbox, --codex-home, --codex.
+    const { args } = parse(argv);
+    return runCodex(args, liveCodexDeps());
   }
   if (verb === "watch") {
     const { args } = parse(argv);

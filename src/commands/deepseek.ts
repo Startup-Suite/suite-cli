@@ -702,7 +702,7 @@ export async function runInSession(
  * Separated so the run path above has one place to fail on a missing token
  * rather than three.
  */
-async function loadCredentials(config: SuiteConfig, _deps: DeepseekDeps): Promise<Record<string, string>> {
+export async function loadCredentials(config: SuiteConfig, _deps: DeepseekDeps): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   // `suite init --token-from-env VAR`: the token is in the environment only.
   const fromEnv = config.tokenEnv === undefined ? undefined : process.env[config.tokenEnv];
