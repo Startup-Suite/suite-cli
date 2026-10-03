@@ -8,9 +8,32 @@
 
 # suite-cli
 
-`suite` wires a Claude Code runtime to [Startup Suite](https://github.com/Startup-Suite)
-in one command instead of eight manual steps, and keeps agents alive when the
-terminal that started them goes away.
+`suite` connects a machine to a [Startup Suite](https://github.com/Startup-Suite)
+install, sets up whichever agent harness you run there (Claude Code, DeepSeek,
+Hermes, OpenClaw), and keeps agents alive when the terminal that started them
+goes away.
+
+## The model: an install connection, then harness wiring
+
+* **An install** is the server: a URL, a runtime id and a token.
+  **`suite init`** connects this machine to one. It saves those three values,
+  checks `bun` and `tmux`, and installs the watchdog. It never runs `claude`
+  or any other harness, so it cannot fail because one is missing.
+* **Harness wiring** is what one harness needs on top. Each harness verb does
+  its own, from the saved connection, without asking for credentials again,
+  and only the parts that are missing. For **`suite claude`** that is the
+  channel plugin checkout, `CLAUDE.md`, and both MCP entries for this folder.
+
+Both orders work:
+
+```sh
+suite init && suite claude      # connect the machine first, then start an agent
+suite claude                    # or start straight away: it asks the init questions itself
+```
+
+Installing Claude Code before or after `suite init` makes no difference.
+`suite doctor` reports the two halves separately, so you can see which one is
+missing.
 
 macOS and Linux. **Windows is not supported** — the installer refuses it by
 name rather than failing obscurely.
@@ -23,7 +46,7 @@ name rather than failing obscurely.
 **checked and named**, never installed for you. Install any that are missing
 with your own package manager first:
 
-* `git` — clones the Suite channel plugin during `suite init`.
+* `git` — clones the Suite channel plugin the first time `suite claude` runs.
 * `curl` — fetches this installer, and the bun installer if you take that route.
 * `ca-certificates` — without trusted roots every one of those fetches fails at
   TLS rather than at a prompt.
@@ -42,7 +65,7 @@ with your own package manager first:
 <a id="claude-on-demand"></a>
 
 **Claude Code is not a prerequisite.** Nothing above installs it and `suite
-init` does not ask about it. The first time you launch an agent with `suite
+init` neither asks about it nor needs it. The first time you launch an agent with `suite
 claude`, if `claude` is not on `PATH`, `suite` says so, **offers to install it**
 with the official installer (`curl -fsSL https://claude.ai/install.sh | bash`,
 which lands a launcher in `~/.local/bin` and needs no `sudo`), and — once it is
@@ -68,20 +91,39 @@ The installer never uses `sudo`. It installs to `$XDG_BIN_HOME`, or
 `PATH`, and prints the exact `export PATH=` line to add. If a `suite` is
 already installed it names the version it would replace and asks first.
 
-## Wire this machine up
+## Connect this machine
 
 ```sh
 suite init
 ```
 
 `init` detects `bun` and `tmux` (offering to install either, never unasked),
-clones the channel plugin, asks for your credentials, and registers both MCP
-entries — then health-checks that they actually **connect**, because written is
-not connected.
+asks for the Suite URL, runtime id and token, saves them, and installs the
+watchdog. That is all it does. Re-run it to fix a URL or rotate a token. The
+next `suite claude` in each agent folder rewrites any MCP entry that no longer
+matches.
+
+## Claude Code's wiring (done by `suite claude`)
+
+Before each launch, `suite claude` checks this folder's wiring and does only
+what is missing or stale:
+
+* **the channel plugin** — cloned once and `bun install`ed. An existing
+  checkout is used as it is, not pulled, so a launch never depends on the
+  network;
+* **both MCP entries** — `suite-channel` and `startup-suite`, registered at
+  local scope from the saved connection. An entry that already matches is left
+  alone. Written entries are health-checked, because written is not connected;
+* **`CLAUDE.md`** — described below.
+
+A fully wired folder runs no `git`, no `bun` and no `claude mcp` at all. With no
+saved connection, `suite claude` asks the same questions `suite init` does,
+saves the answers, then wires and launches. Without a terminal to ask in, it
+says so and starts Claude without Suite wiring.
 
 ### It also seeds a `CLAUDE.md`
 
-`init` writes a starting `CLAUDE.md` into the working directory: a short brief
+The wiring writes a starting `CLAUDE.md` into the working directory: a short brief
 on how an agent is expected to behave on this platform. It covers the
 conventions a new agent gets wrong by default — **a task assignment is already
 the authorization** so there is nothing to wait for, a terminal-only answer is
@@ -90,20 +132,20 @@ a subagent before you ack, never self-approve a human gate, and prefer org
 memory over local notes.
 
 **An existing `CLAUDE.md` is never overwritten.** The file is yours the moment
-it exists, and `init` is re-run routinely — losing the operating knowledge an
-agent has accumulated there would be the worst thing this verb could do. A
-re-run reports `present, left alone` and touches nothing.
+it exists, and the wiring runs on every launch — losing the operating knowledge
+an agent has accumulated there would be the worst thing it could do. An existing
+file is never written to.
 
 ### ...and if that file is a project's, not an agent's
 
 Two different documents share the filename: an agent's brief, and a *project's*
-codebase guide. Most mature repos ship the second one, and `init` cannot tell
+codebase guide. Most mature repos ship the second one, and the wiring cannot tell
 them apart — so a skip used to mean the agent got **none** of the conventions,
 silently.
 
-When your `CLAUDE.md` exists and states none of them, `init` leaves it alone and
-writes `SUITE_CONVENTIONS.md` beside it — a file the CLI **owns and rewrites on
-every run**, so keep your own notes in `CLAUDE.md`. It then prints what is
+When your `CLAUDE.md` exists and states none of them, the wiring leaves it alone
+and writes `SUITE_CONVENTIONS.md` beside it — a file the CLI **owns and keeps
+current**, so keep your own notes in `CLAUDE.md`. It then prints what is
 missing and the single line that loads it:
 
 ```
@@ -130,8 +172,8 @@ again from the same place and you are back in the same session.
 
 | Command | What it does |
 | --- | --- |
-| `suite init` | Detects `bun` and `tmux`, installs the channel plugin, collects credentials, registers both MCP entries and verifies they connect |
-| `suite claude [...]` | Runs Claude Code in the persistent session for this directory; re-attaches when one is already live. Every argument passes through verbatim |
+| `suite init` | Connects this machine to a Suite install: detects `bun` and `tmux`, saves the URL, runtime id and token, installs the watchdog. Harness-neutral |
+| `suite claude [...]` | Sets up this folder's Claude wiring if anything is missing (plugin, MCP entries, `CLAUDE.md`), then runs Claude Code in the persistent session for this directory; re-attaches when one is already live. Every argument passes through verbatim |
 | `suite claude new [...]` | **The force-new verb.** Creates a second session even when one exists, under the next free name (`…-2`) |
 | `suite claude -p '…'` | One-shot, non-interactive: **bypasses tmux entirely** and execs Claude directly |
 | `suite claude --session NAME` | Per-invocation override of the derived session name. The one option the wrapper owns; not persisted |
@@ -142,7 +184,7 @@ again from the same place and you are back in the same session.
 | `suite openclaw --root DIR [...]` | Stamps an OpenClaw agent root and runs its gateway in tmux. See [`suite openclaw`](#suite-openclaw) |
 | `suite hermes\|openclaw --stamp-only` | Stamps only, and prints one JSON document. See [the stamp contract](#stamp-contract---stamp-only) |
 | `suite update` | Re-runs the installer to replace this install with the latest published CLI |
-| `suite doctor` | Diagnoses a broken setup — one runnable remedy per failure, and a stale session is never reported green |
+| `suite doctor` | Diagnoses a broken setup in two halves, **install connection** (`→ suite init`) and **claude harness** (mostly `→ suite claude`), with one runnable remedy per failure. A stale session is never reported green |
 | `suite status` | Shows which runtime this box is federated as, the state and age of each session, and each stamped agent's kind, root, state and last verdict |
 | `suite --version`, `suite --help` | Version, and the verb list |
 
@@ -576,6 +618,11 @@ of any extra headers, and the session-naming preference. **It never holds a
 secret value** — a test asserts the serialised bytes contain neither the token
 nor any header value.
 
+The token and header values are saved beside it in `credentials.json`, mode
+600, so every harness verb can reuse them without asking again. With
+`suite init --token-from-env VAR`, only the variable name is saved and the
+token is not written to disk.
+
 Writes default to **user scope**. If a write would land inside a git
 repository, `suite` asks `git check-ignore` and **refuses** — non-zero exit, a
 message naming the path — unless the path is ignored. Refusal rather than a
@@ -706,7 +753,7 @@ for byte. One audited single-quote escaper exists for the display-only case.
 
 A command line is world-readable through `ps`, and a `tmux new-session` command
 line stays in the process table for the life of the agent. Credentials reach
-Claude through the MCP config written at `suite init` time. The composed argv is
+Claude through the MCP config written by `suite claude`. The composed argv is
 checked against the credential store before it is run, and `send-keys` is never
 used — typing a secret into a live shell would add its history to the exposure.
 
@@ -866,7 +913,7 @@ look at the next one.** The seen-flag is stored in
 
 ## MCP registration
 
-`suite init` writes both MCP entries with `claude mcp add` rather than editing
+`suite claude` writes both MCP entries with `claude mcp add` rather than editing
 `.mcp.json` by hand — the file format is Claude Code's to change. They are
 registered at **local scope** (`-s local`, passed explicitly), run from the
 agent directory: private to that directory, stored in `~/.claude.json` under
@@ -879,10 +926,10 @@ second one's Suite and runtime. **Not project scope** (`.mcp.json`) either:
 that puts the token inside the agent directory, where a repository can commit
 it, and each server then needs approving. A user-scope entry left by an older
 `suite init` is **left alone** — another agent directory may still be running
-on it — and `init` warns when it names a different runtime; this directory's
+on it — and the wiring warns when it names a different runtime; this directory's
 local entry takes precedence here regardless.
 
-Being written is not being connected, so `init` finishes by health-checking
+Being written is not being connected, so after writing an entry the wiring health-checks
 with `claude mcp list` and requires both `suite-channel` and `startup-suite` to
 report connected. A status line it cannot parse is a **failure that prints the
 raw line**, never a green result on an assumption.

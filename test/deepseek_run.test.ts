@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type DeepseekDeps, runDeepseek } from "../src/commands/deepseek.ts";
 import type { RunResult, TmuxDeps } from "../src/tmux.ts";
+import type { Prompter } from "../src/secrets.ts";
 
 const FAKE_TOKEN = "fake-runtime-token-0001";
 const FAKE_OR_KEY = "fake-openrouter-key-0002";
@@ -142,6 +143,49 @@ describe("A: the cwd is the agent root when it carries suite.json", () => {
   test("an ancestor of an agent root is not that agent: machine-config fallback, named", async () => {
     const { d, c } = deps({ cwd: join(base, "home", "agents") });
     expect(await runDeepseek(["--no-session"], d)).toBe(1);
+    expect(c.stderr).toContain("suite init");
+    expect(c.execs).toHaveLength(0);
+  });
+});
+
+describe("D: no saved connection — the init prompts run inline, never 'run suite init first'", () => {
+  function scripted(answers: string[], asked: string[]): Prompter {
+    const q = [...answers];
+    return {
+      ask: async (question) => (asked.push(question), q.shift() ?? ""),
+      askSecret: async (question) => (asked.push(question), q.shift() ?? ""),
+      say: () => {},
+    };
+  }
+
+  test("from a terminal, it asks for url, runtime id and token, saves them, and starts", async () => {
+    const asked: string[] = [];
+    const { d, c } = deps({ cwd: join(base, "home", "agents"), tty: true });
+    d.prompter = scripted(["https://suite.example.invalid", "inline-dsh", FAKE_TOKEN, ""], asked);
+
+    const code = await runDeepseek(["--no-session"], d);
+
+    expect(asked.some((q) => q.startsWith("suite url"))).toBe(true);
+    expect(asked.some((q) => q.startsWith("runtime id"))).toBe(true);
+    expect(asked.some((q) => q.startsWith("token"))).toBe(true);
+    expect(code).toBe(0);
+    expect(c.execs).toHaveLength(1);
+    expect(c.execs[0]?.env.SUITE_RUNTIME_ID).toBe("inline-dsh");
+    expect(c.execs[0]?.env.SUITE_RUNTIME_TOKEN).toBe(FAKE_TOKEN);
+    // Saved for next time: a second run asks nothing.
+    const again: string[] = [];
+    const second = deps({ cwd: join(base, "home", "agents"), tty: true });
+    second.d.prompter = scripted([], again);
+    expect(await runDeepseek(["--no-session"], second.d)).toBe(0);
+    expect(again).toEqual([]);
+  });
+
+  test("CONTROL: off a terminal there is nobody to ask, so it refuses and names the way out", async () => {
+    const asked: string[] = [];
+    const { d, c } = deps({ cwd: join(base, "home", "agents"), tty: false });
+    d.prompter = scripted(["https://suite.example.invalid", "inline-dsh", FAKE_TOKEN, ""], asked);
+    expect(await runDeepseek(["--no-session"], d)).toBe(1);
+    expect(asked).toEqual([]);
     expect(c.stderr).toContain("suite init");
     expect(c.execs).toHaveLength(0);
   });

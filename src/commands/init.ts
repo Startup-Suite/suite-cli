@@ -1,16 +1,19 @@
 /**
- * `suite init` — the whole manual setup, automated.
+ * `suite init` — connect this machine to a Suite install. Harness-neutral.
  *
- * The plugin README (Startup-Suite/claude-code-suite-channel, v0.3.0) lists
- * about eight manual steps. This verb performs them, in order, and reports each
- * as a COMPLETED line rather than as running commentary:
+ * An INSTALL is the server: a URL, a runtime id and a token. `suite init`
+ * records those (plus bun, tmux and the watchdog, which every harness needs)
+ * and nothing else — it never runs `claude`, `dsh`, `hermes` or `openclaw`, so
+ * it cannot fail because one of them is missing. See {@link runInit}.
  *
- *     bun               1.2.4                 installed
+ *     bun               1.2.4                 present
  *     tmux              3.5a                  present
- *     plugin            v0.3.0                cloned
- *     dependencies      4 packages            installed
+ *     config            ~/.config/suite/config.json
  *
- * Two rules the rest of the file exists to keep:
+ * Each harness verb then does its OWN wiring from what init saved, lazily and
+ * idempotently: `suite claude` clones the channel plugin, writes CLAUDE.md and
+ * registers both MCP entries (`src/claude_wiring.ts`). This module still holds
+ * the Claude MCP primitives that wiring uses, and their two rules:
  *
  *  1. MCP ENTRIES ARE WRITTEN BY `claude mcp add`, NEVER BY HAND, AT LOCAL
  *     SCOPE. Hand-rolling `.mcp.json` means owning a file format we do not
@@ -20,35 +23,24 @@
  *     itself. It used to be `-s user`, which is ONE entry for every Claude on
  *     the machine, so installing a second agent re-pointed the first one at the
  *     second one's Suite and runtime. See {@link registerServers}.
- *  2. WRITTEN IS NOT CONNECTED. Step 7 health-checks. An entry that was written
- *     perfectly and cannot connect is the exact failure this tool exists to
- *     stop someone debugging by hand, so a green result requires seeing the
- *     word from `claude mcp list`, and a line we cannot parse is a FAILURE that
- *     prints the raw line — never a false green.
+ *  2. WRITTEN IS NOT CONNECTED. After writing, the wiring health-checks. An
+ *     entry that was written perfectly and cannot connect is the exact failure
+ *     this tool exists to stop someone debugging by hand, so a green result
+ *     requires seeing the word from `claude mcp list`, and a line we cannot
+ *     parse is a FAILURE that prints the raw line — never a false green.
  */
 import { resolve } from "node:path";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir } from "node:fs/promises";
 import {
   createStore,
-  solicitCredentials,
   spawnWithSecrets,
-  TOKEN_KEY,
   type CredentialStore,
   type Prompter,
   type SpawnResult,
 } from "../secrets.ts";
 import { dataDir } from "../paths.ts";
-import {
-  CLAUDE_MD,
-  CONVENTIONS_FILENAME,
-  CONVENTIONS_MD,
-  claudeMdPlan,
-  conventionsAdvice,
-  conventionsPlan,
-  type ConventionsPlan,
-} from "../claude_md.ts";
-import { readConfig, writeConfig, type SuiteConfig } from "../config.ts";
+import { credentialsPath, promptConnection } from "../connection.ts";
 import { nextCommand, row } from "../ui.ts";
 import {
   type SupervisorIo,
@@ -120,10 +112,15 @@ export interface InitDeps {
 }
 
 export interface InitOptions {
-  /** Override the plugin checkout location. Defaults under the data dir. */
+  /**
+   * Accepted and IGNORED: the Claude channel plugin checkout is now part of
+   * `suite claude`'s wiring, at the default location. Said out loud when given,
+   * rather than silently dropped.
+   */
   checkout?: string;
   /**
-   * Write `SUITE_TOKEN=${VAR}` instead of the value. Opt-in: see
+   * Record that the harness wiring should write `SUITE_TOKEN=${VAR}` instead of
+   * the value, and keep the token off disk. Opt-in: see
    * {@link ENV_INTERPOLATION_SUPPORTED} for why this is not the default.
    */
   tokenFromEnv?: string;
@@ -427,7 +424,7 @@ export function noGitPrompt(
  * silently destroys whatever the user was doing in that directory, and this
  * command was invoked to set up a tool, not to arbitrate their git state.
  */
-export async function cloneOrUpdate(dir: string, deps: InitDeps): Promise<CheckoutOutcome> {
+export async function cloneOrUpdate(dir: string, deps: Pick<InitDeps, "run" | "env">): Promise<CheckoutOutcome> {
   if (existsSync(resolve(dir, ".git"))) {
     const r = await deps.run(["git", "pull", "--ff-only"], { cwd: dir, env: noGitPrompt(deps.env) });
     if (r.exitCode !== 0) throw new PullFailed(dir, r.stderr || r.stdout);
@@ -641,7 +638,7 @@ export function parseServerStatus(listOutput: string, name: string): ServerStatu
   return { name, state: "missing", raw: "" };
 }
 
-export async function verifyConnections(deps: InitDeps): Promise<ServerStatus[]> {
+export async function verifyConnections(deps: Pick<InitDeps, "run" | "cwd">): Promise<ServerStatus[]> {
   // In the agent directory: local-scope entries are only listed there.
   const r = await deps.run(["claude", "mcp", "list"], { cwd: deps.cwd });
   const text = `${r.stdout}\n${r.stderr}`;
@@ -776,8 +773,9 @@ export async function registerServers(
       );
     }
   }
-  lines.push(row(CHANNEL_SERVER, "registered", `local scope: ${deps.cwd}`));
-  lines.push(row(TOOLS_SERVER, "registered", `local scope: ${deps.cwd}`));
+  // Only what this call wrote: a caller that found one entry already current
+  // passes one invocation, and must not be told both were registered.
+  for (const argv of invocations) lines.push(row(argv[3] as string, "registered", `local scope: ${deps.cwd}`));
 
   let text: string | null = null;
   try {
@@ -793,10 +791,7 @@ export async function registerServers(
 /* Orchestration                                                              */
 /* ------------------------------------------------------------------------- */
 
-export const FEDERATE_HINT = [
-  "  Open Suite in a browser, go to Agent Resources, and click Federate on this",
-  "  runtime. Copy the URL, the runtime id and the token it shows you.",
-].join("\n");
+export { FEDERATE_HINT } from "../connection.ts";
 
 export interface InitResult {
   /** Null when the operator declined with --no-supervisor. */
@@ -804,14 +799,25 @@ export interface InitResult {
   exitCode: number;
   /** True when tmux is unavailable — sessions will not outlive a terminal. */
   tmuxMissing: boolean;
-  checkout: CheckoutOutcome;
   configPath: string;
-  /** `write` when one was created, `skip` when the operator's own was kept. */
-  claudeMd: "write" | "skip";
-  /** How the conventions reach the agent — see {@link ConventionsPlan.claudeMd}. */
-  conventions: ConventionsPlan["claudeMd"];
 }
 
+/**
+ * `suite init`: connect this machine to a Suite install. HARNESS-NEUTRAL.
+ *
+ * Every step here is one that any harness on this machine needs:
+ *
+ *     bun          the runtime this CLI itself runs on
+ *     tmux         persistence for every harness's session
+ *     connection   suite url, runtime id, token (config.json + credentials.json)
+ *     watchdog     session supervision, and the restore-on-boot unit
+ *
+ * NOTHING CLAUDE-SPECIFIC. The channel plugin clone, `claude mcp add` and
+ * CLAUDE.md are Claude Code's wiring and are done by `suite claude`, from what
+ * this saves (see `src/claude_wiring.ts`). They used to be steps 3-7 here,
+ * which made init die with `ENOENT: claude` on a machine without Claude Code —
+ * a fresh Mac, or a DeepSeek-only box. init now never runs a harness binary.
+ */
 export async function runInit(deps: InitDeps, options: InitOptions = {}): Promise<InitResult> {
   const say = deps.out;
   say("");
@@ -864,100 +870,26 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
     say(row("", "", "install tmux and re-run suite init to fix this"));
   }
 
-  // 3-4. the checkout ---------------------------------------------------
-  const checkoutDir = options.checkout ?? defaultCheckout(deps.env);
-  const cloneSpin = spinner("plugin", deps);
-  let outcome: CheckoutOutcome;
-  try {
-    outcome = await cloneOrUpdate(checkoutDir, deps);
-  } finally {
-    cloneSpin.stop();
+  if (options.checkout !== undefined) {
+    say(row("", "", "--checkout is ignored: suite claude sets up the plugin checkout, under the data dir"));
   }
-  say(row("plugin", PLUGIN_DIRNAME, outcome));
 
-  const depsSpin = spinner("dependencies", deps);
-  let installOut = "";
-  try {
-    const r = await deps.run(["bun", "install"], { cwd: checkoutDir });
-    installOut = `${r.stdout}\n${r.stderr}`;
-    if (r.exitCode !== 0) throw new Error(`bun install failed in ${checkoutDir}`);
-  } finally {
-    depsSpin.stop();
-  }
-  say(row("dependencies", packageCount(installOut) || "up to date", "installed"));
-
-  // 5. credentials ------------------------------------------------------
-  say("");
-  say(FEDERATE_HINT);
-  say("");
-  const existing = await readConfig({ env: deps.env });
-  const suiteUrl = (await deps.prompter.ask(`suite url${existing ? ` [${existing.suiteUrl}]` : ""}: `)).trim() ||
-    existing?.suiteUrl ||
-    "";
-  const runtimeId = (await deps.prompter.ask(`runtime id${existing ? ` [${existing.runtimeId}]` : ""}: `)).trim() ||
-    existing?.runtimeId ||
-    "";
-  if (suiteUrl === "" || runtimeId === "") throw new Error("suite url and runtime id are both required");
-  const { headerNames } = await solicitCredentials(deps.prompter, deps.store);
-
-  const config: SuiteConfig = {
-    suiteUrl,
-    runtimeId,
-    headerNames,
-    sessionNaming: existing?.sessionNaming ?? "cwd",
-  };
-  const configFile = await writeConfig(config, { env: deps.env });
+  // 3. the install connection -------------------------------------------
+  // Always asked: re-running init is how a URL is fixed or a token rotated.
+  // The saved values are offered as defaults. A harness verb picks the change
+  // up on its next launch — `suite claude` rewrites an entry that no longer
+  // matches what is saved here.
+  const { configPath: configFile } = await promptConnection(
+    { env: deps.env, prompter: deps.prompter, store: deps.store, out: say },
+    options.tokenFromEnv === undefined ? {} : { tokenFromEnv: options.tokenFromEnv },
+  );
   say(row("config", configFile));
-
-  // 5b. a starting CLAUDE.md, and never a replacement for one ------------
-  const claudeMdPath = resolve(deps.cwd, "CLAUDE.md");
-  // Read, never written when it exists. The content only feeds the decision
-  // below; every branch here leaves an existing file byte-for-byte alone.
-  const existingClaudeMd = existsSync(claudeMdPath) ? await readFile(claudeMdPath, "utf8") : null;
-  const claudeMd = claudeMdPlan(claudeMdPath, existingClaudeMd !== null);
-  if (claudeMd.action === "write") {
-    await writeFile(claudeMd.path, CLAUDE_MD, "utf8");
-    say(row("CLAUDE.md", claudeMd.path, "written"));
-  } else {
-    // Yours the moment it exists. Re-running init must never cost an agent the
-    // operating knowledge it has accumulated in this file.
-    say(row("CLAUDE.md", claudeMd.path, "present, left alone"));
+  say(row("credentials", credentialsPath(deps.env), "mode 600"));
+  if (options.tokenFromEnv !== undefined) {
+    say(row("", "", `token read from ${options.tokenFromEnv} at launch and not saved; export it before starting an agent`));
   }
 
-  // 5c. and the conventions themselves, which a skip used to swallow --------
-  // A project's codebase guide and an agent's brief share this filename, so a
-  // file being present is no evidence the agent has the conventions. When it
-  // has not, they go to a path this CLI owns and the gap is SAID OUT LOUD.
-  const conventions = conventionsPlan(resolve(deps.cwd, CONVENTIONS_FILENAME), existingClaudeMd);
-  if (conventions.action === "write") {
-    await writeFile(conventions.path, CONVENTIONS_MD, "utf8");
-    say(row(CONVENTIONS_FILENAME, conventions.path, "written"));
-  }
-  for (const line of conventionsAdvice(conventions)) say(row("", "", line));
-
-  // 6. both MCP entries, via claude mcp add -----------------------------
-  const token = deps.store.get(TOKEN_KEY) ?? "";
-  const tokenLiteral = options.tokenFromEnv === undefined ? token : envReference(options.tokenFromEnv);
-  const usingReference = options.tokenFromEnv !== undefined;
-  const indexPath = resolve(checkoutDir, "src", "index.ts");
-
-  const headers = headerNames.map((name) => ({ name, value: deps.store.get(name) ?? "" }));
-  const invocations = [
-    channelAddArgs({ suiteUrl, runtimeId, tokenLiteral, indexPath }),
-    toolsAddArgs(suiteUrl, tokenLiteral, headers),
-  ];
-
-  for (const line of await registerServers(deps, invocations, runtimeId)) say(line);
-  if (usingReference) {
-    say(row("", "", `token read from ${options.tokenFromEnv} at launch; export it or the channel will not authenticate`));
-  }
-
-  // 7. connected, not merely written ------------------------------------
-  const statuses = await verifyConnections(deps);
-  const report = connectionReport(statuses);
-  for (const line of report.lines) say(line);
-
-  // The watchdog, installed unless explicitly declined.
+  // 4. the watchdog, installed unless explicitly declined ---------------
   let supervisor: SupervisorResult | null = null;
   if (!options.noSupervisor && deps.supervisorIo) {
     const home = deps.env.HOME ?? "";
@@ -996,16 +928,14 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
   }
 
   say("");
+  say("this machine is connected. now start an agent from its folder — each sets up its own harness:");
   say(nextCommand("suite claude"));
 
   return {
     supervisor,
-    exitCode: report.ok ? 0 : 1,
+    exitCode: 0,
     tmuxMissing: !tmux.present,
-    checkout: outcome,
     configPath: configFile,
-    claudeMd: claudeMd.action,
-    conventions: conventions.claudeMd,
   };
 }
 

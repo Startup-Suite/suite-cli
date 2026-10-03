@@ -258,23 +258,24 @@ async function report(options: FakeOptions = {}): Promise<{ text: string; code: 
 /* ------------------------------------------------------------------------- */
 
 describe("an all-healthy machine", () => {
-  test("passes all ten checks and exits 0", async () => {
+  test("passes all eleven checks and exits 0", async () => {
     const { text, code, checks } = await report();
-    expect(checks).toHaveLength(10);
-    expect(checks.filter((c) => c.status === "pass")).toHaveLength(10);
+    expect(checks).toHaveLength(11);
+    expect(checks.filter((c) => c.status === "pass")).toHaveLength(11);
     expect(code).toBe(0);
-    expect(text).toContain("10 checks passed.");
+    expect(text).toContain("11 checks passed.");
     expect(text).not.toContain("✘");
     expect(text).not.toContain("⋯");
   });
 
-  test("the ten checks are listed in dependency order", async () => {
-    const { checks } = await report();
+  test("the eleven checks are listed in dependency order: install connection, then the claude harness", async () => {
+    const { checks, text } = await report();
     expect(checks.map((c) => c.id)).toEqual([
+      "install",
+      "tmux",
       "claude",
       "auth",
       "bun",
-      "tmux",
       "plugin",
       "credentials",
       "tokens",
@@ -282,6 +283,29 @@ describe("an all-healthy machine", () => {
       "tools",
       "session",
     ]);
+    // The two halves are headed, in that order, so a reader sees which is missing.
+    expect(text.indexOf("install connection")).toBeGreaterThan(-1);
+    expect(text.indexOf("install connection")).toBeLessThan(text.indexOf("claude harness"));
+    expect(text.indexOf("claude harness")).toBeLessThan(text.indexOf("claude code"));
+  });
+});
+
+describe("the install connection is reported apart from the claude harness", () => {
+  test("no saved connection: install fails → suite init, while the claude half still reports on its own", async () => {
+    const { text, code, checks } = await report({ config: null });
+    const install = byId(checks, "install");
+    expect(install.status).toBe("fail");
+    expect(text).toContain("→ suite init");
+    expect(code).toBe(1);
+    // The harness half is still checked — it is a different half.
+    expect(byId(checks, "claude").status).toBe("pass");
+  });
+
+  test("no claude at all: the install half is still green", async () => {
+    const { checks } = await report({ tools: ["bun", "tmux"] });
+    expect(byId(checks, "install").status).toBe("pass");
+    expect(byId(checks, "tmux").status).toBe("pass");
+    expect(byId(checks, "claude").status).toBe("fail");
   });
 });
 
@@ -360,7 +384,7 @@ describe("each check fires on a broken input", () => {
     // The canvas's `suite init --repair` is NOT shipped: rule (b) requires a
     // runnable command, and that flag does not exist.
     expect(text).not.toContain("--repair");
-    expect(text).toContain("→ suite init");
+    expect(text).toContain("→ suite claude");
   });
 
   test("5b. an unreadable MCP entry is a loud failure printing the raw line", async () => {
@@ -453,7 +477,7 @@ describe("a broken upstream check skips its dependants rather than reddening the
     expect(text).toContain("skipped — needs a working plugin path");
     // Exactly one failure, not a wall of red pointing at one real cause.
     expect(checks.filter((c) => c.status === "fail")).toHaveLength(1);
-    expect(text).toContain("1 of 10 failed.");
+    expect(text).toContain("1 of 11 failed.");
   });
 
   test("no claude at all skips everything that needs it, and still exits 1", async () => {
@@ -465,7 +489,7 @@ describe("a broken upstream check skips its dependants rather than reddening the
       ),
     ).toEqual(["skip", "skip", "skip", "skip", "skip", "skip"]);
     expect(code).toBe(1);
-    expect(text).toContain("1 of 10 failed.");
+    expect(text).toContain("1 of 11 failed.");
   });
 });
 
@@ -479,7 +503,7 @@ describe("the report obeys the design rules", () => {
     const ids = checks.map((c) => c.id);
     expect(ids.indexOf("auth")).toBeLessThan(ids.indexOf("bun"));
     expect(ids.indexOf("bun")).toBeLessThan(ids.indexOf("plugin"));
-    expect(ids[0]).toBe("claude");
+    expect(ids[0]).toBe("install");
   });
 
   test("(b) every failure carries a consequence and exactly one runnable →", async () => {
@@ -549,7 +573,7 @@ describe("the report obeys the design rules", () => {
   test("(d) the closing line is a count and an instruction, not a paragraph", async () => {
     const { text } = await report({ auth: APIKEY_AUTH, exists: () => false });
     const last = text.trimEnd().split("\n").pop() ?? "";
-    expect(last).toContain("2 of 10 failed.");
+    expect(last).toContain("2 of 11 failed.");
     expect(last).toContain("Fix the first one, run suite doctor again.");
     expect(last.split(".").filter((s) => s.trim() !== "")).toHaveLength(2);
   });
@@ -575,7 +599,7 @@ describe("colour and glyphs", () => {
     expect(ascii.text).toContain("ok");
     // The arrow and the em dash are not ASCII either, and degrade with them.
     expect(ascii.text).not.toContain("→");
-    expect(ascii.text).toContain("-> suite init");
+    expect(ascii.text).toContain("-> suite claude");
     expect(ascii.text).toContain("skipped -- needs a working plugin path");
     const column = (text: string) =>
       text
@@ -1049,7 +1073,7 @@ describe("the tools api check", () => {
     const weird = await report({ toolsGet: "Type: http\nno url on any line\n" });
     expect(byId(weird.checks, "tools").status).toBe("fail");
     expect(weird.text).toContain("entry unreadable");
-    expect(weird.text).toContain("→ suite init");
+    expect(weird.text).toContain("→ suite claude");
   });
 
   test("without the claude cli it is ⋯ skipped, not red", async () => {

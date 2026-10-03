@@ -10,6 +10,42 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.6.0
+
+- **`suite init` is harness-neutral.** It connects the machine to a Suite
+  install and does nothing else: it checks `bun` and `tmux`, saves the URL,
+  runtime id and token, and installs the watchdog. It no longer clones the
+  Claude channel plugin, runs `claude mcp add` or writes `CLAUDE.md`. Before
+  this, on a machine without Claude Code (a fresh Mac, or a DeepSeek-only box),
+  init died at `claude mcp add` with `ENOENT: claude`.
+- **`suite claude` does its own wiring.** Before each launch it clones the
+  channel plugin if it is absent, writes `CLAUDE.md` if there is none, and
+  registers each MCP entry that is missing or no longer matches the saved
+  connection. It uses the saved connection and does not ask for credentials
+  again. A folder that is already wired runs no `git`, `bun` or `claude mcp`.
+  An existing plugin checkout is no longer pulled. Re-running init used to
+  update it; update it with `git -C ~/.local/share/suite/claude-code-suite-channel pull`.
+- **No chicken-and-egg.** `suite claude`, or `suite deepseek` from a terminal,
+  on a machine with no saved connection now asks the init questions itself
+  (URL, runtime id, token) and saves the answers. It no longer says "run suite
+  init first". Off a terminal, `suite claude` warns and starts Claude without
+  Suite wiring, which is what it did before. `suite deepseek` refuses as before.
+- **The token is saved** in `~/.config/suite/credentials.json`, mode 600, next
+  to `config.json`, so any harness verb can reuse it. Before this the only copy
+  was inside Claude's MCP entries. A machine set up by 0.5.x is asked for its
+  token once, and only if an entry has to be rewritten. With `--token-from-env
+  VAR`, only the name is saved (config `tokenEnv`).
+- **`suite deepseek` finds the token `suite init` saved.** Before this it read
+  `state.json`, which init never wrote, so it always failed with "no runtime
+  token found" unless the agent root had its own state file.
+- **`suite doctor` reports two halves.** The install connection (`install`,
+  `tmux`) comes first, then the claude harness. A missing, moved or unreadable
+  Claude entry now points at `suite claude`. A rejected credential still points
+  at `suite init`.
+- `suite init --checkout` is accepted and ignored, with a note saying so.
+- `suite hermes` and `suite openclaw` are unchanged. They take their identity
+  from flags and the agent root's `suite.json`, and never depended on init.
+
 ## 0.5.1
 
 - **`suite deepseek` works from the agent's folder.** `cd ~/agents/oddjob &&
