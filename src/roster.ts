@@ -30,7 +30,7 @@ export interface RosterEntry {
   /** Working directory the session was started in. */
   cwd: string;
   /** Which verb produced it. Recorded for the operator, not branched on. */
-  kind: "claude" | "deepseek" | "hermes" | "openclaw";
+  kind: "claude" | "deepseek" | "hermes" | "openclaw" | "codex";
   /** ISO timestamp of the most recent launch. */
   recordedAt: string;
 }
@@ -68,7 +68,7 @@ export function parseRoster(text: string): RosterEntry[] {
       session: e.session,
       command: e.command as string[],
       cwd: e.cwd,
-      kind: e.kind === "deepseek" || e.kind === "hermes" || e.kind === "openclaw" ? e.kind : "claude",
+      kind: e.kind === "deepseek" || e.kind === "hermes" || e.kind === "openclaw" || e.kind === "codex" ? e.kind : "claude",
       recordedAt: typeof e.recordedAt === "string" ? e.recordedAt : "",
     });
   }
@@ -215,5 +215,8 @@ export function bareGatewayKind(argv: string[]): "hermes" | "openclaw" | null {
 export function kindFromArgv(argv: string[]): RosterEntry["kind"] {
   const stamped = stampRelaunchKind(argv) ?? bareGatewayKind(argv);
   if (stamped !== null) return stamped;
+  // The `suite codex` bridge relaunch: `<bun> <cli.ts> codex … --no-session`.
+  const verb = argv.indexOf("codex");
+  if (verb > 0 && argv.includes("--no-session") && programName(argv[verb - 1] ?? "") !== "codex") return "codex";
   return argv.some((a) => a.includes("dsh")) ? "deepseek" : "claude";
 }

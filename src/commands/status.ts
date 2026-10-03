@@ -65,6 +65,10 @@ export function agentNameForKind(kind: RosterEntry["kind"]): string {
       return OPENCLAW_GATEWAY_COMM;
     case "deepseek":
       return "dsh";
+    case "codex":
+      // The pane runs `<bun> <cli.ts> codex --no-session`, and its child is
+      // `codex app-server`; both carry `codex` as an argv word.
+      return "codex";
     case "claude":
       return AGENT_NAME;
   }

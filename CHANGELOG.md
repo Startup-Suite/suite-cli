@@ -10,6 +10,23 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.7.0
+
+- **`suite codex`: a Codex agent in Suite, through `codex app-server`.** It
+  reuses the saved install connection, or asks for it inline. When Codex is
+  not logged in, it runs Codex's own `codex login --device-auth`, which needs
+  no browser on the host. It gives Codex the install's MCP tools plus a
+  `suite-channel` server with `suite_reply`, `suite_typing`,
+  `suite_reply_chunk` and `suite_reply_with_media`, as `-c` overrides, so no
+  config file is edited and no token is in an argv. Each Suite space maps to
+  one persistent Codex thread, which is resumed after a restart. Approval
+  requests follow `--approvals accept|decline` (default `accept`, the parity
+  of `suite claude`'s `--dangerously-skip-permissions`). It runs under the same
+  tmux, restore and watchdog supervision as `suite claude`. `CODEX_HOME`
+  defaults to `<root>/.codex`.
+- **`suite restore` and `suite status` know the `codex` kind**, and adoption
+  recognises a running `suite codex` bridge.
+
 ## 0.6.1
 
 - **Agents come back with nobody at the keyboard.** Claude Code shows a
