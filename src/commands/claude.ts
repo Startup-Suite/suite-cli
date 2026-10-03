@@ -36,6 +36,7 @@ import { type SupervisorIo, ensureSupervision, liveSupervisorIo } from "../super
 import { confirm, defaultCheckout, type InstallPlan, type Runner } from "./init.ts";
 import { CLAUDE_CODE_URL } from "./doctor.ts";
 import { colorEnabled } from "../ui.ts";
+import { answerLaunchDialogs, liveDialogIo, sessionLogPath, type AnswerResult, type DialogIo } from "../claude_dialogs.ts";
 import {
   attachArgv,
   composeNewSession,
@@ -596,6 +597,13 @@ export interface ClaudeDeps {
    */
   wiring?: WiringIo;
   /**
+   * How a freshly created session's pre-launch dialogs are answered (see
+   * `src/claude_dialogs.ts`). Optional for the same reason `restore` is: a
+   * caller that supplies nothing answers nothing, so the launch tests never
+   * poll a pane. The live deps always supply it.
+   */
+  dialogs?: DialogIo;
+  /**
    * Injected so the settle wait is instant in tests and real on a machine.
    * Optional: a caller that supplies nothing gets the real one.
    */
@@ -790,13 +798,36 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     }
   }
 
+  // ANSWER THE PRE-LAUNCH DIALOGS — only for a session this call created, and
+  // CONCURRENTLY with the attach, so a person who is watching sees it happen
+  // rather than staring at a delay. The attach returning (a detach, a nested
+  // switch-client, or no terminal at all) does not cancel it: the dialogs are
+  // there whether or not anyone is looking, which is the whole point.
+  let answering: Promise<AnswerResult> | null = null;
+  let answeringDone = false;
+  if (plan.create !== undefined && deps.dialogs !== undefined) {
+    answering = answerLaunchDialogs(deps.dialogs, { session, cwd: deps.cwd, home: deps.env.HOME }).finally(() => {
+      answeringDone = true;
+    });
+  }
+  const finish = async (code: number): Promise<number> => {
+    if (answering === null) return code;
+    if (!answeringDone) deps.err(`suite: still watching ${session} for Claude's launch dialogs…`);
+    const result = await answering;
+    if (result.answered.length > 0) {
+      const list = result.answered.map((a) => `${a.dialog} (${a.keys.join(" ")})`).join(", ");
+      deps.err(`suite: answered Claude's launch dialogs in ${session}: ${list} — logged to ${sessionLogPath(deps.env.HOME ?? "", session)}`);
+    }
+    return code;
+  };
+
   const enter = plan.enter;
-  if (enter === undefined) return 0;
+  if (enter === undefined) return finish(0);
   if (enter.kind === "refuse") {
     deps.err(enter.message);
-    return NESTED_REFUSAL_EXIT;
+    return finish(NESTED_REFUSAL_EXIT);
   }
-  return deps.exec(enter.argv);
+  return finish(await deps.exec(enter.argv));
 }
 
 export interface WiringIo {
@@ -867,6 +898,9 @@ export async function liveClaudeDeps(
     },
     restore: liveRestoreDeps(),
     supervisorIo: liveSupervisorIo(),
+    // File only, no echo: while the attach owns the terminal, a line on stderr
+    // would draw across the tmux client. The summary is printed after it.
+    dialogs: liveDialogIo(liveTmuxDeps(env), env.HOME ?? "", () => {}),
     tmux: liveTmuxDeps(env),
     platform: process.platform,
     prompter,

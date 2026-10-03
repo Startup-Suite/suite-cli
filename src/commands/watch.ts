@@ -31,6 +31,7 @@ import {
 } from "../halt.ts";
 import { SESSION_PREFIX, type TmuxDeps, detectState, liveTmuxDeps } from "../tmux.ts";
 import { RSS_CEILING_BYTES, SUPERVISED_ENV } from "../supervisor.ts";
+import { answerOnce, liveDialogIo, type DialogIo } from "../claude_dialogs.ts";
 
 export interface WatchDeps {
   tmux: TmuxDeps;
@@ -42,6 +43,12 @@ export interface WatchDeps {
   listProjectDirs(home: string): string[];
   newestTranscript(dir: string): { path: string; bytes: number } | null;
   log(line: string): void;
+  /**
+   * Answers a Claude Code launch dialog left on screen in a session we own —
+   * the backstop for a launch whose own poll ran out (a very slow boot).
+   * Optional: a caller that supplies nothing answers nothing.
+   */
+  dialogs?: DialogIo;
 }
 
 export interface WatchOptions {
@@ -328,8 +335,18 @@ export async function runWatch(deps: WatchDeps, opts: WatchOptions): Promise<Hal
     "-F",
     "#{session_name}\t#{pane_current_path}",
   ]);
-  const bySlug = sessionsBySlug(parseTargets(panes.stdout), deps.realpath);
+  const targets = parseTargets(panes.stdout);
+  const bySlug = sessionsBySlug(targets, deps.realpath);
   const events: HaltEvent[] = [];
+
+  // A launch dialog still on screen in one of OUR sessions. One key per session
+  // per pass: the sweep comes round again, so it never needs to wait for a
+  // redraw, and a two-step dialog simply takes two passes. Exact-text matching
+  // (src/claude_dialogs.ts) is what makes it safe to look at every session we
+  // named, whatever harness runs in it.
+  if (opts.apply && deps.dialogs !== undefined) {
+    for (const t of targets) await answerOnce(deps.dialogs, { session: t.session, cwd: t.cwd, home: opts.home });
+  }
 
   // Resident memory per session, gathered once. Harness-agnostic, so it covers
   // agents this watcher can otherwise not see at all.
@@ -487,6 +504,7 @@ export function liveWatchDeps(
     listProjectDirs: liveListProjectDirs,
     newestTranscript: liveNewestTranscript,
     log: (line) => console.log(`suite watch: ${line}`),
+    dialogs: liveDialogIo(tmux ?? liveTmuxDeps(env), env.HOME ?? "", (line) => console.log(`suite watch: ${line}`)),
     async post(url, body, contentType, auth) {
       try {
         const res = await fetch(url, {
