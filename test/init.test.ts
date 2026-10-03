@@ -32,6 +32,9 @@ import {
   userScopeLines,
 } from "../src/commands/init.ts";
 import { CLAUDE_MD } from "../src/claude_md.ts";
+import { ensureClaudeWiring, type WiringResult } from "../src/claude_wiring.ts";
+import { loadSavedSecrets } from "../src/connection.ts";
+import { readConfig } from "../src/config.ts";
 import { createStore, spawnWithSecrets, type Prompter } from "../src/secrets.ts";
 import {
   STUBBED_NOT_PROVEN,
@@ -156,6 +159,39 @@ function invocation(fixture: Fixture, prefix: string[]): string[] | null {
   return null;
 }
 
+/**
+ * `suite init`, then the Claude wiring `suite claude` performs before launch.
+ *
+ * Steps 3-7 of the old init — clone, bun install, CLAUDE.md, `claude mcp add`,
+ * verify — moved out of init and into `src/claude_wiring.ts`. The tests below
+ * that pin THOSE behaviours still pin them, through this pair: the wiring reads
+ * only what init saved, in a FRESH credential store, so a pass also proves the
+ * connection round-trips through disk without a second prompt.
+ */
+async function initThenWire(
+  deps: InitDeps & { lines: string[] },
+): Promise<{ init: Awaited<ReturnType<typeof runInit>>; wiring: WiringResult }> {
+  const init = await runInit(deps);
+  const config = await readConfig({ env: deps.env });
+  if (config === null) throw new Error("init saved no config");
+  const store = createStore();
+  loadSavedSecrets(deps.env, config, store);
+  const wiring = await ensureClaudeWiring(
+    {
+      env: deps.env,
+      cwd: deps.cwd,
+      isTTY: false,
+      store,
+      out: deps.out,
+      // The test's own runner, so a test that scripts `claude mcp add` scripts
+      // the wiring's. The TOKEN still comes only from the fresh store above.
+      run: deps.run,
+    },
+    config,
+  );
+  return { init, wiring };
+}
+
 /* ------------------------------------------------------------------------- */
 
 describe("init on a machine where nothing is installed", () => {
@@ -255,15 +291,15 @@ describe("init on a machine where nothing is installed", () => {
     expect(calls).toEqual([]);
   });
 
-  test("takes the clone path, runs bun install, and registers both entries at LOCAL scope", async () => {
+  test("init then the Claude wiring: clone path, bun install, both entries at LOCAL scope", async () => {
     const fx = makeFixture();
     const prompter = scriptedPrompter(credentialAnswers());
     const deps = makeDeps(fx, prompter);
 
-    const result = await runInit(deps);
+    const { init: result, wiring } = await initThenWire(deps);
 
     expect(result.exitCode).toBe(0);
-    expect(result.checkout).toBe("cloned");
+    expect(wiring.checkout).toBe("cloned");
 
     // The clone path was TAKEN — not merely available.
     const clone = invocation(fx, ["git", "clone"]);
@@ -311,7 +347,7 @@ describe("init on a machine where nothing is installed", () => {
     const fx = makeFixture();
     const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
 
-    const result = await runInit(deps);
+    const { wiring: result } = await initThenWire(deps);
 
     expect(result.claudeMd).toBe("write");
     const written = await Bun.file(resolve(fx.root, "CLAUDE.md")).text();
@@ -331,7 +367,7 @@ describe("init on a machine where nothing is installed", () => {
     const mine = resolve(fx.root, "CLAUDE.md");
     await Bun.write(mine, "# mine\n\nhard-won notes\n");
 
-    const result = await runInit(makeDeps(fx, scriptedPrompter(credentialAnswers())));
+    const { wiring: result } = await initThenWire(makeDeps(fx, scriptedPrompter(credentialAnswers())));
 
     expect(result.claudeMd).toBe("skip");
     expect(await Bun.file(mine).text()).toBe("# mine\n\nhard-won notes\n");
@@ -350,7 +386,7 @@ describe("init on a machine where nothing is installed", () => {
     await Bun.write(mine, theirs);
     const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
 
-    const result = await runInit(deps);
+    const { wiring: result } = await initThenWire(deps);
 
     // Rule 1, unchanged: their file is not written to, not appended to.
     expect(result.claudeMd).toBe("skip");
@@ -376,7 +412,7 @@ describe("init on a machine where nothing is installed", () => {
     await Bun.write(resolve(fx.root, "CLAUDE.md"), CLAUDE_MD);
     const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
 
-    const result = await runInit(deps);
+    const { wiring: result } = await initThenWire(deps);
 
     expect(result.conventions).toBe("carries");
     expect(existsSync(resolve(fx.root, "SUITE_CONVENTIONS.md"))).toBe(false);
@@ -385,7 +421,7 @@ describe("init on a machine where nothing is installed", () => {
 
   test("a freshly seeded CLAUDE.md needs no second file either", async () => {
     const fx = makeFixture();
-    const result = await runInit(makeDeps(fx, scriptedPrompter(credentialAnswers())));
+    const { wiring: result } = await initThenWire(makeDeps(fx, scriptedPrompter(credentialAnswers())));
     expect(result.conventions).toBe("seeded");
     expect(existsSync(resolve(fx.root, "SUITE_CONVENTIONS.md"))).toBe(false);
   });
@@ -573,23 +609,27 @@ describe("a failed pull says what actually went wrong", () => {
 });
 
 describe("an existing checkout", () => {
-  test("is fast-forwarded, not re-cloned", async () => {
+  test("is used as it is: neither pulled nor re-cloned, so a launch needs no network", async () => {
     const fx = makeFixture();
     mkdirSync(resolve(fx.checkout, ".git"), { recursive: true });
+    mkdirSync(resolve(fx.checkout, "src"), { recursive: true });
+    writeFileSync(resolve(fx.checkout, "src/index.ts"), "");
     const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
-    const result = await runInit(deps);
-    expect(result.checkout).toBe("updated");
-    expect(invocation(fx, ["git", "pull", "--ff-only"])).not.toBeNull();
+    const { wiring } = await initThenWire(deps);
+    expect(wiring.checkout).toBe("present");
+    expect(invocation(fx, ["git", "pull", "--ff-only"])).toBeNull();
     expect(invocation(fx, ["git", "clone"])).toBeNull();
   });
 
-  test("a failed fast-forward stops; it is never forced", async () => {
+  test("an incomplete checkout is fast-forwarded; a failed fast-forward stops and is never forced", async () => {
     const fx = makeFixture({ pullFails: true });
+    // .git but no src/index.ts: not usable, so the wiring tries to update it.
     mkdirSync(resolve(fx.checkout, ".git"), { recursive: true });
     const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
 
-    await expect(runInit(deps)).rejects.toThrow(PullFailed);
+    await expect(initThenWire(deps)).rejects.toThrow(PullFailed);
 
+    expect(invocation(fx, ["git", "pull", "--ff-only"])).not.toBeNull();
     for (const line of fx.log()) {
       expect(line).not.toMatch(/\treset\b/);
       expect(line).not.toMatch(/--force|-f\b/);
@@ -607,9 +647,11 @@ describe("verification is of connection, not of writing", () => {
         `${TOOLS_SERVER}: https://suite.example.invalid/mcp (HTTP) - ✘ Failed to connect\n`,
     });
     const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
-    const result = await runInit(deps);
+    const { init, wiring } = await initThenWire(deps);
     expect(invocation(fx, ["claude", "mcp", "add", TOOLS_SERVER])).not.toBeNull();
-    expect(result.exitCode).toBe(1);
+    // init itself never looks at Claude; the WIRING reports the failure.
+    expect(init.exitCode).toBe(0);
+    expect(wiring.connected).toBe(false);
     expect(deps.lines.join("\n")).toContain("not connected");
   });
 
@@ -618,15 +660,15 @@ describe("verification is of connection, not of writing", () => {
       mcpList: `${CHANNEL_SERVER}: something we have never seen\n${TOOLS_SERVER}: x - ✔ Connected\n`,
     });
     const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
-    const result = await runInit(deps);
-    expect(result.exitCode).toBe(1);
+    const { wiring } = await initThenWire(deps);
+    expect(wiring.connected).toBe(false);
     expect(deps.lines.join("\n")).toContain("something we have never seen");
   });
 
   test("a server missing from the listing is a failure, not an omission", async () => {
     const fx = makeFixture({ mcpList: `${CHANNEL_SERVER}: x - ✔ Connected\n` });
     const deps = makeDeps(fx, scriptedPrompter(credentialAnswers()));
-    expect((await runInit(deps)).exitCode).toBe(1);
+    expect((await initThenWire(deps)).wiring.connected).toBe(false);
   });
 });
 
@@ -718,7 +760,7 @@ describe("parseServerStatus", () => {
  * `claude mcp add suite-channel failed with exit 1`, a number with no cause
  * attached because the argv is deliberately unlogged (it carries the token).
  */
-describe("re-running init over entries it already registered", () => {
+describe("re-wiring over entries that are already registered", () => {
   test("the discriminator is the message, not the exit code", () => {
     expect(alreadyRegistered("MCP server suite-channel already exists in user config")).toBe(true);
     // Everything else also exits 1, and must NOT be answered by deleting the
@@ -756,7 +798,7 @@ describe("re-running init over entries it already registered", () => {
       },
     });
 
-    await runInit(deps);
+    await initThenWire(deps);
 
     const removes = calls.filter((c) => c[1] === "mcp" && c[2] === "remove");
     expect(removes.map((c) => c[3]).sort()).toEqual([CHANNEL_SERVER, TOOLS_SERVER].sort());
@@ -783,7 +825,7 @@ describe("re-running init over entries it already registered", () => {
     });
 
     // The cause travels with the error; an exit code alone is not a next step.
-    await expect(runInit(deps)).rejects.toThrow(/permission denied/);
+    await expect(initThenWire(deps)).rejects.toThrow(/permission denied/);
     expect(calls.filter((c) => c[1] === "mcp" && c[2] === "remove")).toHaveLength(0);
   });
 
@@ -802,7 +844,7 @@ describe("re-running init over entries it already registered", () => {
 
     let message = "";
     try {
-      await runInit(deps);
+      await initThenWire(deps);
     } catch (e) {
       message = (e as Error).message;
     }

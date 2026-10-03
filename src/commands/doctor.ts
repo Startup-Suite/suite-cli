@@ -28,20 +28,22 @@
  * thing, which is also what makes the output survive a pipe. `NO_COLOR` is
  * honoured and zero SGR bytes are emitted off a TTY.
  *
- * THE `suite init --repair` DECISION. The canvas's failure wireframe points an
- * unresolvable plugin path at `→ suite init --repair`. That flag is scoped
- * nowhere, and rule (b) says a `→` must be runnable, so it is NOT shipped:
- * the remedy is `suite init`, which already re-clones or updates the checkout
- * and rewrites BOTH MCP entries with freshly resolved absolute paths — i.e. it
- * IS the repair. A non-interactive `--repair` that skips the credential
- * prompts is a real convenience and is deliberately deferred rather than
- * invented here; what must not ship is a remedy line naming a flag the CLI
- * does not have.
+ * TWO HALVES, TWO REMEDIES. The report is split into the INSTALL CONNECTION
+ * (`suite init`: which Suite, which runtime, which token) and the CLAUDE
+ * HARNESS (`suite claude`: plugin checkout, MCP entries, session). A missing,
+ * moved or unreadable Claude entry points at `suite claude`, which clones a
+ * missing checkout and rewrites any entry that does not match the saved
+ * connection — without asking for credentials. A credential Suite REJECTS
+ * points at `suite init`, because the fix is re-entering it; the next
+ * `suite claude` then rewrites both entries with it. (The canvas's
+ * `suite init --repair` was never shipped: rule (b) says a `→` must be
+ * runnable, and `suite claude` is now the non-interactive repair it wanted.)
  */
 import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import { emptyConfig, readConfig, type SuiteConfig } from "../config.ts";
 import { configPath } from "../paths.ts";
+import { readCredentials } from "../connection.ts";
 import {
   CHANNEL_SERVER,
   PENDING_APPROVAL_REMEDY,
@@ -110,10 +112,11 @@ export interface Skipped extends Base {
 export type CheckResult = Pass | Failure | Skipped;
 
 export const CHECK_IDS = [
+  "install",
+  "tmux",
   "claude",
   "auth",
   "bun",
-  "tmux",
   "plugin",
   "credentials",
   "tokens",
@@ -123,6 +126,19 @@ export const CHECK_IDS = [
 ] as const;
 
 export type CheckId = (typeof CHECK_IDS)[number];
+
+/**
+ * THE TWO HALVES OF A WORKING SETUP, reported separately so a reader can see
+ * which one is missing. The INSTALL CONNECTION (which Suite, as which runtime,
+ * with what token, plus tmux) is harness-neutral and is what `suite init`
+ * sets up. The CLAUDE HARNESS is this folder's Claude Code wiring — plugin,
+ * MCP entries, session — which `suite claude` sets up from the connection.
+ */
+export type CheckGroup = "install connection" | "claude harness";
+
+export function groupOf(id: string): CheckGroup {
+  return id === "install" || id === "tmux" ? "install connection" : "claude harness";
+}
 
 /* ------------------------------------------------------------------------- */
 /* Pure parsing — every one of these is asserted directly                     */
@@ -596,7 +612,18 @@ export function summaryLine(checks: CheckResult[], options: RenderOptions): stri
 export function renderReport(checks: CheckResult[], options: RenderOptions): string[] {
   // No sort. Rule (a): the order they were produced in IS the dependency order.
   const lines: string[] = [""];
-  for (const check of checks) lines.push(...renderCheck(check, options));
+  let group: CheckGroup | null = null;
+  for (const check of checks) {
+    // A heading wherever the half changes. Headings never reorder anything:
+    // the checks are still printed exactly in the order given.
+    const next = groupOf(check.id);
+    if (next !== group) {
+      if (group !== null && lines[lines.length - 1] !== "") lines.push("");
+      lines.push(`  ${paint(next, SGR.bold, options.color)}`);
+      group = next;
+    }
+    lines.push(...renderCheck(check, options));
+  }
   if (lines[lines.length - 1] !== "") lines.push("");
   lines.push(summaryLine(checks, options));
   return lines;
@@ -629,6 +656,11 @@ export interface DoctorDeps {
   exists(path: string): boolean;
   config: SuiteConfig | null;
   configFile: string;
+  /**
+   * Whether `credentials.json` holds a token. Optional: absent reads as "not
+   * known", and the install check then says nothing about the token.
+   */
+  tokenSaved?: boolean;
   tmux: TmuxDeps;
   color: boolean;
   utf8: boolean;
@@ -652,6 +684,33 @@ export const CLAUDE_CODE_URL = "https://claude.com/product/claude-code";
 
 export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
   const checks: CheckResult[] = [];
+
+  // 0. The install connection: harness-neutral, set up by `suite init` ---
+  checks.push(installCheck(deps));
+
+  // 0b. tmux — every harness's sessions need it -----------------------
+  const tmuxPath = deps.which(TMUX);
+  checks.push(
+    tmuxPath === null
+      ? {
+          id: "tmux",
+          label: "tmux",
+          status: "fail",
+          value: "not on PATH",
+          consequence: [
+            "Agents die with the terminal that started them, mid-task, and Suite",
+            "keeps waiting on a runtime that no longer exists.",
+          ],
+          remedy: "brew install tmux",
+        }
+      : {
+          id: "tmux",
+          label: "tmux",
+          status: "pass",
+          value: (await version(deps, tmuxPath, ["-V"])) ?? "present",
+          detail: tmuxPath,
+        },
+  );
 
   // 1. Claude Code itself, and its version floor ------------------------
   const claudePath = deps.which(CLAUDE);
@@ -734,30 +793,6 @@ export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
         },
   );
 
-  // 4. tmux --------------------------------------------------------------
-  const tmuxPath = deps.which(TMUX);
-  checks.push(
-    tmuxPath === null
-      ? {
-          id: "tmux",
-          label: "tmux",
-          status: "fail",
-          value: "not on PATH",
-          consequence: [
-            "Agents die with the terminal that started them, mid-task, and Suite",
-            "keeps waiting on a runtime that no longer exists.",
-          ],
-          remedy: "brew install tmux",
-        }
-      : {
-          id: "tmux",
-          label: "tmux",
-          status: "pass",
-          value: (await version(deps, tmuxPath, ["-V"])) ?? "present",
-          detail: tmuxPath,
-        },
-  );
-
   // 5. The plugin checkout, AND the path the MCP entry actually records ---
   const entry = claudePath === null ? null : await deps.run([claudePath, "mcp", "get", CHANNEL_SERVER]);
   checks.push(pluginCheck(deps, claudePath, entry));
@@ -781,6 +816,47 @@ export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
   checks.push(await sessionCheck(deps, tmuxPath));
 
   return checks;
+}
+
+/**
+ * Is this machine connected to a Suite install at all? Checked FIRST and on its
+ * own, because every harness depends on it and none of them owns it.
+ *
+ * The token is described, not judged: a machine set up by an older CLI kept
+ * its token only inside Claude's MCP entries, and still works — `suite claude`
+ * asks for it once, only if an entry has to be rewritten.
+ */
+function installCheck(deps: DoctorDeps): CheckResult {
+  const config = deps.config;
+  if (config === null || config.suiteUrl === "" || config.runtimeId === "") {
+    return {
+      id: "install",
+      label: "install",
+      status: "fail",
+      value: "not connected",
+      detail: deps.configFile,
+      consequence: [
+        "No harness on this machine knows which Suite to join or as which runtime,",
+        "so every agent here starts unfederated.",
+      ],
+      remedy: "suite init",
+    };
+  }
+  const token =
+    config.tokenEnv !== undefined
+      ? `token from $${config.tokenEnv}`
+      : deps.tokenSaved === undefined
+        ? ""
+        : deps.tokenSaved
+          ? "token saved"
+          : "token not saved; suite claude asks once if needed";
+  return {
+    id: "install",
+    label: "install",
+    status: "pass",
+    value: config.runtimeId,
+    detail: [config.suiteUrl, token].filter((x) => x !== "").join(" · "),
+  };
 }
 
 /** First version-looking token of a `--version` style probe. */
@@ -877,7 +953,7 @@ function pluginCheck(deps: DoctorDeps, claudePath: string | null, entry: RunResu
         `No ${CHANNEL_SERVER} MCP entry exists, so this runtime never joins the`,
         "channel and Suite shows it as offline.",
       ],
-      remedy: "suite init",
+      remedy: "suite claude",
     };
   }
   const path = parseMcpEntryPath(output);
@@ -895,7 +971,7 @@ function pluginCheck(deps: DoctorDeps, claudePath: string | null, entry: RunResu
         "We could not find the plugin path in the MCP entry, so we cannot tell",
         "whether the channel will start at all.",
       ],
-      remedy: "suite init",
+      remedy: "suite claude",
     };
   }
   if (!deps.exists(path)) {
@@ -910,9 +986,9 @@ function pluginCheck(deps: DoctorDeps, claudePath: string | null, entry: RunResu
         "the channel fails to start and no error names the path.",
       ],
       // The canvas said `suite init --repair`; that flag does not exist. `suite
-      // init` re-resolves the checkout and rewrites both entries — see the
+      // claude` re-resolves the checkout and rewrites a stale entry — see the
       // module docstring.
-      remedy: "suite init",
+      remedy: "suite claude",
     };
   }
   return { id: "plugin", label: "plugin", status: "pass", value: "checkout resolves", detail: path };
@@ -1081,7 +1157,7 @@ async function channelCheck(
         `claude mcp list does not list ${CHANNEL_SERVER}, so nothing carries`,
         "Suite's messages to this machine.",
       ],
-      remedy: "suite init",
+      remedy: "suite claude",
     };
   }
   if (status.state === "unparseable") {
@@ -1170,7 +1246,7 @@ async function toolsCheck(
         `No ${TOOLS_SERVER} MCP entry exists, so this runtime has no Suite tools`,
         "at all and cannot answer the work the channel delivers.",
       ],
-      remedy: "suite init",
+      remedy: "suite claude",
     };
   }
   const url = parseMcpHttpUrl(output);
@@ -1185,7 +1261,7 @@ async function toolsCheck(
         "We could not find the endpoint URL in the MCP entry, so we cannot tell",
         "whether this runtime's credential is accepted by Suite.",
       ],
-      remedy: "suite init",
+      remedy: "suite claude",
     };
   }
 
@@ -1336,6 +1412,7 @@ export async function liveDoctorDeps(
     exists: pathResolves,
     config: await readConfig({ env }),
     configFile: configPath(env),
+    tokenSaved: (readCredentials(env)?.token ?? "") !== "",
     tmux,
     color: colorEnabled(env),
     utf8: utf8Enabled(env),

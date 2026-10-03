@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 /**
- * suite — command-line tool for wiring a Claude Code runtime to Startup Suite.
+ * suite — connects a machine to a Startup Suite install, then sets up and runs
+ * whichever agent harness you use there (Claude Code, DeepSeek, Hermes, OpenClaw).
  *
  * Argument passthrough for `suite claude` is deliberately total: the wrapper
  * parses nothing beyond the verb, so a user flag can never be eaten by us.
@@ -145,8 +146,8 @@ export function usage(): string {
     "",
     row("suite", VERSION),
     "",
-    row("init", "wire this machine to Suite (installs the watchdog; --no-supervisor to skip)"),
-    row("claude", "run Claude Code in a persistent session"),
+    row("init", "connect this machine to a Suite install (url, runtime id, token, watchdog)"),
+    row("claude", "set up Claude Code for Suite in this folder if needed, then run it in a persistent session"),
     row("claude new", "force a new session"),
     row("deepseek", "run a DeepSeek Harness agent federated into Suite"),
     row("hermes", "stamp a Hermes agent root and run its gateway (--stamp-only: JSON contract)"),

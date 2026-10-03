@@ -49,6 +49,12 @@ export interface SuiteConfig {
   tokenRef?: string;
   /** The keychain service a `keychain:` ref is looked up under. A name, not a secret. */
   keychainService?: string;
+  /**
+   * `suite init --token-from-env VAR`: the NAME of the variable the harness
+   * wiring reads the token from at launch. A name, never a value, so it can
+   * live here. When set, the token itself is not saved to disk.
+   */
+  tokenEnv?: string;
 }
 
 export interface TelemetrySinkConfig {
@@ -69,9 +75,13 @@ const ALLOWED_KEYS = [
   "telemetry",
   "tokenRef",
   "keychainService",
+  "tokenEnv",
 ] as const;
 
 /** Mirrors token_ref.ts; duplicated so config.ts keeps no import of the resolver. */
+/** A shell variable name, and nothing that could carry a value. */
+const isEnvName = (v: unknown): v is string => typeof v === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(v);
+
 const isRefString = (v: unknown): v is string =>
   typeof v === "string" && (v.startsWith("file:") || v.startsWith("keychain:"));
 
@@ -100,6 +110,13 @@ export function serializeConfig(config: SuiteConfig): string {
       }
     } else if (key === "keychainService") {
       if (config.keychainService !== undefined && config.keychainService !== "") out[key] = config.keychainService;
+    } else if (key === "tokenEnv") {
+      // Omitted when unset. Refused when it is not a variable NAME: this field
+      // must never become a place a token value can be written.
+      if (config.tokenEnv !== undefined) {
+        if (!isEnvName(config.tokenEnv)) throw new Error("config.tokenEnv must be an environment variable name");
+        out[key] = config.tokenEnv;
+      }
     } else {
       out[key] = config[key];
     }
@@ -121,6 +138,7 @@ export function parseConfig(text: string): SuiteConfig {
     ...(typeof raw.keychainService === "string" && raw.keychainService !== ""
       ? { keychainService: raw.keychainService }
       : {}),
+    ...(isEnvName(raw.tokenEnv) ? { tokenEnv: raw.tokenEnv } : {}),
   };
 }
 

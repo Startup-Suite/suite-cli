@@ -31,7 +31,8 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { readConfig, type SuiteConfig } from "../config.ts";
-import { createStore, TOKEN_KEY, assertNoSecretsInArgv, type CredentialStore } from "../secrets.ts";
+import { createStore, TOKEN_KEY, assertNoSecretsInArgv, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
+import { ensureConnection, ensureToken, hasConnection, readCredentials } from "../connection.ts";
 import { dataDir } from "../paths.ts";
 import {
   attachArgv,
@@ -273,6 +274,12 @@ export interface DeepseekDeps {
   cwd?(): string;
   /** Injected in tests; defaults to the live tmux. */
   tmux?: TmuxDeps;
+  /**
+   * Asks for the Suite connection when this machine has none saved — the same
+   * prompts `suite init` asks — instead of refusing with "run suite init
+   * first". Only used from a terminal; absent, the verb refuses as before.
+   */
+  prompter?: Prompter;
 }
 
 /** Whether the harness is already installed under `dir`. */
@@ -425,11 +432,22 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   // agent root is not that agent.
   const explicitRoot = options.root ?? cwdAgentRoot(deps.cwd?.() ?? process.cwd());
   const rootConfig = explicitRoot === undefined ? null : await readAgentConfig(explicitRoot);
-  const config = rootConfig ?? (await readConfig());
+  let config = rootConfig ?? (await readConfig());
+  // NO CHICKEN AND EGG: on a machine with no saved connection, a terminal user
+  // is asked for it here — URL, runtime id, token — exactly as `suite init`
+  // would, and it is saved for next time. Off a terminal there is nobody to
+  // ask, so the refusal below stands.
+  const prompter = deps.prompter;
+  const interactive = prompter !== undefined && deps.isTTY();
+  if (rootConfig === null && !hasConnection(config) && interactive) {
+    const say = (line: string) => deps.stderr.write(`${line}\n`);
+    config = (await ensureConnection({ env: process.env, prompter, store: createStore(), out: say })).config;
+  }
   if (config === null || config.suiteUrl === "" || config.runtimeId === "") {
     deps.stderr.write(
       explicitRoot === undefined
-        ? "suite: this machine is not wired to Suite yet. Run `suite init` first,\n" +
+        ? "suite: this machine is not connected to Suite yet, and there is no terminal to ask in.\n" +
+            "suite: run `suite init` (or this command from a terminal, which asks for the connection),\n" +
             `suite: or run this from an agent folder that has its own ${AGENT_CONFIG_FILE} (or pass --root).\n`
         : `suite: no Suite config found. Run \`suite init\`, or put one at ${join(explicitRoot, AGENT_CONFIG_FILE)}\n`,
     );
@@ -442,6 +460,12 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
       ? await loadCredentials(config, deps)
       : await loadAgentCredentials(explicitRoot as string, config);
   for (const [key, value] of Object.entries(credentials)) store.set(key, value);
+  if (store.get(TOKEN_KEY) === undefined && rootConfig === null && interactive) {
+    // A machine connected by an older CLI never saved its token. Ask for it
+    // once — URL and runtime id are already known — and save it.
+    const say = (line: string) => deps.stderr.write(`${line}\n`);
+    config = await ensureToken({ env: process.env, prompter, store, out: say }, config);
+  }
   if (store.get(TOKEN_KEY) === undefined) {
     deps.stderr.write("suite: no runtime token found. Run `suite init` to capture one.\n");
     return 1;
@@ -679,6 +703,25 @@ export async function runInSession(
  * rather than three.
  */
 async function loadCredentials(config: SuiteConfig, _deps: DeepseekDeps): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  // `suite init --token-from-env VAR`: the token is in the environment only.
+  const fromEnv = config.tokenEnv === undefined ? undefined : process.env[config.tokenEnv];
+  // What `suite init` (or an inline connection) saved, beside config.json.
+  const saved = readCredentials();
+  if (saved !== null) {
+    if (saved.token !== "") out[TOKEN_KEY] = saved.token;
+    for (const name of config.headerNames) {
+      const value = saved.headers[name];
+      if (value !== undefined && value !== "") out[name] = value;
+    }
+  }
+  if (fromEnv !== undefined && fromEnv !== "") out[TOKEN_KEY] = fromEnv;
+  if (out[TOKEN_KEY] !== undefined) return out;
+  return { ...(await loadLegacyState(config)), ...out };
+}
+
+/** The pre-credentials.json location: `token` / `headers` in state.json. */
+async function loadLegacyState(config: SuiteConfig): Promise<Record<string, string>> {
   const { statePath } = await import("../paths.ts");
   const file = Bun.file(statePath());
   if (!(await file.exists())) return {};
@@ -731,5 +774,6 @@ export function liveDeepseekDeps(): DeepseekDeps {
     // waits for it: a signalled wrapper must not leave the harness orphaned.
     exec: async (argv, opts) => await runForwardingSignals(argv, { cwd: opts.cwd, env: opts.env }),
     stderr: process.stderr,
+    prompter: ttyPrompter(),
   };
 }

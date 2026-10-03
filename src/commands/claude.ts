@@ -28,10 +28,12 @@ import { dirname } from "node:path";
 import { readConfig, emptyConfig, type SuiteConfig } from "../config.ts";
 import { resolveTmux } from "../halt.ts";
 import { statePath } from "../paths.ts";
-import { createStore, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
+import { createStore, spawnWithSecrets, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
+import { ensureConnection, ensureToken, hasConnection } from "../connection.ts";
+import { ensureClaudeWiring, needsRegistration, planMcp } from "../claude_wiring.ts";
 import { type RestoreDeps, liveRestoreDeps, recordLaunch } from "./restore.ts";
 import { type SupervisorIo, ensureSupervision, liveSupervisorIo } from "../supervisor.ts";
-import { confirm, type InstallPlan } from "./init.ts";
+import { confirm, defaultCheckout, type InstallPlan, type Runner } from "./init.ts";
 import { CLAUDE_CODE_URL } from "./doctor.ts";
 import { colorEnabled } from "../ui.ts";
 import {
@@ -101,6 +103,9 @@ export const MISSING_AGENT_EXIT = 4;
 
 /** The session was created and did not survive. Distinct so scripts can tell. */
 export const SESSION_DIED_EXIT = 5;
+
+/** Claude Code's Suite wiring (plugin, MCP entries, CLAUDE.md) could not be set up. */
+export const WIRING_FAILED_EXIT = 6;
 
 /**
  * How long to let a freshly created agent settle before judging it.
@@ -576,8 +581,20 @@ export interface ClaudeDeps {
   color: boolean;
   /** `process.platform`, so {@link claudeInstallPlan} is decided not sniffed. */
   platform: string;
-  /** Used ONLY by the install offer. Claude Code's own login is never prompted here. */
+  /**
+   * Used by the install offer, and — on a machine with no saved Suite
+   * connection — by the same URL / runtime id / token prompts `suite init`
+   * asks. Claude Code's own login is never prompted here.
+   */
   prompter: Prompter;
+  /**
+   * How Claude Code's Suite wiring runs its children (git, bun, `claude mcp`).
+   *
+   * Optional for the same reason `restore` is: a caller that supplies nothing
+   * wires nothing, which keeps the launch tests from cloning, prompting or
+   * touching `~/.claude.json`. The live deps always supply it.
+   */
+  wiring?: WiringIo;
   /**
    * Injected so the settle wait is instant in tests and real on a machine.
    * Optional: a caller that supplies nothing gets the real one.
@@ -623,6 +640,16 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
   const missing = await ensureAgent(deps);
   if (missing !== null) return missing;
 
+  // Then this folder's wiring to the install, from the saved connection — or,
+  // on a machine that has none, after asking for it right here. Both orders
+  // work: `suite init` then `suite claude`, or `suite claude` straight away.
+  let config = deps.config;
+  if (deps.wiring !== undefined) {
+    const wired = await wireClaude(deps, deps.wiring);
+    if (typeof wired === "number") return wired;
+    config = wired;
+  }
+
   // A non-interactive call touches tmux NOT AT ALL — not even to detect state.
   // Probing a server it will never use is latency a scripted caller pays for
   // nothing, and on a box without tmux it would be a spawn that cannot succeed.
@@ -630,7 +657,7 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     return deps.exec(agentArgv(options.userArgs));
   }
 
-  const base = sessionNameFromConfig(deps.config, deps.cwd, options.explicitSession);
+  const base = sessionNameFromConfig(config, deps.cwd, options.explicitSession);
   const session = options.force ? uniqueSessionName(base, await listSessionNames(deps.tmux)) : base;
 
   const sessionState = options.force ? "none" : await detectState(session, deps.tmux);
@@ -772,6 +799,55 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
   return deps.exec(enter.argv);
 }
 
+export interface WiringIo {
+  run: Runner;
+  /** Whether a spinner may draw (stdout AND stderr are terminals). */
+  isTTY: boolean;
+  /**
+   * Whether there is a person to answer a prompt (stdin is a terminal). Off a
+   * terminal a missing connection cannot be asked for, so Claude is launched
+   * unwired with a warning — exactly what it did before wiring existed —
+   * rather than failing a script, a service or a test harness.
+   */
+  canPrompt: boolean;
+}
+
+/**
+ * Connect (if needed) and wire this folder's Claude Code to the install.
+ *
+ * Returns the connection to launch with, or an exit code to stop with. All
+ * output goes to stderr, so a `-p` caller's captured stdout stays Claude's.
+ */
+export async function wireClaude(deps: ClaudeDeps, wiring: WiringIo): Promise<SuiteConfig | number> {
+  const io = { env: deps.env, prompter: deps.prompter, store: deps.store, out: deps.err };
+  const unwired = (why: string): SuiteConfig => {
+    deps.err(`suite: ${why}; starting Claude Code without Suite wiring.`);
+    deps.err("suite: run `suite init`, or `suite claude` from a terminal, to connect it.");
+    return deps.config;
+  };
+  try {
+    if (!wiring.canPrompt && !hasConnection(await readConfig({ env: deps.env }))) {
+      return unwired("this machine is not connected to a Suite install and there is no terminal to ask in");
+    }
+    let { config } = await ensureConnection(io);
+    // The token is needed only to WRITE an entry. Asked for at most once, and
+    // only on a machine set up before it was saved — never on a wired folder.
+    const plan = planMcp({ env: deps.env, cwd: deps.cwd, store: deps.store }, config, defaultCheckout(deps.env));
+    if (needsRegistration(plan) && plan.want.tokenLiteral === null) {
+      if (!wiring.canPrompt) return unwired("the Claude MCP entries need writing and no token is saved");
+      config = await ensureToken(io, config);
+    }
+    await ensureClaudeWiring(
+      { env: deps.env, run: wiring.run, cwd: deps.cwd, isTTY: wiring.isTTY, store: deps.store, out: deps.err },
+      config,
+    );
+    return config;
+  } catch (error) {
+    deps.err(`suite: could not set up Claude Code for Suite: ${error instanceof Error ? error.message : String(error)}`);
+    return WIRING_FAILED_EXIT;
+  }
+}
+
 /* ------------------------------------------------------------------------- */
 /* Live dependencies                                                          */
 /* ------------------------------------------------------------------------- */
@@ -781,7 +857,14 @@ export async function liveClaudeDeps(
   prompter: Prompter = ttyPrompter(),
 ): Promise<ClaudeDeps> {
   const config = (await readConfig({ env })) ?? emptyConfig();
+  const store = createStore();
   return {
+    wiring: {
+      run: (argv, options) => spawnWithSecrets(argv, store, options),
+      // Spinners draw on stdout; a `-p` caller capturing it must get none.
+      isTTY: Boolean(process.stdout.isTTY && process.stderr.isTTY),
+      canPrompt: Boolean(process.stdin.isTTY),
+    },
     restore: liveRestoreDeps(),
     supervisorIo: liveSupervisorIo(),
     tmux: liveTmuxDeps(env),
@@ -789,7 +872,7 @@ export async function liveClaudeDeps(
     prompter,
     env,
     cwd: process.cwd(),
-    store: createStore(),
+    store,
     config,
     statePath: statePath(env),
     color: colorEnabled(env),
