@@ -30,6 +30,7 @@ import {
   parseProcesses,
 } from "../tmux.ts";
 import { resolveTmux } from "../halt.ts";
+import { answerLaunchDialogs, liveDialogIo, type AnswerResult, type DialogIo } from "../claude_dialogs.ts";
 
 export interface RestoreDeps {
   tmux: TmuxDeps;
@@ -37,6 +38,11 @@ export interface RestoreDeps {
   writeRoster(path: string, contents: string): void;
   now(): Date;
   log(line: string): void;
+  /**
+   * Answers Claude Code's pre-launch dialogs in each restored `claude` session.
+   * Optional: a caller that supplies nothing answers nothing (the tests).
+   */
+  dialogs?: DialogIo;
 }
 
 export function liveRestoreDeps(env = process.env): RestoreDeps {
@@ -55,6 +61,7 @@ export function liveRestoreDeps(env = process.env): RestoreDeps {
     },
     now: () => new Date(),
     log: (line) => console.log(`suite restore: ${line}`),
+    dialogs: liveDialogIo(liveTmuxDeps(env), env.HOME ?? "", (line) => console.log(`suite restore: ${line}`)),
   };
 }
 
@@ -216,6 +223,10 @@ export async function runRestore(
   const live = await liveSessions(deps);
   const result: RestoreResult = { started: [], skipped: [], failed: [] };
   const tmux = resolveTmux(deps.tmux.which);
+  // One poll per restored Claude session, all running at once: at boot every
+  // agent comes up together, and answering them one after another would make
+  // the last one wait for all the others' windows.
+  const answering: Promise<AnswerResult>[] = [];
 
   for (const { entry, action, reason } of restorePlan(entries, live)) {
     if (action === "skip") {
@@ -235,10 +246,14 @@ export async function runRestore(
     if (exitCode === 0) {
       result.started.push(entry.session);
       deps.log(`${entry.session}: started in ${entry.cwd}`);
+      if (entry.kind === "claude" && deps.dialogs !== undefined) {
+        answering.push(answerLaunchDialogs(deps.dialogs, { session: entry.session, cwd: entry.cwd, home }));
+      }
     } else {
       result.failed.push(entry.session);
       deps.log(`${entry.session}: FAILED — ${stderr.trim().slice(0, 160)}`);
     }
   }
+  await Promise.all(answering);
   return result;
 }

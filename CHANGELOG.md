@@ -10,6 +10,26 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.6.1
+
+- **Agents come back with nobody at the keyboard.** Claude Code shows a
+  full-screen "Loading development channels" warning on every launch with
+  `--dangerously-load-development-channels`, and in a new folder it first asks
+  whether the folder is trusted. Until someone answered, a restarted or
+  rebooted agent sat there alive and silent. `suite claude` and `suite restore`
+  now watch each session they start for up to 60 seconds and answer those
+  dialogs — plus the bypass-permissions acceptance and the "New MCP server
+  found" prompt (answered "Continue without", never an approval). `suite watch`
+  answers one still on screen in a session it owns, as a backstop.
+- **Only screens known word for word.** A dialog is answered only when its
+  whole text matches the screen captured from Claude Code 2.1.288 (kept as test
+  fixtures), with the folder it names being the folder the agent was launched
+  in and the channel being `server:suite-channel` alone. The key depends on
+  where the cursor is: two of these dialogs default to "No, exit". A reworded
+  or unknown dialog gets no keys and one log line saying so.
+- **Every key is logged** to `~/.local/state/suite/sessions/<session>.log`, and
+  each tmux call targets the session by exact name (`=NAME:`), never a prefix.
+
 ## 0.6.0
 
 - **`suite init` is harness-neutral.** It connects the machine to a Suite
