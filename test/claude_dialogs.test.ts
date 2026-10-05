@@ -225,7 +225,7 @@ describe("answerLaunchDialogs", () => {
     const unknown = ["─".repeat(80), "  Something new", "  ❯ Yes", "    No", "  Enter to confirm · Esc to cancel"].join("\n");
     const s = scripted([unknown]);
     const r = await answerLaunchDialogs(s.io, OPTS);
-    expect(r).toEqual({ outcome: "timeout", answered: [] });
+    expect(r).toEqual({ outcome: "timeout", answered: [], waitingOn: 'unrecognised dialog "Something new"' });
     expect(s.sent).toEqual([]);
     expect(s.clock.t).toBeGreaterThanOrEqual(DIALOG_WINDOW_MS);
     expect(s.clock.t).toBeLessThan(DIALOG_WINDOW_MS + 1000);
@@ -318,7 +318,8 @@ describe("suite restore answers the dialogs of the Claude sessions it starts", (
     const r = await runRestore(deps, "/home/agent", { apply: true });
     expect(r.started).toEqual(["suite-c", "suite-h"]);
     const captured = t.calls.filter((a) => a[1] === "capture-pane").map((a) => a[4]);
-    expect(captured).toEqual(["=suite-c:"]);
+    // Only the claude session is looked at (several captures: the ready settle).
+    expect([...new Set(captured)]).toEqual(["=suite-c:"]);
     // The hermes pane showed a dialog-shaped screen and still got nothing.
     expect(t.calls.filter((a) => a[1] === "send-keys")).toEqual([]);
   });

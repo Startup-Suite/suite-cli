@@ -18,7 +18,8 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, wr
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { INIT_RESULT_FIELDS } from "../src/commands/init_ref.ts";
+import { INIT_RESULT_FIELDS, installTmuxStep } from "../src/commands/init_ref.ts";
+import { buildLeanBin } from "./tool-free-path.ts";
 
 const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TEMPLATE = join(REPO_ROOT, "bin", "suite.template");
@@ -67,8 +68,12 @@ function sandbox(): Sandbox {
     ["#!/bin/sh", 'out=""', 'while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; shift; fi; shift; done', `cat ${JSON.stringify(installer)} >"$out"`].join("\n") + "\n",
   );
   writeFileSync(join(stubBin, "unzip"), "#!/bin/sh\nexit 0\n");
+  // tmux PRESENT by default, so "only bun is missing" does not depend on
+  // whether the host has a tmux in /usr/bin (moon does, rock does not).
+  writeFileSync(join(stubBin, "tmux"), "#!/bin/sh\necho 'tmux 3.4'\n");
   chmodSync(join(stubBin, "curl"), 0o755);
   chmodSync(join(stubBin, "unzip"), 0o755);
+  chmodSync(join(stubBin, "tmux"), 0o755);
   return { home, suite, stubBin, bunInstall, installedBun: join(bunInstall, "bin", "bun") };
 }
 
@@ -143,6 +148,32 @@ describe("bun absent, --json", () => {
     // Nothing was installed, and the "y" waiting on stdin was not taken as consent.
     expect(existsSync(s.installedBun)).toBe(false);
     expect(r.stderr).not.toContain("[y/N]");
+  });
+
+  test("only bun missing (tmux present): exactly one step, install_bun; deps.tmux present", () => {
+    const s = sandbox();
+    const r = run(s, ["init", "--json"]);
+    const doc = JSON.parse(r.stdout);
+    expect(doc.human_steps.map((h: { kind: string }) => h.kind)).toEqual(["install_bun"]);
+    expect(doc.deps.tmux.present).toBe(true);
+  });
+
+  test("bun AND tmux missing: ONE document carries both steps, install_tmux identical to the TypeScript init's", () => {
+    const s = sandbox();
+    rmSync(join(s.stubBin, "tmux"));
+    const lean = buildLeanBin(mkdtempSync(join(workRoot, "lean-tmux.")));
+    const path = `${s.stubBin}:${lean}`;
+    // The lean PATH really has no tmux, or this test proves nothing.
+    expect(spawnSync("sh", ["-c", "command -v tmux"], { env: { PATH: path } }).status).not.toBe(0);
+    const r = spawnSync(s.suite, ["init", "--json"], { input: "", encoding: "utf8", env: { PATH: path, HOME: s.home, BUN_INSTALL: s.bunInstall } });
+    expect(r.status).toBe(3);
+    const doc = JSON.parse(r.stdout ?? "");
+    expect(Object.keys(doc)).toEqual([...INIT_RESULT_FIELDS]);
+    expect(doc.error.code).toBe("bun_missing");
+    expect(doc.deps.tmux).toEqual({ present: false, version: null, path: null });
+    expect(doc.human_steps.map((h: { kind: string }) => h.kind)).toEqual(["install_bun", "install_tmux"]);
+    // The same step the TypeScript init gives when bun is present and tmux is not.
+    expect(doc.human_steps[1]).toEqual(installTmuxStep(process.platform, { PATH: path }));
   });
 
   test("`suite secret` is a machine verb: the same document without --json", () => {

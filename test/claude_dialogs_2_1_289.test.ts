@@ -39,8 +39,13 @@ describe("Claude Code 2.1.289: the recorded dialogs get exactly the 2.1.288 keys
       });
     }
 
-    test(`ready-not-logged-in.${w}: the 2.1.289 input box reads as ready`, () => {
-      expect(classifyPane(fixture(`ready-not-logged-in.${w}`), ctx(w))).toEqual({ kind: "ready" });
+    // Review round 2: the "Not logged in" mark makes this a sign-in for a
+    // person (login_required), no longer a plain ready box. A logged-in box —
+    // the same capture with the mark blanked — still reads as ready.
+    test(`ready-not-logged-in.${w}: the 2.1.289 input box is found, and its Not-logged-in mark is read`, () => {
+      expect(classifyPane(fixture(`ready-not-logged-in.${w}`), ctx(w))).toEqual({ kind: "person", screen: "not-logged-in" });
+      const loggedIn = fixture(`ready-not-logged-in.${w}`).replace("Not logged in · Run /login", "");
+      expect(classifyPane(loggedIn, ctx(w))).toEqual({ kind: "ready" });
     });
 
     test(`trust-folder.${w} naming another folder is held, not answered`, () => {

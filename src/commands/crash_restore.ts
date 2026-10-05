@@ -77,8 +77,6 @@ export async function crashRestorePass(
       deps.log(`${entry.session}: ${state} — would restore (dry run)`);
       continue;
     }
-    guard = decision.next;
-    guardChanged = true;
 
     if (state === "stale") {
       // Exact-match target: a bare name would prefix-match another agent's session.
@@ -86,6 +84,15 @@ export async function crashRestorePass(
     }
     const started = await startEntry(deps, home, entry);
     const n = decision.recent + 1;
+    // The session turned out to be there: nothing was restarted, so nothing
+    // is counted against the crash-loop budget (review round 2).
+    if (started.alreadyRunning === true) {
+      deps.log(`${entry.session}: already running — not restarted, not counted`);
+      continue;
+    }
+    // Counted only once a start was actually attempted on an absent session.
+    guard = decision.next;
+    guardChanged = true;
     if (started.ok) {
       result.restored.push(entry.session);
       const line = `restored by suite watch (session was ${state === "stale" ? "stale" : "gone"}; restart ${n} of at most 3 in 10 minutes) in ${entry.cwd}`;

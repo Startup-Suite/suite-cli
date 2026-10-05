@@ -73,6 +73,39 @@ tmux_json() {
 	esac
 }
 
+# The command a human runs to install tmux here. Shown, never run. Mirrors
+# init_ref.ts tmuxInstallCommand, so one Connect gets the same step whether bun
+# is missing (this file) or present (the TypeScript init).
+TMUX_INSTALL_URL='https://github.com/tmux/tmux/wiki/Installing'
+tmux_install_command() {
+	if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+		printf 'brew install tmux'
+	elif command -v apt-get >/dev/null 2>&1; then
+		printf 'sudo apt-get install -y tmux'
+	elif command -v dnf >/dev/null 2>&1; then
+		printf 'sudo dnf install -y tmux'
+	elif command -v apk >/dev/null 2>&1; then
+		printf 'sudo apk add tmux'
+	else
+		printf "install tmux with your system's package manager"
+	fi
+}
+
+# The install_tmux human step, with a leading comma, when tmux is absent:
+# a machine missing BOTH deps gets both steps from ONE Connect (review round 2).
+tmux_step_json() {
+	if command -v tmux >/dev/null 2>&1; then return 0; fi
+	cat <<EOF_TMUX
+,
+    {
+      "kind": "install_tmux",
+      "text": "tmux is not installed. Agents need it to outlive the app or terminal that started them. Install it, then connect again.",
+      "command": "$(tmux_install_command)",
+      "url": "$TMUX_INSTALL_URL"
+    }
+EOF_TMUX
+}
+
 # Exit 3 with the one document. Field order is init_ref.ts INIT_RESULT_FIELDS.
 emit_bun_missing() {
 	cat <<EOF_JSON
@@ -102,7 +135,7 @@ emit_bun_missing() {
       "text": "bun is not installed. The suite CLI runs on bun. Install it with the official installer, then try again.",
       "command": "$BUN_INSTALL_COMMAND",
       "url": "$BUN_INSTALL_URL"
-    }
+    }$(tmux_step_json)
   ],
   "error": {
     "code": "bun_missing",

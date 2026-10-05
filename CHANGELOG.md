@@ -72,6 +72,21 @@ behaviour anyone was relying on.
   10 minutes, then `crash_looping` (a new `suite status --json` state) until
   `suite restore`. **An agent stopped on purpose is restarted too while it is
   in the roster**; retire it with `suite restore --forget NAME`.
+- **A fresh macOS user's `suite claude --detach` reaches Claude's input box
+  with no human key** (review round 2). It seeds Claude Code's own
+  `hasCompletedOnboarding` (the one key that removes the theme, sign-in method
+  and security-notes screens on 2.1.289), and answers 2.1.289's headersHelper
+  trust variant and fullscreen-renderer upsell word for word. A Claude with no
+  credentials is a `claude_login_required` human step (exit 3), never a
+  credential suite handles; a screen nobody recognises is `claude_not_ready`
+  (exit 1) instead of a silent exit 0.
+- **An already-live agent is not a failed restore.** When `new-session` says
+  "duplicate session" and the session is on the server, `suite restore` skips
+  it as already running, and the watchdog's crash-restore pass neither fails
+  it nor counts it toward the crash-loop budget.
+- **One Connect reports every missing dependency.** With bun absent, the
+  launcher's document also carries the `install_tmux` step when tmux is
+  missing, identical to the TypeScript init's.
 - `suite codex` now waits for the watchdog install it starts, instead of
   exiting with it in flight.
 - Tuning values (CLI timeout, status poll, credential probe timeout, crash-loop

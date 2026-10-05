@@ -94,11 +94,21 @@ export async function startEntry(
   deps: RestoreDeps,
   home: string,
   entry: RosterEntry,
-): Promise<{ ok: boolean; stderr: string; answering: Promise<AnswerResult> | null }> {
+): Promise<{ ok: boolean; stderr: string; answering: Promise<AnswerResult> | null; alreadyRunning?: boolean }> {
   const tmux = resolveTmux(deps.tmux.which);
   const argv = [tmux, ...entry.command.slice(1)];
   const { exitCode, stderr } = await deps.tmux.run(argv);
-  if (exitCode !== 0) return { ok: false, stderr, answering: null };
+  if (exitCode !== 0) {
+    // "duplicate session" means the session is there after all: the caller's
+    // look said otherwise (a list-panes that failed under load, or a session
+    // another sweep started a moment ago). Confirmed on the server, that is an
+    // agent already running — a no-op, never a failure, and never a restart
+    // the crash-loop guard should count (review round 2).
+    if (/duplicate session/i.test(stderr) && (await liveSessions(deps)).includes(entry.session)) {
+      return { ok: false, stderr, answering: null, alreadyRunning: true };
+    }
+    return { ok: false, stderr, answering: null };
+  }
   const answering =
     entry.kind === "claude" && deps.dialogs !== undefined
       ? answerLaunchDialogs(deps.dialogs, { session: entry.session, cwd: entry.cwd, home })
@@ -283,6 +293,11 @@ export async function runRestore(
     // differ from the machine state at record time.
     const started = await startEntry(deps, home, entry);
     const stderr = started.stderr;
+    if (started.alreadyRunning === true) {
+      result.skipped.push(entry.session);
+      deps.log(`${entry.session}: skipped — already running`);
+      continue;
+    }
     if (started.ok) {
       result.started.push(entry.session);
       deps.log(`${entry.session}: started in ${entry.cwd}`);

@@ -846,6 +846,29 @@ needs tmux. `suite codex --detach` refuses a Codex that is not logged in
 (exit 7: run `suite login codex`). Off a terminal, plain `suite codex` already
 returned without attaching; `--detach` makes that hold on a terminal too.
 
+**A fresh user's first run.** Before it creates the session, `suite claude
+--detach` sets ONE key, `hasCompletedOnboarding: true`, in Claude Code's config
+(`~/.claude.json`, or `$CLAUDE_CONFIG_DIR/.claude.json`). Measured on Claude
+Code 2.1.289, that key alone removes all three onboarding screens (theme, the
+sign-in method picker, security notes); nothing else is written, an existing
+`true` is left byte for byte, and a file that is not a JSON object is not
+touched. It logs nobody in. The remaining screens are answered word for word
+and logged to the session log: trust-folder (and its headersHelper variant,
+only when every helper declared for the folder is suite's own `mcp-headers`),
+bypass-permissions, dev-channels and the fullscreen-renderer upsell ("Not
+now"). The poll waits for the input box to stay up for about 6 s, so a screen
+Claude draws once it is idle is answered too.
+
+**Sign-in is a person's step, never suite's.** If Claude has no credentials
+(the "Select login method" screen, or an input box marked "Not logged in"),
+suite sends no key, exits **3** with `error.code` `claude_login_required` and a
+`human_steps` entry `sign_in_claude` naming `claude auth login --claudeai`.
+suite never picks a login method and never enters or relays a Claude
+credential or code. If Claude never reaches its input box (an unrecognised
+screen), `--detach` exits **1** with `claude_not_ready` naming the screen; it
+no longer exits 0. Run on a session that already exists, `--detach` looks at it
+again and answers a recognised screen left on it.
+
 ### Crash restore (`suite watch`)
 
 Each `suite watch` tick restores **recorded** agents whose session has died,

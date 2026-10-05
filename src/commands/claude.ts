@@ -33,10 +33,19 @@ import { ensureConnection, ensureToken, hasConnection } from "../connection.ts";
 import { ensureClaudeWiring, needsRegistration, planMcp } from "../claude_wiring.ts";
 import { type RestoreDeps, liveRestoreDeps, recordLaunch } from "./restore.ts";
 import { type SupervisorIo, ensureSupervision, liveSupervisorIo } from "../supervisor.ts";
-import { confirm, defaultCheckout, type InstallPlan, type Runner } from "./init.ts";
+import { claudeJsonPath, confirm, defaultCheckout, type InstallPlan, type Runner } from "./init.ts";
 import { CLAUDE_CODE_URL } from "./doctor.ts";
 import { colorEnabled } from "../ui.ts";
-import { answerLaunchDialogs, liveDialogIo, sessionLogPath, type AnswerResult, type DialogIo } from "../claude_dialogs.ts";
+import {
+  answerLaunchDialogs,
+  CLAUDE_SIGN_IN_COMMAND,
+  liveDialogIo,
+  sessionLogPath,
+  type AnswerResult,
+  type DialogIo,
+} from "../claude_dialogs.ts";
+import { seedLogLine, seedOnboarding, type SeedOutcome } from "../claude_onboarding.ts";
+import type { HumanStep } from "../stamp_result.ts";
 import {
   attachArgv,
   composeNewSession,
@@ -604,6 +613,13 @@ export interface ClaudeDeps {
    */
   dialogs?: DialogIo;
   /**
+   * `--detach` only: mark Claude Code's onboarding complete in its config
+   * before the session is created (src/claude_onboarding.ts), so a fresh
+   * user's unattended agent does not park on first-run screens. Optional for
+   * the same reason `restore` is: absent, nothing is written.
+   */
+  seedOnboarding?(claudeJson: string): SeedOutcome;
+  /**
    * Injected so the settle wait is instant in tests and real on a machine.
    * Optional: a caller that supplies nothing gets the real one.
    */
@@ -653,6 +669,31 @@ export interface DetachDocument {
   state: SessionState;
   created: boolean;
   error: { code: string; message: string } | null;
+  /**
+   * Additive (0.8.0, review round 2): what a person must do before the agent
+   * can work — today only `sign_in_claude` (Claude Code's own
+   * `claude auth login`; suite never handles the credential). Present only
+   * when non-empty.
+   */
+  human_steps?: HumanStep[];
+}
+
+/** `--detach`: the session is up, but Claude needs a person (a sign-in). The stamp contract's "blocked". */
+export const DETACH_BLOCKED_EXIT = 3;
+
+/** `--detach`: the session is up, but Claude never reached its input box (an unanswered screen). */
+export const DETACH_NOT_READY_EXIT = 1;
+
+/** The human step for a Claude Code that has no credentials. */
+export function signInClaudeStep(): HumanStep {
+  return {
+    kind: "sign_in_claude",
+    text:
+      "Claude Code is not signed in. Sign in with your Claude subscription using Claude Code's own command, " +
+      "then start the agent again. suite never asks for, sees or relays a Claude sign-in code.",
+    command: CLAUDE_SIGN_IN_COMMAND,
+    url: "https://code.claude.com/docs/en/setup",
+  };
 }
 
 /** Exit code for `--detach` combined with something it cannot honour (-p). */
@@ -743,6 +784,13 @@ async function runClaudeInner(
   report({ session });
 
   if (plan.kill !== undefined) await deps.tmux.run(plan.kill);
+  // Unattended starts only: a person at a terminal sees Claude's own
+  // onboarding; an app-started agent has nobody to see it (review round 2).
+  if (detach && plan.create !== undefined && deps.seedOnboarding !== undefined) {
+    const claudeJson = claudeJsonPath(deps.env);
+    const seeded = deps.seedOnboarding(claudeJson);
+    deps.dialogs?.log(session, seedLogLine(seeded, claudeJson));
+  }
   if (plan.create !== undefined) {
     const created = await deps.tmux.run(plan.create);
     if (created.exitCode !== 0) {
@@ -862,8 +910,16 @@ async function runClaudeInner(
   // there whether or not anyone is looking, which is the whole point.
   let answering: Promise<AnswerResult> | null = null;
   let answeringDone = false;
-  if (plan.create !== undefined && deps.dialogs !== undefined) {
-    answering = answerLaunchDialogs(deps.dialogs, { session, cwd: deps.cwd, home: deps.env.HOME }).finally(() => {
+  // `--detach` also looks at a session it did NOT create: the Mac app's Retry
+  // re-runs `--detach` on an agent left at a screen. Only recognised dialogs
+  // ever get a key, and a ready input box ends the look at once.
+  if ((plan.create !== undefined || detach) && deps.dialogs !== undefined) {
+    answering = answerLaunchDialogs(deps.dialogs, {
+      session,
+      cwd: deps.cwd,
+      home: deps.env.HOME,
+      claudeJson: claudeJsonPath(deps.env),
+    }).finally(() => {
       answeringDone = true;
     });
   }
@@ -883,6 +939,20 @@ async function runClaudeInner(
     const code = await finish(0);
     report({ state: await detectState(session, deps.tmux) });
     deps.err(`suite: ${session} is running detached — attach with \`suite claude\` in ${deps.cwd}`);
+    const result = answering === null ? null : await answering;
+    if (result?.outcome === "login_required") {
+      const message = "Claude Code is running but not signed in; a person signs in with `" + CLAUDE_SIGN_IN_COMMAND + "`";
+      deps.err(`suite claude: ${message}`);
+      report({ error: { code: "claude_login_required", message }, human_steps: [signInClaudeStep()] });
+      return DETACH_BLOCKED_EXIT;
+    }
+    if (result?.outcome === "timeout") {
+      const on = result.waitingOn !== undefined ? ` (waiting on ${result.waitingOn})` : "";
+      const message = `Claude Code did not reach its input box${on}; see ${sessionLogPath(deps.env.HOME ?? "", session)}`;
+      deps.err(`suite claude: ${message}`);
+      report({ error: { code: "claude_not_ready", message } });
+      return DETACH_NOT_READY_EXIT;
+    }
     return code;
   }
   const enter = plan.enter;
@@ -973,6 +1043,7 @@ export async function liveClaudeDeps(
     // File only, no echo: while the attach owns the terminal, a line on stderr
     // would draw across the tmux client. The summary is printed after it.
     dialogs: liveDialogIo(liveTmuxDeps(env), env.HOME ?? "", () => {}),
+    seedOnboarding: (path) => seedOnboarding(path),
     tmux: liveTmuxDeps(env),
     platform: process.platform,
     prompter,
