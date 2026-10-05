@@ -34,6 +34,7 @@ import { createHash } from "node:crypto";
 import { fstatSync } from "node:fs";
 import { CONTRACT_VERSION, EXIT_BLOCKED, EXIT_FAILED, EXIT_OK, EXIT_REFUSED, StampFailure, divertStdout, refused, type HumanStep, type StampIO } from "../stamp_result.ts";
 import { SECURITY_BIN, isValidItem, keychainHumanStep, resolveTokenRef, type KeychainDeps } from "../token_ref.ts";
+import { SECURITY_TIMEOUT_MS } from "../tuning.ts";
 
 /** Runs `bin` with `args` and `stdin` piped in, no shell. Output is captured and never printed. */
 export type SecurityExec = (bin: string, args: string[], stdin?: string) => Promise<{ exitCode: number; stdout: string }>;
@@ -127,18 +128,30 @@ function stripOneNewline(value: string): string {
   return value;
 }
 
+/** What liveExec reports when `security` had to be killed at {@link SECURITY_TIMEOUT_MS}. */
+export const SECURITY_TIMED_OUT = -2;
+
 async function liveExec(bin: string, args: string[], stdin?: string): Promise<{ exitCode: number; stdout: string }> {
   const proc = Bun.spawn([bin, ...args], {
     stdin: stdin === undefined ? "ignore" : new Blob([stdin]),
     stdout: "pipe",
     stderr: "pipe",
   });
-  const [stdout, , exitCode] = await Promise.all([
-    new Response(proc.stdout).text(),
-    new Response(proc.stderr).text(),
-    proc.exited,
-  ]);
-  return { exitCode, stdout };
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    proc.kill("SIGKILL");
+  }, SECURITY_TIMEOUT_MS);
+  try {
+    const [stdout, , exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
+    ]);
+    return { exitCode: timedOut ? SECURITY_TIMED_OUT : exitCode, stdout: timedOut ? "" : stdout };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function liveReadStdin(): Promise<{ tty: true } | { tty: false; value: string }> {
@@ -159,7 +172,7 @@ function result(action: SecretOptions["action"], service = "", item = ""): Secre
 function writeFailure(service: string, item: string, exitCode: number): StampFailure {
   // Exit 36 (-25308, errSecInteractionNotAllowed) is a locked keychain in a
   // session that may not prompt: what ssh gets (measured on rock, 2026-10-05).
-  if (exitCode === 36) {
+  if (exitCode === 36 || exitCode === SECURITY_TIMED_OUT) {
     const step = keychainHumanStep({ service, item }, exitCode);
     return new StampFailure(EXIT_BLOCKED, "keychain_locked", step.text, [step]);
   }

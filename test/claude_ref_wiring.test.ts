@@ -197,12 +197,18 @@ describe("ref-mode wiring", () => {
 
 describe("suite mcp-headers", () => {
   function runHelper(args: string[]) {
-    const p = Bun.spawnSync([process.execPath, CLI, "mcp-headers", ...args], { env, stdout: "pipe", stderr: "pipe" });
+    // bun's transpiler cache is bun's, not this CLI's: switched off, so "writes
+    // no file" can be checked over the WHOLE of HOME (~/.bun on Linux,
+    // ~/Library/Caches/bun on macOS would otherwise appear).
+    const p = Bun.spawnSync([process.execPath, CLI, "mcp-headers", ...args], {
+      env: { ...env, BUN_RUNTIME_TRANSPILER_CACHE_PATH: "0" },
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     return { code: p.exitCode, stdout: p.stdout.toString(), stderr: p.stderr.toString() };
   }
 
-  // bun's own transpiler cache (~/.bun/install/cache) is bun's, not this CLI's.
-  const ownFiles = () => listFiles(home).filter((p) => !p.includes("/.bun/"));
+  const ownFiles = () => listFiles(home);
 
   test("prints ONLY the headers object on stdout; nothing on stderr; writes no file", () => {
     const before = ownFiles();

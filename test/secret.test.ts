@@ -8,7 +8,9 @@
  * nowhere else — not argv, not the document, not stderr.
  */
 import { describe, expect, test } from "bun:test";
+import { SECURITY_TIMEOUT_MS } from "../src/tuning.ts";
 import {
+  SECURITY_TIMED_OUT,
   addCommandLine,
   parseSecretArgs,
   runSecret,
@@ -151,6 +153,26 @@ describe("suite secret put", () => {
     expect(r.result.human_steps[0]?.command).toContain("security unlock-keychain");
     expect(r.result.human_steps[0]?.url).toStartWith("https://support.apple.com/");
   });
+
+  test("a security that never answers is killed and reported as a human step (exit 3), not a hang", async () => {
+    const k = fakeKeychain({ writeExit: SECURITY_TIMED_OUT });
+    const r = await runSecretInner(PUT, deps(k, canary()));
+    expect(r.exitCode).toBe(3);
+    expect(r.result.human_steps[0]?.kind).toBe("keychain_unlock");
+    expect(r.result.human_steps[0]?.text).toContain("did not answer in time");
+  });
+
+  test("the live runner kills a security that hangs (measured: a HOME with no login keychain makes it wait)", async () => {
+    const dir = (await import("node:fs")).mkdtempSync(`${(await import("node:os")).tmpdir()}/suite-secret-hang-01a0d6b9-`);
+    const bin = `${dir}/security`;
+    (await import("node:fs")).writeFileSync(bin, "#!/bin/sh\nexec sleep 60\n");
+    (await import("node:fs")).chmodSync(bin, 0o755);
+    const started = Date.now();
+    const r = await runSecretInner(PUT, { platform: "darwin", securityBin: bin, readStdin: async () => ({ tty: false, value: "v" }) });
+    expect(r.exitCode).toBe(3);
+    expect(Date.now() - started).toBeLessThan(SECURITY_TIMEOUT_MS + 5_000);
+    (await import("node:fs")).rmSync(dir, { recursive: true, force: true });
+  }, 30_000);
 
   test("another write failure is exit 1, not a human step", async () => {
     const r = await runSecretInner(PUT, deps(fakeKeychain({ writeExit: 45 }), canary()));

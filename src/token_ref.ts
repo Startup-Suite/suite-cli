@@ -299,7 +299,10 @@ export function keychainHumanStep(ref: { item: string; service: string }, securi
   }
   return {
     kind: "keychain_unlock",
-    text: `The login keychain is locked, or this session may not show the unlock prompt (security exit ${securityExit}). Unlock it, then re-run.`,
+    text:
+      securityExit === -2
+        ? "The keychain did not answer in time: it may be waiting on a prompt this session cannot show. Unlock the login keychain, then re-run."
+        : `The login keychain is locked, or this session may not show the unlock prompt (security exit ${securityExit}). Unlock it, then re-run.`,
     command: "security unlock-keychain ~/Library/Keychains/login.keychain-db",
     url: KEYCHAIN_HELP_URL,
   };

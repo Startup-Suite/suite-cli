@@ -14,6 +14,15 @@ export const CLI_TIMEOUT_MS = 15_000;
 /** How often the Mac app's menu re-reads `suite status --json`. Read by the app, documented here. */
 export const STATUS_POLL_INTERVAL_MS = 60_000;
 
+/**
+ * How long `suite secret` waits for `/usr/bin/security`. Measured on rock
+ * (2026-10-05): with HOME pointed somewhere that has no login keychain,
+ * `security -i add-generic-password` does not fail, it WAITS (for a keychain
+ * to be created through UI that an ssh session cannot show). A machine caller
+ * must get a document, not a hang, so the child is killed at this limit.
+ */
+export const SECURITY_TIMEOUT_MS = 10_000;
+
 /** The authenticated `tools/list` probe `suite init --token-ref` makes before it saves anything. */
 export const CREDENTIAL_PROBE_TIMEOUT_MS = 10_000;
 

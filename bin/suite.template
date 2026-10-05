@@ -68,7 +68,7 @@ BUN_INSTALL_URL='https://bun.sh/docs/installation'
 tmux_json() {
 	_tmux="$(command -v tmux 2>/dev/null || true)"
 	case "$_tmux" in
-	'' | *'"'* | *'\'*) printf '{"present": false, "version": null, "path": null}' ;;
+	'' | *\"* | *\\*) printf '{"present": false, "version": null, "path": null}' ;;
 	*) printf '{"present": true, "version": null, "path": "%s"}' "$_tmux" ;;
 	esac
 }
