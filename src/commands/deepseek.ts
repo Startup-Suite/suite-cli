@@ -34,6 +34,10 @@ import { readConfig, type SuiteConfig } from "../config.ts";
 import { createStore, TOKEN_KEY, assertNoSecretsInArgv, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
 import { ensureConnection, ensureToken, hasConnection, readCredentials } from "../connection.ts";
 import { dataDir } from "../paths.ts";
+import { parseTokenRef, resolveTokenRef, type ResolveDeps } from "../token_ref.ts";
+
+/** `suite deepseek` on a ref-mode connection: refused, exit 2 (the stamp contract's "refused"). */
+export const TOKEN_REF_UNSUPPORTED_EXIT = 2;
 import {
   attachArgv,
   composeNewSession,
@@ -433,6 +437,18 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   const explicitRoot = options.root ?? cwdAgentRoot(deps.cwd?.() ?? process.cwd());
   const rootConfig = explicitRoot === undefined ? null : await readAgentConfig(explicitRoot);
   let config = rootConfig ?? (await readConfig());
+  // REF MODE IS NOT SUPPORTED HERE YET (a named follow-up): dsh reads its token
+  // from SUITE_RUNTIME_TOKEN in its environment, so honouring a ref would mean
+  // resolving it into a long-lived child's env. Refused with exit 2 rather
+  // than done quietly.
+  if (config?.tokenRef !== undefined && config.tokenRef !== "") {
+    deps.stderr.write(
+      `suite deepseek: token_ref_unsupported: this connection uses the token ref ${config.tokenRef}, ` +
+        "and suite deepseek does not support token refs yet (follow-up). Connect this agent with its own " +
+        `${AGENT_CONFIG_FILE} and credentials, or use suite claude, codex, hermes or openclaw.\n`,
+    );
+    return TOKEN_REF_UNSUPPORTED_EXIT;
+  }
   // NO CHICKEN AND EGG: on a machine with no saved connection, a terminal user
   // is asked for it here — URL, runtime id, token — exactly as `suite init`
   // would, and it is saved for next time. Off a terminal there is nobody to
@@ -702,8 +718,24 @@ export async function runInSession(
  * Separated so the run path above has one place to fail on a missing token
  * rather than three.
  */
-export async function loadCredentials(config: SuiteConfig, _deps: DeepseekDeps): Promise<Record<string, string>> {
+export async function loadCredentials(
+  config: SuiteConfig,
+  _deps: DeepseekDeps,
+  resolveDeps?: ResolveDeps,
+): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
+  // REF MODE (`suite init --token-ref`): the token is resolved IN MEMORY, every
+  // time, and never saved. A keychain that does not answer throws a
+  // StampFailure (exit 3) naming the item, never a value.
+  if (config.tokenRef !== undefined && config.tokenRef !== "") {
+    out[TOKEN_KEY] = await resolveTokenRef(parseTokenRef(config.tokenRef, { keychainService: config.keychainService }), resolveDeps);
+    const saved = config.headerNames.length > 0 ? readCredentials() : null;
+    for (const name of config.headerNames) {
+      const value = saved?.headers[name];
+      if (value !== undefined && value !== "") out[name] = value;
+    }
+    return out;
+  }
   // `suite init --token-from-env VAR`: the token is in the environment only.
   const fromEnv = config.tokenEnv === undefined ? undefined : process.env[config.tokenEnv];
   // What `suite init` (or an inline connection) saved, beside config.json.

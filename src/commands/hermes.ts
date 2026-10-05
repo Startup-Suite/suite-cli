@@ -82,6 +82,7 @@ import {
   type StampInputs,
   type StampRequest,
 } from "../stamp.ts";
+import { readMachineConnection } from "../stamp.ts";
 import {
   EXIT_FAILED,
   EXIT_REFUSED,
@@ -1338,9 +1339,11 @@ async function runGateway(opts: HermesOptions, deps: HermesDeps): Promise<number
 function stampParts(args: string[], deps: HermesDeps) {
   const ctx: { opts: HermesOptions | null } = { opts: null };
   const writer = hermesWriter(ctx, deps);
-  const build = (): StampRequest => {
+  const build = async (): Promise<StampRequest> => {
     ctx.opts = parseHermesOptions(args);
-    return stampRequest(ctx.opts);
+    // `--token-ref` defaults to the machine's ref (suite init --token-ref) for
+    // the machine's own runtime; see stamp.ts machineFallback.
+    return { ...stampRequest(ctx.opts), machine: await readMachineConnection(deps.env) };
   };
   const stampDeps: StampDeps = { resolve: deps.resolve, stdin: deps.stdin };
   return { writer, build, stampDeps };

@@ -44,6 +44,8 @@ import { resolve } from "node:path";
 import { emptyConfig, readConfig, type SuiteConfig } from "../config.ts";
 import { configPath } from "../paths.ts";
 import { readCredentials } from "../connection.ts";
+import { localEntries } from "../claude_wiring.ts";
+import { parseTokenRef, resolveTokenRef } from "../token_ref.ts";
 import {
   CHANNEL_SERVER,
   PENDING_APPROVAL_REMEDY,
@@ -665,6 +667,21 @@ export interface DoctorDeps {
   color: boolean;
   utf8: boolean;
   out(line: string): void;
+  /**
+   * REF MODE (config.tokenRef set): resolve the ref IN MEMORY, for the probe's
+   * Authorization header only. Never rendered. Absent: the tools probe in ref
+   * mode reports that it could not resolve, rather than probing with nothing.
+   */
+  resolveRef?(config: SuiteConfig): Promise<string>;
+  /** Operator header values saved beside the config, for the ref-mode probe. Never rendered. */
+  savedHeaders?(): Record<string, string>;
+  /** This folder's `startup-suite` headersHelper, from ~/.claude.json; null when none. */
+  toolsHelper?(): string | null;
+}
+
+/** True when the machine connection holds a token REF rather than a value. */
+export function inRefMode(config: SuiteConfig | null): boolean {
+  return config?.tokenRef !== undefined && config.tokenRef !== "";
 }
 
 /* ------------------------------------------------------------------------- */
@@ -805,7 +822,11 @@ export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
   // below: the token comparison and the probe read the same entry, so they can
   // never disagree about what is registered.
   const toolsEntry = claudePath === null ? null : await deps.run([claudePath, "mcp", "get", TOOLS_SERVER]);
-  checks.push(tokensCheck(claudePath, entry, toolsEntry));
+  checks.push(
+    inRefMode(deps.config)
+      ? refTokensCheck(deps, claudePath, entry, toolsEntry)
+      : tokensCheck(claudePath, entry, toolsEntry),
+  );
 
   checks.push(await channelCheck(deps, claudePath, pluginOk));
 
@@ -843,7 +864,9 @@ function installCheck(deps: DoctorDeps): CheckResult {
     };
   }
   const token =
-    config.tokenEnv !== undefined
+    config.tokenRef !== undefined && config.tokenRef !== ""
+      ? `token ref ${config.tokenRef}`
+      : config.tokenEnv !== undefined
       ? `token from $${config.tokenEnv}`
       : deps.tokenSaved === undefined
         ? ""
@@ -1117,6 +1140,52 @@ function tokensCheck(
   return { id, label, status: "pass", value: "both entries agree", detail: channelHost };
 }
 
+/**
+ * REF MODE's token match: both entries must name THE MACHINE'S REF. The
+ * channel entry carries it in `SUITE_TOKEN`; the tools entry carries it inside
+ * its headersHelper command (`... mcp-headers --token-ref '<ref>' ...`), which
+ * `claude mcp get` does not print, so it is read from ~/.claude.json. Refs are
+ * names, so they are compared and shown as they are. An inline bearer on the
+ * tools entry is a FAILURE here: ref mode must leave no value in that file.
+ */
+function refTokensCheck(
+  deps: DoctorDeps,
+  claudePath: string | null,
+  channelEntry: RunResult | null,
+  toolsEntry: RunResult | null,
+): CheckResult {
+  const id = "tokens";
+  const label = "token match";
+  const ref = deps.config?.tokenRef ?? "";
+  if (claudePath === null || channelEntry === null || toolsEntry === null) {
+    return { id, label, status: "skip", reason: "needs the claude cli" };
+  }
+  if (channelEntry.exitCode !== 0) return { id, label, status: "skip", reason: `${CHANNEL_SERVER} is not registered` };
+  if (toolsEntry.exitCode !== 0) return { id, label, status: "skip", reason: `${TOOLS_SERVER} is not registered` };
+  const channelRef = mcpEntryEnvValue(`${channelEntry.stdout}\n${channelEntry.stderr}`, "SUITE_TOKEN");
+  const inline = parseMcpHeaderValue(`${toolsEntry.stdout}\n${toolsEntry.stderr}`, "Authorization");
+  const helper = deps.toolsHelper?.() ?? null;
+  const wrong: string[] = [];
+  if (channelRef !== ref) wrong.push(`${CHANNEL_SERVER} names ${channelRef === null ? "no ref" : "another token"}`);
+  if (helper === null || !helper.includes(`'${ref}'`)) wrong.push(`${TOOLS_SERVER} has no headersHelper for ${ref}`);
+  if (inline !== null) wrong.push(`${TOOLS_SERVER} still carries an inline Authorization header`);
+  if (wrong.length > 0) {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "entries do not use the ref",
+      detail: wrong.join("; "),
+      consequence: [
+        `This machine connects with the token ref ${ref}, and an entry that does not name it authenticates with something else, or with nothing.`,
+        "Re-running suite claude rewrites both entries from the saved connection.",
+      ],
+      remedy: "suite claude",
+    };
+  }
+  return { id, label, status: "pass", value: "both entries use the ref", detail: ref };
+}
+
 async function channelCheck(
   deps: DoctorDeps,
   claudePath: string | null,
@@ -1267,11 +1336,37 @@ async function toolsCheck(
 
   // Headers verbatim off the entry — the secret goes straight into the request
   // and is never held anywhere it could be rendered.
-  const headers = {
+  const headers: Record<string, string> = {
     ...parseMcpHeaders(output),
     "Content-Type": "application/json",
     Accept: "application/json, text/event-stream",
   };
+  if (inRefMode(deps.config)) {
+    // REF MODE: the entry has a headersHelper and no headers. Build what the
+    // helper would print — the saved operator headers and the resolved ref —
+    // in memory, straight into the request.
+    let token: string | null = null;
+    try {
+      token = deps.resolveRef === undefined || deps.config === null ? null : await deps.resolveRef(deps.config);
+    } catch {
+      token = null;
+    }
+    if (token === null) {
+      return {
+        id,
+        label,
+        status: "fail",
+        value: "token ref unresolved",
+        detail: deps.config?.tokenRef ?? "",
+        consequence: [
+          "The ref this machine connects with did not resolve here (a locked keychain, a missing item, or a file with the wrong mode),",
+          "so Claude Code's headersHelper fails the same way and the tools entry connects with no credential.",
+        ],
+        remedy: "suite init --json",
+      };
+    }
+    Object.assign(headers, deps.savedHeaders?.() ?? {}, { Authorization: `Bearer ${token}` });
+  }
 
   let result: ProbeResult | null = null;
   try {
@@ -1413,6 +1508,10 @@ export async function liveDoctorDeps(
     config: await readConfig({ env }),
     configFile: configPath(env),
     tokenSaved: (readCredentials(env)?.token ?? "") !== "",
+    resolveRef: async (config) =>
+      await resolveTokenRef(parseTokenRef(config.tokenRef ?? "", { keychainService: config.keychainService })),
+    savedHeaders: () => readCredentials(env)?.headers ?? {},
+    toolsHelper: () => localEntries(env, process.cwd())?.[TOOLS_SERVER]?.headersHelper ?? null,
     tmux,
     color: colorEnabled(env),
     utf8: utf8Enabled(env),

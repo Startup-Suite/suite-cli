@@ -40,18 +40,96 @@ suite_ask() {
 	printf '%s' "$_reply"
 }
 
-bootstrap_bun() {
-	printf 'suite: bun is not installed, and suite init needs it.\n' >&2
-	printf 'install bun now with the official installer from https://bun.sh? [y/N] ' >&2
-	reply="$(suite_ask)"
-	printf '\n' >&2
-	case "$reply" in
-	y | Y | yes | YES | Yes) : ;;
-	*)
-		printf 'suite: not installing bun. Install it from https://bun.sh, then re-run suite init.\n' >&2
-		exit 1
-		;;
+# ------------------------------------------------------- machine callers ---
+# A caller that passes --json (the Mac app) gets ONE JSON document on stdout
+# and an exit code, and is NEVER prompted: nothing here reads /dev/tty or stdin
+# on that path. With bun absent that document is the `suite init --json`
+# shape, blocked (exit 3) on one human step, install_bun, naming the official
+# command and page. `suite secret` is always a machine verb, so it counts too.
+# `--install-bun` is the explicit consent: it runs the same official bootstrap
+# below without a prompt.
+SUITE_JSON=0
+SUITE_INSTALL_BUN=0
+for _arg in "$@"; do
+	case "$_arg" in
+	--) break ;;
+	--json) SUITE_JSON=1 ;;
+	--install-bun) SUITE_INSTALL_BUN=1 ;;
 	esac
+done
+case "${1:-}" in
+secret) SUITE_JSON=1 ;;
+esac
+
+BUN_INSTALL_COMMAND='curl -fsSL https://bun.sh/install | bash'
+BUN_INSTALL_URL='https://bun.sh/docs/installation'
+
+# The tmux half of the deps object. Present/absent and the path, nothing else.
+tmux_json() {
+	_tmux="$(command -v tmux 2>/dev/null || true)"
+	case "$_tmux" in
+	'' | *'"'* | *'\'*) printf '{"present": false, "version": null, "path": null}' ;;
+	*) printf '{"present": true, "version": null, "path": "%s"}' "$_tmux" ;;
+	esac
+}
+
+# Exit 3 with the one document. Field order is init_ref.ts INIT_RESULT_FIELDS.
+emit_bun_missing() {
+	cat <<EOF_JSON
+{
+  "contract_version": 1,
+  "ok": false,
+  "changed": false,
+  "connection": {
+    "suite_url": "",
+    "runtime_id": "",
+    "token_ref": null,
+    "keychain_service": null
+  },
+  "deps": {
+    "bun": {"present": false, "version": null, "path": null},
+    "tmux": $(tmux_json)
+  },
+  "watchdog": {
+    "requested": false,
+    "installed": null,
+    "kind": null,
+    "summary": null
+  },
+  "human_steps": [
+    {
+      "kind": "install_bun",
+      "text": "bun is not installed. The suite CLI runs on bun. Install it with the official installer, then try again.",
+      "command": "$BUN_INSTALL_COMMAND",
+      "url": "$BUN_INSTALL_URL"
+    }
+  ],
+  "error": {
+    "code": "bun_missing",
+    "message": "bun is not installed or not on PATH"
+  }
+}
+EOF_JSON
+	exit 3
+}
+
+bootstrap_bun() {
+	if [ "$SUITE_INSTALL_BUN" -eq 1 ]; then
+		# Consent was given on the command line. No prompt, no /dev/tty.
+		printf 'suite: bun is not installed; installing it with the official installer from https://bun.sh (--install-bun).\n' >&2
+	else
+		printf 'suite: bun is not installed, and suite init needs it.\n' >&2
+		printf 'install bun now with the official installer from https://bun.sh? [y/N] ' >&2
+		reply="$(suite_ask)"
+		printf '\n' >&2
+		case "$reply" in
+		y | Y | yes | YES | Yes) : ;;
+		*)
+			printf 'suite: not installing bun. Install it from https://bun.sh, then re-run suite init.\n' >&2
+			exit 1
+			;;
+		esac
+	fi
 
 	# unzip belongs on this list because the bun.sh installer downloads a zip
 	# and unzips it: without unzip the installer fails partway, leaving a
@@ -66,6 +144,7 @@ bootstrap_bun() {
 			printf 'suite: %s is needed to install bun, and is not on PATH.\n' "$tool" >&2
 			printf 'suite: install %s yourself (suite never runs a package manager, and never sudo), then re-run suite init.\n' \
 				"$tool" >&2
+			[ "$SUITE_JSON" -eq 1 ] && emit_bun_missing
 			exit 127
 		fi
 	done
@@ -79,9 +158,12 @@ bootstrap_bun() {
 			exit 1
 		}
 	# Installs under $BUN_INSTALL (default ~/.bun), which the user owns. Never sudo.
-	if ! curl -fsSL https://bun.sh/install -o "$installer" || ! bash "$installer"; then
+	# The installer's own chatter goes to stderr: under --json stdout carries
+	# exactly one document, from the CLI this execs into.
+	if ! curl -fsSL https://bun.sh/install -o "$installer" || ! bash "$installer" >&2; then
 		rm -f "$installer"
 		printf 'suite: installing bun failed. See https://bun.sh for manual instructions.\n' >&2
+		[ "$SUITE_JSON" -eq 1 ] && emit_bun_missing
 		exit 1
 	fi
 	rm -f "$installer"
@@ -102,6 +184,14 @@ if ! command -v bun >/dev/null 2>&1; then
 	if [ -x "$(bun_bin_dir)/bun" ]; then
 		PATH="$(bun_bin_dir):$PATH"
 		export PATH
+	fi
+fi
+
+if ! command -v bun >/dev/null 2>&1; then
+	if [ "$SUITE_INSTALL_BUN" -eq 1 ]; then
+		bootstrap_bun
+	elif [ "$SUITE_JSON" -eq 1 ]; then
+		emit_bun_missing
 	fi
 fi
 

@@ -48,9 +48,18 @@ import { liveOpenclawDeps, runOpenclaw } from "./commands/openclaw.ts";
 import { liveUpdateDeps, runUpdate } from "./commands/update.ts";
 import { liveCodexDeps, runCodex } from "./commands/codex.ts";
 import { ttyPrompter } from "./secrets.ts";
+import { isNonInteractiveInit, liveInitRefDeps, runInitRef } from "./commands/init_ref.ts";
+import { runSecret } from "./commands/secret.ts";
+import { runMcpHeaders } from "./commands/mcp_headers.ts";
+import { liveSupervisorIo as liveSupervisorIoForInit } from "./supervisor.ts";
+import { liveTmuxDeps } from "./tmux.ts";
+import { liveWatchdogLoaded, livePidAlive, renderStatusDocument, statusDocument } from "./commands/status_json.ts";
+import { readFileOrNull } from "./commands/status.ts";
 
 export type Verb =
   | "init"
+  | "secret"
+  | "mcp-headers"
   | "claude"
   | "claude new"
   | "deepseek"
@@ -69,7 +78,7 @@ export interface Dispatch {
   args: string[];
 }
 
-const VERBS = new Set(["init", "claude", "deepseek", "hermes", "openclaw", "codex", "doctor", "status", "update", "watch", "restore"]);
+const VERBS = new Set(["init", "secret", "mcp-headers", "claude", "deepseek", "hermes", "openclaw", "codex", "doctor", "status", "update", "watch", "restore"]);
 
 /**
  * Pure: map argv to a verb plus untouched passthrough arguments.
@@ -149,6 +158,8 @@ export function usage(): string {
     row("suite", VERSION),
     "",
     row("init", "connect this machine to a Suite install (url, runtime id, token, watchdog)"),
+    row("init --token-ref", "the same without a terminal: --suite-url --runtime-id --token-ref [--json]"),
+    row("secret", "put|delete a keychain item (value on stdin) — macOS"),
     row("claude", "set up Claude Code for Suite in this folder if needed, then run it in a persistent session"),
     row("claude new", "force a new session"),
     row("deepseek", "run a DeepSeek Harness agent federated into Suite"),
@@ -156,7 +167,7 @@ export function usage(): string {
     row("openclaw", "stamp an OpenClaw agent root and run its gateway (--stamp-only: JSON contract)"),
     row("codex", "run a Codex agent through codex app-server, federated into Suite, in a persistent session"),
     row("doctor", "diagnose a broken setup"),
-    row("status", "show federation, session state and stamped agents (kind, root, live/stale, last verdict)"),
+    row("status", "show federation, session state and stamped agents (kind, root, live/stale, last verdict); --json"),
     row("watch", "recover halted agent sessions (--dry-run, --once, --interval N, --force SESSION)"),
     row("restore", "bring recorded agents back up (--adopt, --dry-run, --forget NAME)"),
     row("update", "install the latest suite CLI"),
@@ -181,8 +192,38 @@ export async function run(argv: string[]): Promise<number> {
     return 2;
   }
   if (verb === "init") {
+    // Any machine flag (--token-ref, --json, --suite-url, ..., or a refused
+    // --token) selects the non-interactive init; the prompt mode is unchanged.
+    if (isNonInteractiveInit(argv.slice(1))) {
+      const noSupervisor = argv.includes("--no-supervisor");
+      return await runInitRef(argv.slice(1), liveInitRefDeps(process.env, noSupervisor ? undefined : liveSupervisorIoForInit()));
+    }
     const { exitCode } = await runInit(liveDeps(ttyPrompter()), parseInitOptions(argv.slice(1)));
     return exitCode;
+  }
+  if (verb === "secret") return await runSecret(argv.slice(1));
+  if (verb === "mcp-headers") {
+    // Hidden: Claude Code's headersHelper. stdout is the headers object, for Claude alone.
+    return await runMcpHeaders(argv.slice(1), {
+      env: process.env,
+      stdout: (t) => void process.stdout.write(t),
+      stderr: (t) => void process.stderr.write(t),
+    });
+  }
+  if (verb === "status" && argv.includes("--json")) {
+    const tmux = liveTmuxDeps(process.env);
+    const doc = await statusDocument({
+      env: process.env,
+      platform: process.platform,
+      home: process.env.HOME ?? "",
+      config: await readConfig().catch(() => null),
+      tmux,
+      readFile: readFileOrNull,
+      watchdogLoaded: () => liveWatchdogLoaded(process.platform, tmux),
+      pidAlive: livePidAlive,
+    });
+    process.stdout.write(renderStatusDocument(doc));
+    return 0;
   }
   if (verb === "claude" || verb === "claude new") {
     // Everything after the verb is Claude's, verbatim, EXCEPT `--session NAME`

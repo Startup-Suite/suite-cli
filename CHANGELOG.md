@@ -10,6 +10,46 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.8.0
+
+- **Connect a machine with no terminal: `suite init --suite-url URL
+  --runtime-id ID --token-ref REF [--keychain-service SVC] --json`.** The token
+  is a keychain or file **ref**; `config.json` records the ref and
+  `credentials.json` holds no token. Nothing is saved until Suite accepts the
+  credential through the authenticated `tools/list` call doctor makes. One JSON
+  document on stdout, the stamp contract's exit codes (0 ok, 1 failed with
+  `credential_rejected` or `suite_unreachable`, 2 refused, 3 blocked on a
+  human), and human steps with the exact command and an official URL
+  (`keychain_unlock`, `keychain_item_missing`, `install_tmux`, `install_bun`).
+  A literal token is refused in every spelling. The prompt mode is unchanged.
+- **`suite secret put|delete`** writes and removes a macOS keychain item. The
+  value comes on stdin and reaches `/usr/bin/security -i` on its stdin,
+  hex-encoded, never an argv; it is read back and compared by sha256.
+- **The launcher never prompts a machine caller.** With bun absent and
+  `--json` given, it prints the init document with an `install_bun` step and
+  exits 3. `--install-bun` runs the official bootstrap with no prompt.
+- **Claude Code in ref mode puts no token in any argv or in `~/.claude.json`.**
+  This fixes a leak on 0.7.0, where `suite claude` passed the literal token to
+  `claude mcp add` (`-e SUITE_TOKEN=`, `-H Authorization: Bearer`) and stored
+  it inline. In ref mode both entries go through `claude mcp add-json -s
+  local`: the channel gets the ref, and the tools entry gets a `headersHelper`
+  running the new hidden `suite mcp-headers`. A channel checkout without
+  token-ref support is moved to a pinned commit. Doctor compares refs.
+- **`suite status --json`**: the connection (with `token_at_rest`), the
+  watchdog, and one row per agent with state, channel, verdict,
+  `token_at_rest` and `token_in_child_env`. Additive only.
+- **`suite codex`** resolves a ref in memory; **`suite hermes` and `suite
+  openclaw`** default `--token-ref` to the machine's ref for the machine's own
+  runtime; **`suite deepseek`** refuses a ref-mode connection with exit 2
+  (`token_ref_unsupported`, a follow-up).
+- **One token-ref spec** (`spec/token-ref.md`) with shared vectors that both
+  channel plugins vendor and run in CI. It closes two gaps: a keychain item
+  with whitespace or a control character, and an unknown scheme, are refused.
+  A missing keychain item (exit 44) is now the `keychain_item_missing` step,
+  not `keychain_unlock`.
+- Tuning values (CLI timeout, status poll, credential probe timeout, crash-loop
+  limit) live in `src/tuning.ts`.
+
 ## 0.7.0
 
 - **`suite codex`: a Codex agent in Suite, through `codex app-server`.** It

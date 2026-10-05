@@ -45,6 +45,8 @@ import { agentNameFromRuntimeId, liveDeepseekDeps, loadCredentials, runInSession
 import { liveRestoreDeps, loadRoster, recordLaunch, type RestoreDeps } from "./restore.ts";
 import { ensureSupervision, liveSupervisorIo, type SupervisorIo } from "../supervisor.ts";
 import { VERSION } from "../version.ts";
+import { StampFailure } from "../stamp_result.ts";
+import type { ResolveDeps } from "../token_ref.ts";
 import { AppServerClient, processTransport } from "../codex/app_server.ts";
 import { CodexBridge, type ApprovalPolicy } from "../codex/bridge.ts";
 import { PhoenixChannel, socketUrl, type SocketLike } from "../codex/phoenix.ts";
@@ -193,6 +195,8 @@ export interface CodexDeps {
   platform: string;
   /** The bridge, for `--no-session`. Injected so the command's tests never open a socket. */
   runBridge?(input: BridgeInput): Promise<number>;
+  /** How a token ref is resolved (ref mode). Tests inject a fake `security`. */
+  resolve?: ResolveDeps;
 }
 
 export interface BridgeInput {
@@ -245,7 +249,22 @@ export async function runCodex(args: string[], deps: CodexDeps): Promise<number>
     return 1;
   }
   const store = createStore();
-  for (const [k, v] of Object.entries(await loadCredentials(config, {} as DeepseekDeps))) store.set(k, v);
+  try {
+    for (const [k, v] of Object.entries(await loadCredentials(config, {} as DeepseekDeps, deps.resolve))) store.set(k, v);
+  } catch (error) {
+    // A ref that does not resolve: the message names the ref, never a value.
+    if (error instanceof StampFailure) {
+      deps.stderr.write(`suite codex: ${error.message}\n`);
+      return error.exitCode;
+    }
+    throw error;
+  }
+  if (config.tokenRef !== undefined && config.tokenRef !== "") {
+    // Surfaced, never hidden: the bridge hands the resolved token to
+    // `codex app-server` in its ENVIRONMENT (0.7.0 design). `suite status
+    // --json` reports this agent as token_in_child_env: true.
+    say(`suite codex: token ref ${config.tokenRef} resolved in memory; token_in_child_env: the codex app-server child receives it in its environment`);
+  }
   if (store.get(TOKEN_KEY) === undefined && interactive) {
     config = await ensureToken({ env: deps.env, prompter: deps.prompter as Prompter, store, out: say }, config);
   }

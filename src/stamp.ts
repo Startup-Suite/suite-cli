@@ -35,7 +35,7 @@
 import { createHash } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
-import { parseConfig, serializeConfig, writeConfig, emptyConfig, type SuiteConfig } from "./config.ts";
+import { parseConfig, readConfig, serializeConfig, writeConfig, emptyConfig, type SuiteConfig } from "./config.ts";
 import { assertWritable, gitProbe, type GitProbe, WriteRefused } from "./paths.ts";
 import {
   EXIT_FAILED,
@@ -137,6 +137,29 @@ export interface StampRequest {
   keychainService?: string;
   nonSecret?: Record<string, unknown>;
   env?: Env;
+  /**
+   * The MACHINE connection (`suite init --token-ref`), used only when no
+   * `--token-ref` was given and the root records none. Its ref is the default
+   * only for the machine's OWN runtime: a root that names a different runtime
+   * id is never handed the machine's token.
+   */
+  machine?: { suiteUrl: string; runtimeId: string; tokenRef: string; keychainService?: string } | null;
+}
+
+/**
+ * The connection a stamp falls back to when neither the flags nor the root
+ * name a token ref: the machine's, for the machine's runtime. Null otherwise.
+ */
+export function machineFallback(
+  req: Pick<StampRequest, "tokenRef" | "runtimeId" | "machine">,
+  existing: SuiteConfig | null,
+): NonNullable<StampRequest["machine"]> | null {
+  const m = req.machine;
+  if (m === undefined || m === null || m.tokenRef === "") return null;
+  if (req.tokenRef !== undefined || (existing?.tokenRef ?? "") !== "") return null;
+  const runtimeId = req.runtimeId ?? existing?.runtimeId;
+  if (runtimeId !== undefined && runtimeId !== "" && runtimeId !== m.runtimeId) return null;
+  return m;
 }
 
 export interface StampDeps {
@@ -156,6 +179,27 @@ export interface StampRecord {
   tokenRef: string;
   keychainService?: string;
   verdict: ValidationVerdict["verdict"];
+}
+
+/**
+ * This machine's ref-mode connection, for {@link StampRequest.machine}. Null
+ * when the machine is not connected with a ref, or HOME cannot be resolved.
+ */
+export async function readMachineConnection(env: Env): Promise<StampRequest["machine"]> {
+  let config: SuiteConfig | null;
+  try {
+    config = await readConfig({ env });
+  } catch {
+    return null;
+  }
+  if (config === null || config.tokenRef === undefined || config.tokenRef === "") return null;
+  if (config.suiteUrl === "" || config.runtimeId === "") return null;
+  return {
+    suiteUrl: config.suiteUrl,
+    runtimeId: config.runtimeId,
+    tokenRef: config.tokenRef,
+    ...(config.keychainService !== undefined ? { keychainService: config.keychainService } : {}),
+  };
 }
 
 /** The warning for a harness version the writer was not measured against. */
@@ -303,17 +347,23 @@ async function runStampInner(
     );
   }
 
-  const refString = req.tokenRef ?? existing?.tokenRef;
+  const machine = machineFallback(req, existing);
+  if (machine !== null) {
+    io.stderr(`suite: --token-ref defaults to this machine's connection: ${machine.tokenRef} (runtime ${machine.runtimeId})\n`);
+  }
+  const refString = req.tokenRef ?? (existing?.tokenRef || undefined) ?? machine?.tokenRef;
   if (refString === undefined || refString === "") {
     throw refused("token_ref_required", "--token-ref is required (none given and none recorded in suite.json)");
   }
-  const keychainService = req.keychainService ?? (req.tokenRef === undefined ? existing?.keychainService : undefined);
+  const keychainService =
+    req.keychainService ??
+    (req.tokenRef === undefined ? (machine !== null ? machine.keychainService : existing?.keychainService) : undefined);
   const ref = parseTokenRef(refString, { keychainService });
   result.token_ref = ref.raw;
   validateTokenRef(ref, deps.resolve);
 
-  const suiteUrl = req.suiteUrl ?? existing?.suiteUrl ?? "";
-  const runtimeId = req.runtimeId ?? existing?.runtimeId ?? "";
+  const suiteUrl = req.suiteUrl ?? (existing?.suiteUrl || undefined) ?? machine?.suiteUrl ?? "";
+  const runtimeId = req.runtimeId ?? (existing?.runtimeId || undefined) ?? machine?.runtimeId ?? "";
   if (suiteUrl === "") throw refused("suite_url_required", "--suite-url is required (none given and none recorded)");
   if (runtimeId === "") throw refused("runtime_id_required", "--runtime-id is required (none given and none recorded)");
   result.agent.runtime_id = runtimeId;

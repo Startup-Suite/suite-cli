@@ -841,6 +841,8 @@ export interface WiringIo {
    * rather than failing a script, a service or a test harness.
    */
   canPrompt: boolean;
+  /** argv that runs this CLI, for the ref-mode headersHelper. Tests set it; live uses selfArgv. */
+  self?: string[];
 }
 
 /**
@@ -863,13 +865,18 @@ export async function wireClaude(deps: ClaudeDeps, wiring: WiringIo): Promise<Su
     let { config } = await ensureConnection(io);
     // The token is needed only to WRITE an entry. Asked for at most once, and
     // only on a machine set up before it was saved — never on a wired folder.
-    const plan = planMcp({ env: deps.env, cwd: deps.cwd, store: deps.store }, config, defaultCheckout(deps.env));
-    if (needsRegistration(plan) && plan.want.tokenLiteral === null) {
+    const plan = planMcp(
+      { env: deps.env, cwd: deps.cwd, store: deps.store, ...(wiring.self !== undefined ? { self: wiring.self } : {}) },
+      config,
+      defaultCheckout(deps.env),
+    );
+    // Ref mode needs no token here at all: the entries carry the ref.
+    if (needsRegistration(plan) && plan.want.tokenLiteral === null && plan.want.ref === undefined) {
       if (!wiring.canPrompt) return unwired("the Claude MCP entries need writing and no token is saved");
       config = await ensureToken(io, config);
     }
     await ensureClaudeWiring(
-      { env: deps.env, run: wiring.run, cwd: deps.cwd, isTTY: wiring.isTTY, store: deps.store, out: deps.err },
+      { env: deps.env, run: wiring.run, cwd: deps.cwd, isTTY: wiring.isTTY, store: deps.store, out: deps.err, err: deps.err, ...(wiring.self !== undefined ? { self: wiring.self } : {}) },
       config,
     );
     return config;

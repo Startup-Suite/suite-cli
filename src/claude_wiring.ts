@@ -31,9 +31,13 @@ import {
 } from "./claude_md.ts";
 import type { SuiteConfig } from "./config.ts";
 import { TOKEN_KEY, type CredentialStore } from "./secrets.ts";
+import { singleQuote } from "./tmux.ts";
 import { row } from "./ui.ts";
+import { selfArgv } from "./commands/deepseek.ts";
 import {
   CHANNEL_SERVER,
+  MCP_SCOPE,
+  alreadyRegistered,
   PLUGIN_DIRNAME,
   TOOLS_SERVER,
   channelAddArgs,
@@ -41,6 +45,7 @@ import {
   claudeJsonPath,
   cloneOrUpdate,
   connectionReport,
+  noGitPrompt,
   defaultCheckout,
   envReference,
   packageCount,
@@ -58,6 +63,14 @@ type Env = Record<string, string | undefined>;
 export interface WiringDeps {
   env: Env;
   run: Runner;
+  /**
+   * argv that runs THIS CLI, for the ref-mode `headersHelper`. Defaults to
+   * `[bun, <lib>/src/cli.ts]` (deepseek.ts `selfArgv`): absolute, so it works
+   * from the minimal PATH Claude Code may run a helper with.
+   */
+  self?: string[];
+  /** Where a ref-mode notice goes (stderr). Defaults to `out`. */
+  err?(line: string): void;
   /** The agent folder. Local-scope MCP entries are keyed by it. */
   cwd: string;
   isTTY: boolean;
@@ -81,6 +94,8 @@ export interface McpEntry {
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
+  /** A command Claude Code runs to get headers (ref mode). */
+  headersHelper?: string;
 }
 
 /**
@@ -136,6 +151,11 @@ export interface DesiredEntries {
   /** The token as it should appear in the entry, or null when not known here. */
   tokenLiteral: string | null;
   headers: Array<{ name: string; value: string | undefined }>;
+  /**
+   * REF MODE: the connection holds a token ref, and the entries carry the REF
+   * and a headersHelper — never a value. Absent in literal mode.
+   */
+  ref?: { raw: string; service: string | null; helper: string };
 }
 
 /**
@@ -153,6 +173,12 @@ export function channelState(entry: McpEntry | undefined, want: DesiredEntries):
   if (env.SUITE_URL !== channelWsUrl(want.suiteUrl)) return "stale";
   if (env.SUITE_RUNTIME_ID !== want.runtimeId) return "stale";
   if (args[args.length - 1] !== want.indexPath) return "stale";
+  if (want.ref !== undefined) {
+    // Ref mode: the entry carries the REF and its service, and nothing else.
+    if (env.SUITE_TOKEN !== want.ref.raw) return "stale";
+    if ((env.SUITE_TOKEN_KEYCHAIN_SERVICE ?? null) !== want.ref.service) return "stale";
+    return "current";
+  }
   if (want.tokenLiteral !== null && env.SUITE_TOKEN !== want.tokenLiteral) return "stale";
   return "current";
 }
@@ -161,6 +187,14 @@ export function channelState(entry: McpEntry | undefined, want: DesiredEntries):
 export function toolsState(entry: McpEntry | undefined, want: DesiredEntries): EntryState {
   if (entry === undefined) return "missing";
   if (entry.url !== toolsHttpUrl(want.suiteUrl)) return "stale";
+  if (want.ref !== undefined) {
+    // Ref mode: a helper, and NO inline Authorization. An entry still carrying
+    // a literal bearer from literal mode is stale, so switching to a ref
+    // rewrites it and the literal leaves ~/.claude.json.
+    if (entry.headersHelper !== want.ref.helper) return "stale";
+    if (entry.headers !== undefined && Object.keys(entry.headers).length > 0) return "stale";
+    return "current";
+  }
   const headers = entry.headers ?? {};
   if (want.tokenLiteral !== null && headers.Authorization !== `Bearer ${want.tokenLiteral}`) return "stale";
   for (const h of want.headers) {
@@ -183,14 +217,34 @@ export interface McpPlan {
   want: DesiredEntries;
 }
 
-export function planMcp(deps: Pick<WiringDeps, "env" | "cwd" | "store">, config: SuiteConfig, checkout: string): McpPlan {
+/**
+ * The `headersHelper` command for ref mode. Claude Code runs it THROUGH A
+ * SHELL, so every word is single-quoted. It carries the ref and its service —
+ * names, never a value — so the folder resolves its own ref.
+ */
+export function headersHelperCommand(self: string[], ref: string, service: string | null): string {
+  const words = [...self, "mcp-headers", "--token-ref", ref, ...(service !== null ? ["--keychain-service", service] : [])];
+  return words.map(singleQuote).join(" ");
+}
+
+export function planMcp(
+  deps: Pick<WiringDeps, "env" | "cwd" | "store" | "self">,
+  config: SuiteConfig,
+  checkout: string,
+): McpPlan {
+  const inRefMode = config.tokenRef !== undefined && config.tokenRef !== "";
+  const service = inRefMode && config.tokenRef?.startsWith("keychain:") ? (config.keychainService ?? "") : null;
   const want: DesiredEntries = {
     suiteUrl: config.suiteUrl,
     runtimeId: config.runtimeId,
     indexPath: resolve(checkout, "src", "index.ts"),
-    tokenLiteral: tokenLiteralFor(config, deps.store),
+    tokenLiteral: inRefMode ? null : tokenLiteralFor(config, deps.store),
     headers: config.headerNames.map((name) => ({ name, value: deps.store.get(name) })),
   };
+  if (inRefMode) {
+    const raw = config.tokenRef as string;
+    want.ref = { raw, service, helper: headersHelperCommand(deps.self ?? selfArgv(deps.env as NodeJS.ProcessEnv), raw, service) };
+  }
   const entries = localEntries(deps.env, deps.cwd);
   if (entries === null) return { channel: "missing", tools: "missing", want };
   return { channel: channelState(entries[CHANNEL_SERVER], want), tools: toolsState(entries[TOOLS_SERVER], want), want };
@@ -215,11 +269,111 @@ export interface WiringResult {
   connected: boolean;
 }
 
+/* ------------------------------------------------------------------------- */
+/* Ref mode                                                                   */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The claude-code-suite-channel commit ref mode needs when the checkout cannot
+ * resolve a token ref itself (its package.json lacks `suite.tokenRefs >= 1`).
+ *
+ * DEPLOYER: this is the tip of the channel's task/01a0d6b9 branch (the token
+ * ref resolver). Re-pin it to that branch's MERGE sha on main before merging
+ * suite-cli 0.8.0, so the pin names a commit main will keep.
+ */
+export const CLAUDE_CHANNEL_REF = "28afe6cc86bd80fc96ac38e657b6954ca9b0931d";
+
+/** The capability marker a ref-capable channel plugin declares in package.json. */
+export const TOKEN_REFS_CAPABILITY = 1;
+
+/** `suite.tokenRefs` out of a checkout's package.json; 0 when absent or unreadable. */
+export function checkoutTokenRefs(dir: string): number {
+  try {
+    const pkg = JSON.parse(readFileSync(resolve(dir, "package.json"), "utf8")) as { suite?: { tokenRefs?: unknown } };
+    const v = pkg.suite?.tokenRefs;
+    return typeof v === "number" && Number.isFinite(v) ? v : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** The stdio channel entry as `claude mcp add-json` takes it. The token slot holds the REF. */
+export function channelEntryJson(want: DesiredEntries): string {
+  if (want.ref === undefined) throw new Error("channelEntryJson is ref mode only");
+  const env: Record<string, string> = {
+    SUITE_URL: channelWsUrl(want.suiteUrl),
+    SUITE_RUNTIME_ID: want.runtimeId,
+    SUITE_TOKEN: want.ref.raw,
+  };
+  if (want.ref.service !== null) env.SUITE_TOKEN_KEYCHAIN_SERVICE = want.ref.service;
+  env.SUITE_ALLOW_PERMISSION_RELAY = "0";
+  return JSON.stringify({ type: "stdio", command: "bun", args: [want.indexPath], env });
+}
+
+/** The HTTP tools entry: a URL and a headersHelper. NO headers, so no value. */
+export function toolsEntryJson(want: DesiredEntries): string {
+  if (want.ref === undefined) throw new Error("toolsEntryJson is ref mode only");
+  return JSON.stringify({ type: "http", url: toolsHttpUrl(want.suiteUrl), headersHelper: want.ref.helper });
+}
+
+/** argv for one ref-mode registration. Every element is a name, a URL or a ref. */
+export function addJsonArgs(name: string, json: string): string[] {
+  return ["claude", "mcp", "add-json", "-s", MCP_SCOPE, name, json];
+}
+
+/**
+ * Register ref-mode entries. Unlike literal mode, NO argv may carry a secret,
+ * so the runner's argv guard stays ON (`allowSecretsInArgv` is never passed).
+ * Converges like {@link registerServers}: an existing local entry of the same
+ * name is removed and re-added, in this directory only.
+ */
+export async function registerJsonServers(
+  deps: Pick<WiringDeps, "run" | "cwd">,
+  entries: Array<{ name: string; json: string }>,
+): Promise<string[]> {
+  const lines: string[] = [];
+  for (const { name, json } of entries) {
+    const argv = addJsonArgs(name, json);
+    let r = await deps.run(argv, { cwd: deps.cwd });
+    if (r.exitCode !== 0 && alreadyRegistered(r.stderr || r.stdout)) {
+      await deps.run(["claude", "mcp", "remove", name, "-s", MCP_SCOPE], { cwd: deps.cwd });
+      r = await deps.run(argv, { cwd: deps.cwd });
+    }
+    if (r.exitCode !== 0) {
+      throw new Error([`claude mcp add-json ${name} failed with exit ${r.exitCode}:`, (r.stderr || r.stdout).trim()].filter((l) => l !== "").join("\n"));
+    }
+    lines.push(row(name, "registered", `local scope, token ref: ${deps.cwd}`));
+  }
+  return lines;
+}
+
+/**
+ * Ref mode needs a channel plugin that resolves refs. When the checkout does
+ * not declare `suite.tokenRefs >= 1`, move it to {@link CLAUDE_CHANNEL_REF}
+ * (fetch, then a detached checkout — never a reset or a force: local changes
+ * make git refuse, and that refusal is reported). THE ONLY CASE in which an
+ * existing checkout is updated.
+ */
+async function ensureRefCapableCheckout(deps: WiringDeps, dir: string): Promise<boolean> {
+  if (checkoutTokenRefs(dir) >= TOKEN_REFS_CAPABILITY) return false;
+  const say = deps.err ?? deps.out;
+  say(row("plugin", "no token-ref support", `moving ${PLUGIN_DIRNAME} to ${CLAUDE_CHANNEL_REF.slice(0, 12)} (suite.tokenRefs >= ${TOKEN_REFS_CAPABILITY})`));
+  const env = noGitPrompt(deps.env);
+  const fetched = await deps.run(["git", "fetch", "--quiet", "origin", CLAUDE_CHANNEL_REF], { cwd: dir, env });
+  if (fetched.exitCode !== 0) throw new Error(`git fetch ${CLAUDE_CHANNEL_REF} failed in ${dir}: ${(fetched.stderr || fetched.stdout).trim()}`);
+  const co = await deps.run(["git", "checkout", "--quiet", "--detach", CLAUDE_CHANNEL_REF], { cwd: dir, env });
+  if (co.exitCode !== 0) throw new Error(`git checkout ${CLAUDE_CHANNEL_REF} failed in ${dir}: ${(co.stderr || co.stdout).trim()}`);
+  if (checkoutTokenRefs(dir) < TOKEN_REFS_CAPABILITY) {
+    throw new Error(`${dir} at ${CLAUDE_CHANNEL_REF} still does not declare suite.tokenRefs; the pin is wrong`);
+  }
+  return true;
+}
+
 /**
  * Ensure the plugin checkout exists and has its dependencies. Clones when it
  * is absent; an existing checkout is used as it is, never pulled.
  */
-async function ensureCheckout(deps: WiringDeps, dir: string): Promise<CheckoutOutcome | "present"> {
+async function ensureCheckout(deps: WiringDeps, dir: string, refMode = false): Promise<CheckoutOutcome | "present"> {
   let outcome: CheckoutOutcome | "present" = "present";
   if (!existsSync(resolve(dir, ".git")) || !existsSync(resolve(dir, "src", "index.ts"))) {
     const spin = spinner("plugin", deps);
@@ -230,7 +384,8 @@ async function ensureCheckout(deps: WiringDeps, dir: string): Promise<CheckoutOu
     }
     deps.out(row("plugin", PLUGIN_DIRNAME, outcome));
   }
-  if (outcome !== "present" || !existsSync(resolve(dir, "node_modules"))) {
+  const moved = refMode ? await ensureRefCapableCheckout(deps, dir) : false;
+  if (outcome !== "present" || moved || !existsSync(resolve(dir, "node_modules"))) {
     const spin = spinner("dependencies", deps);
     let out = "";
     try {
@@ -284,13 +439,25 @@ export async function ensureClaudeWiring(
   options: WiringOptions = {},
 ): Promise<WiringResult> {
   const checkoutDir = options.checkout ?? defaultCheckout(deps.env);
-  const checkout = await ensureCheckout(deps, checkoutDir);
+  const refMode = config.tokenRef !== undefined && config.tokenRef !== "";
+  const checkout = await ensureCheckout(deps, checkoutDir, refMode);
   const md = ensureClaudeMd(deps);
 
   const plan = planMcp(deps, config, checkoutDir);
   const registered: string[] = [];
   let connected = true;
-  if (needsRegistration(plan)) {
+  if (needsRegistration(plan) && plan.want.ref !== undefined) {
+    // REF MODE: both entries through `claude mcp add-json`, every argv value-
+    // free. There is NO fallback to an inline bearer: if this fails, it fails.
+    const entries: Array<{ name: string; json: string }> = [];
+    if (plan.channel !== "current") entries.push({ name: CHANNEL_SERVER, json: channelEntryJson(plan.want) });
+    if (plan.tools !== "current") entries.push({ name: TOOLS_SERVER, json: toolsEntryJson(plan.want) });
+    for (const line of await registerJsonServers(deps, entries)) deps.out(line);
+    registered.push(...entries.map((e) => e.name));
+    const report = connectionReport(await verifyConnections(deps));
+    for (const line of report.lines) deps.out(line);
+    connected = report.ok;
+  } else if (needsRegistration(plan)) {
     const tokenLiteral = plan.want.tokenLiteral;
     if (tokenLiteral === null) {
       throw new Error("no saved token to write into the Claude MCP entries; run suite init");

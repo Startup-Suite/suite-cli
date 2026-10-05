@@ -91,6 +91,11 @@ The installer never uses `sudo`. It installs to `$XDG_BIN_HOME`, or
 `PATH`, and prints the exact `export PATH=` line to add. If a `suite` is
 already installed it names the version it would replace and asks first.
 
+suite-cli has **no tags**: pin an install to a commit with
+`SUITE_CLI_REF=<40-hex sha>`, which fetches
+`https://codeload.github.com/Startup-Suite/suite-cli/tar.gz/<sha>` (a branch name
+goes through `refs/heads/<branch>`).
+
 ## Connect this machine
 
 ```sh
@@ -560,7 +565,7 @@ and no session is started.
 | `harness_version` | string or null | The harness version the stamp ran against |
 | `writer_version` | number | The version of this CLI's writer for that harness |
 | `warnings` | array of strings | For example `config shape unverified for <harness> <version>` |
-| `human_steps` | array | `{kind, text}` for a human to act on, such as `start_agent_session` or `keychain_unlock` |
+| `human_steps` | array | `{kind, text}` for a human to act on, such as `start_agent_session`, `keychain_unlock` (a locked keychain) or `keychain_item_missing` (security exit 44). Since 0.8.0 a step may also carry `command` (the exact command, names only) and `url` (an official page) |
 | `error` | object or null | `{code, message}`. The message names paths, flags and item names, never a value |
 
 **`contract_version: 1` changes additively only.** A new field may appear. An
@@ -590,7 +595,14 @@ A literal value is refused with exit `2` in every spelling: `--token`,
 owned by the caller, mode `0600` or `0400`. A `keychain:` ref is resolved with
 `/usr/bin/security find-generic-password -s <service> -a <item> -w`, so argv
 carries names only. The same syntax is read by the OpenClaw channel plugin's own
-resolver.
+resolver and, since 0.8.0, by the Claude channel plugin.
+
+The one definition is [`spec/token-ref.md`](./spec/token-ref.md), with shared
+vectors in [`spec/token-ref-vectors.json`](./spec/token-ref-vectors.json). Both
+channel plugins vendor that file pinned to a commit of this repo and run it in
+CI. A keychain item with whitespace or a control character is refused
+(`token_ref_invalid`), and so is a scheme that is not `file:` or `keychain:`
+(`token_ref_unknown_scheme`; runtime tokens never contain `:`).
 
 ### Idempotence
 
@@ -628,6 +640,139 @@ Hermes env ships `ruamel.yaml`, because Hermes needs it to read its own config.
    channel installer registers as `mcp_servers.startup-suite.command` is the
    dependency venv Hermes selected at stamp time, which Hermes may replace on
    `hermes update`. A re-run of the stamp repairs it; nothing does in between.
+8. **`suite deepseek` on a ref-mode connection** is refused with exit 2,
+   `token_ref_unsupported`: dsh reads its token from its environment, so
+   honouring a ref would mean resolving it into a long-lived child's env.
+
+## Connect without a terminal (`suite init --token-ref`)
+
+What an app (the Mac app) runs to connect this machine. The token goes into
+the macOS keychain first, through `suite secret put`, and init is given only
+the **ref**:
+
+```sh
+printf %s "$TOKEN" | suite secret put --keychain-service suite-cli --item RUNTIME_TOKEN.<runtime id>
+suite init --suite-url https://suite.example.invalid --runtime-id <runtime id> \
+  --token-ref keychain:RUNTIME_TOKEN.<runtime id> --keychain-service suite-cli --json
+```
+
+`suite init` with any of `--token-ref`, `--suite-url`, `--runtime-id` or
+`--json` is **non-interactive**; without them it is the prompt mode above,
+unchanged. In this mode:
+
+* **The token is a ref, never a value.** `config.json` records `tokenRef` and
+  `keychainService`. `credentials.json` holds **no token** (a token an older
+  init saved there is blanked; operator header values are kept). `--token`,
+  `--token=`, `--token-stdin`, a literal `--token-ref` and data on stdin are
+  refused with exit `2`.
+* **Nothing is saved until Suite accepts the credential.** The ref is resolved
+  in memory for the same authenticated `tools/list` call `suite doctor` makes.
+  A rejected credential and an unreachable URL both exit `1`, with different
+  `error.code`s (`credential_rejected`, `suite_unreachable`), and leave
+  `config.json` byte for byte as it was.
+* **Dependencies are named, never installed.** No `tmux` is exit `3` with an
+  `install_tmux` step. A re-run with the same values reports `changed: false`.
+* **`--no-supervisor`** skips the watchdog, as in prompt mode.
+
+`--json` prints one document:
+
+| Field | Meaning |
+| --- | --- |
+| `contract_version` | `1`, additive only |
+| `ok` | connected, and Suite accepted the credential |
+| `changed` | whether `config.json` or `credentials.json` changed |
+| `connection` | `{suite_url, runtime_id, token_ref, keychain_service}` |
+| `deps` | `{bun, tmux}`, each `{present, version, path}` |
+| `watchdog` | `{requested, installed, kind, summary}` |
+| `human_steps` | `{kind, text, command, url}`: `keychain_unlock`, `keychain_item_missing`, `install_tmux`, `install_bun` |
+| `error` | `{code, message}` or null; names refs, items and paths, never a value |
+
+Exit codes are the stamp contract's: `0` ok, `1` failed, `2` refused, `3`
+blocked on a human.
+
+**No bun yet.** The POSIX launcher answers before any TypeScript runs: with
+`--json` among the arguments (or for `suite secret`), it prints the same
+document with one `install_bun` step (`curl -fsSL https://bun.sh/install |
+bash`, <https://bun.sh/docs/installation>) and exits `3`. It never prompts and
+never reads `/dev/tty` on that path. `--install-bun` is the explicit consent:
+it runs the official bootstrap with no prompt (its output on stderr), then
+continues; `suite init --install-bun --json` on its own reports the deps and
+exits `0`.
+
+### `suite secret put|delete` (macOS)
+
+```sh
+suite secret put    --keychain-service SVC --item NAME     # value on stdin
+suite secret delete --keychain-service SVC --item NAME
+```
+
+The only keychain writers an app calls. `put` refuses a terminal on stdin and
+an empty value, writes through `/usr/bin/security -i` with the value
+hex-encoded on **its** stdin (never in an argv), reads the item back through
+the same resolver every consumer uses, and prints
+`{contract_version, ok, action, service, item, sha256_prefix, human_steps,
+error}` (12 hex characters of sha256, nothing else of the value). An item
+created by `/usr/bin/security` trusts `/usr/bin/security`, so the later
+`find-generic-password` reads by `suite` and both channel plugins meet no
+access prompt. A locked keychain, which is what an ssh session gets (exit 36),
+exits `3` with `keychain_unlock`. `delete` of an absent item is `ok` with
+`deleted: false`.
+
+### Claude Code in ref mode
+
+On a ref-mode connection `suite claude` writes both entries with `claude mcp
+add-json -s local`, and **no argv carries the token**:
+
+* `suite-channel` gets `SUITE_TOKEN=<the ref>` and
+  `SUITE_TOKEN_KEYCHAIN_SERVICE`; the channel plugin resolves the ref itself.
+* `startup-suite` gets a `headersHelper` that runs this CLI's hidden
+  `mcp-headers` verb with the ref. Claude Code runs it at each connection and
+  reads `{"Authorization": "Bearer ..."}` (plus any saved operator headers) from
+  its stdout. That stdout is the only place the token is written; the verb logs
+  nothing. Claude Code runs a local-scope helper only after the folder's trust
+  dialog is accepted, which `suite claude`'s dialog answerer does.
+* A channel checkout whose `package.json` lacks `"suite": {"tokenRefs": 1}` is
+  moved (fetch, then a detached checkout, never a reset) to the pinned
+  `CLAUDE_CHANNEL_REF` commit, and stderr says so. This is the only case in
+  which an existing checkout is updated.
+* `suite doctor` compares the **refs** in its token-match check, reading the
+  helper from `~/.claude.json` (it is not shown by `claude mcp get`), and fails
+  on a leftover inline `Authorization`. Its tools probe resolves the ref in
+  memory.
+
+`suite codex` resolves the ref in memory and says that the codex app-server
+child receives the token in its environment (the 0.7.0 design).
+`suite hermes` and `suite openclaw` default `--token-ref` to the machine's ref
+when the flag is omitted and the root records none, **for the machine's own
+runtime id only**. `suite deepseek` refuses a ref-mode connection (exit `2`,
+`token_ref_unsupported`).
+
+## Status contract (`suite status --json`)
+
+One document, `contract_version` 1, additive only like the stamp contract:
+
+| Field | Meaning |
+| --- | --- |
+| `contract_version` | `1` |
+| `suite_version` | this CLI's version |
+| `connection` | `{suite_url, runtime_id, token_ref, token_at_rest}`; `token_ref` is null outside ref mode |
+| `watchdog` | `{installed, loaded}`: the unit file exists; the service manager (or the tmux fallback) has it running |
+| `agents` | one row per roster entry, below |
+
+Each agent: `session`, `kind`, `root`, `runtime_id`, `state` (`live`, `stale`,
+`none`; a recorded agent whose session is gone is `stale`), `channel`
+(`connected`, `not_connected`, `unknown`), `verdict` (the last stamp verdict for
+hermes and openclaw, else null), `token_at_rest` and `token_in_child_env`.
+
+`token_at_rest` is `keychain`, `file`, `inline` (a value in a config file),
+`env` (an env reference) or `none`, decided from the shape of what is stored,
+never by reading a value. **Hermes reports `file`**: hermes-suite-channel reads
+a `0600` token file. `token_in_child_env` is true for codex (app-server's
+environment), DeepSeek (dsh's environment) and Claude in literal mode (the
+channel's `SUITE_TOKEN`). `channel` is read from the state file the Claude
+channel plugin writes on join and disconnect, and is `connected` only while that
+file says joined and its pid is alive; it is never read from `claude mcp list`,
+which would start a second channel joining as the same runtime on every poll.
 
 ## Five decisions, stated rather than guessed
 
