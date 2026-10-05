@@ -35,7 +35,7 @@
  * rewords one, it stops being answered (rule 1) and the fixture test says
  * which.
  */
-import { appendFileSync, mkdirSync, readFileSync, realpathSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { TMUX, type TmuxDeps } from "./tmux.ts";
 import { resolveTmux } from "./halt.ts";
@@ -429,6 +429,17 @@ export interface DialogIo {
   readFile?(path: string): string | null;
   /** The canonical path of a folder, as Claude records it. Absent: the path as given. */
   realpath?(path: string): string;
+  /**
+   * ONE ANSWERER PER SESSION. A launch poll claims its session for its whole
+   * window, and the watchdog's single look ({@link answerOnce}) skips a
+   * claimed session. MEASURED live on rock (2.1.289, review round 2): the
+   * watchdog that `--detach` had just installed ran its first sweep at load
+   * and sent a SECOND Enter 19 ms after the poll's, onto a screen whose next
+   * frame defaults to "No, exit". Absent (tests): no claim is kept.
+   */
+  claim?(session: string): void;
+  release?(session: string): void;
+  isClaimed?(session: string): boolean;
 }
 
 /**
@@ -512,6 +523,21 @@ export async function answerLaunchDialogs(io: DialogIo, opts: AnswerOptions): Pr
   const tmux = resolveTmux(io.tmux.which);
   const windowMs = opts.windowMs ?? DIALOG_WINDOW_MS;
   const pollMs = opts.pollMs ?? DIALOG_POLL_MS;
+  io.claim?.(opts.session);
+  try {
+    return await pollDialogs(io, opts, tmux, windowMs, pollMs);
+  } finally {
+    io.release?.(opts.session);
+  }
+}
+
+async function pollDialogs(
+  io: DialogIo,
+  opts: AnswerOptions,
+  tmux: string,
+  windowMs: number,
+  pollMs: number,
+): Promise<AnswerResult> {
   const settlePolls = opts.settlePolls ?? READY_SETTLE_POLLS;
   const ctx = dialogContext(io, opts);
   const deadline = io.now() + windowMs;
@@ -599,6 +625,8 @@ export async function answerLaunchDialogs(io: DialogIo, opts: AnswerOptions): Pr
  * again a minute later anyway — so it never needs to wait for a redraw.
  */
 export async function answerOnce(io: DialogIo, opts: AnswerOptions): Promise<Answer | null> {
+  // A launch poll owns this session right now: one answerer per session.
+  if (io.isClaimed?.(opts.session) === true) return null;
   const tmux = resolveTmux(io.tmux.which);
   const cap = await io.tmux.run(dialogCaptureArgv(opts.session, tmux));
   if (cap.exitCode !== 0) return null;
@@ -643,9 +671,49 @@ export function sessionLogger(
   };
 }
 
+/** The claim file a launch poll holds for its session: its pid, one line. */
+export function claimPath(home: string, session: string): string {
+  return `${home}/.local/state/suite/sessions/${session}.answering`;
+}
+
+/**
+ * A claim counts while its pid is alive and it is younger than a poll window
+ * plus the settle and a margin. A crashed poller's claim therefore lapses on
+ * its own, and the watchdog takes the session back.
+ */
+export const CLAIM_MAX_AGE_MS = DIALOG_WINDOW_MS + 30_000;
+
 /** Live wiring for the poll. */
 export function liveDialogIo(tmux: TmuxDeps, home: string, echo: (line: string) => void): DialogIo {
   return {
+    claim: (session) => {
+      try {
+        mkdirSync(dirname(claimPath(home, session)), { recursive: true });
+        writeFileSync(claimPath(home, session), `${process.pid}\n`);
+      } catch {
+        /* no claim: the watchdog may also look, as before */
+      }
+    },
+    release: (session) => {
+      try {
+        const held = readFileSync(claimPath(home, session), "utf8").trim();
+        if (held === String(process.pid)) unlinkSync(claimPath(home, session));
+      } catch {
+        /* already gone */
+      }
+    },
+    isClaimed: (session) => {
+      try {
+        const path = claimPath(home, session);
+        if (Date.now() - statSync(path).mtimeMs > CLAIM_MAX_AGE_MS) return false;
+        const pid = Number.parseInt(readFileSync(path, "utf8").trim(), 10);
+        if (!Number.isInteger(pid) || pid <= 0) return false;
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    },
     tmux,
     readFile: (path) => {
       try {

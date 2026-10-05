@@ -11,14 +11,18 @@
  * renderer upsell was forced with CLAUDE_CODE_FORCE_FULLSCREEN_UPSELL=1.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync, chmodSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, existsSync, chmodSync, mkdirSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   answerLaunchDialogs,
+  answerOnce,
+  claimPath,
+  CLAIM_MAX_AGE_MS,
   classifyPane,
   CLAUDE_SIGN_IN_COMMAND,
   dialogContext,
+  liveDialogIo,
   localHeadersHelpersAreSuites,
   READY_SETTLE_POLLS,
   type DialogIo,
@@ -255,6 +259,53 @@ describe("answerLaunchDialogs on the 2.1.289 first-run sequence", () => {
     const r = await answerLaunchDialogs(s.io, { session: "suite-q", cwd: "/x", home: "/h" });
     expect(r.outcome).toBe("ready");
     expect(captures).toBe(READY_SETTLE_POLLS + 1);
+  });
+});
+
+describe("one answerer per session (measured: the watchdog double-pressed Enter live)", () => {
+  test("answerOnce sends nothing to a session a launch poll has claimed", async () => {
+    const s = scripted([fixture("bypass-permissions.120")], { isClaimed: () => true });
+    expect(await answerOnce(s.io, { session: "suite-q", cwd: "/x", home: "/h" })).toBeNull();
+    expect(s.sent).toEqual([]);
+  });
+
+  test("POSITIVE CONTROL: unclaimed, the same look answers", async () => {
+    const s = scripted([fixture("bypass-permissions.120")], { isClaimed: () => false });
+    expect(await answerOnce(s.io, { session: "suite-q", cwd: "/x", home: "/h" })).toEqual({ dialog: "bypass-permissions", keys: ["Down"] });
+  });
+
+  test("the launch poll claims for its whole window and releases at the end, gone or not", async () => {
+    const events: string[] = [];
+    const s = scripted([fixture("bypass-permissions.120"), null], {
+      claim: (x) => void events.push(`claim ${x}`),
+      release: (x) => void events.push(`release ${x}`),
+    });
+    await answerLaunchDialogs(s.io, { session: "suite-q", cwd: "/x", home: "/h" });
+    expect(events).toEqual(["claim suite-q", "release suite-q"]);
+  });
+
+  test("live claim file: held while our pid lives, lapses for a dead pid or an old file, released only by its holder", () => {
+    const home = temp();
+    const tmux = { env: {}, which: () => null, run: async () => ({ exitCode: 1, stdout: "", stderr: "" }) };
+    const io = liveDialogIo(tmux, home, () => {});
+    expect(io.isClaimed!("suite-q")).toBe(false);
+    io.claim!("suite-q");
+    expect(readFileSync(claimPath(home, "suite-q"), "utf8").trim()).toBe(String(process.pid));
+    expect(io.isClaimed!("suite-q")).toBe(true);
+    io.release!("suite-q");
+    expect(existsSync(claimPath(home, "suite-q"))).toBe(false);
+    // A claim left by a process that is gone.
+    mkdirSync(join(home, ".local/state/suite/sessions"), { recursive: true });
+    writeFileSync(claimPath(home, "suite-q"), "999999\n");
+    expect(io.isClaimed!("suite-q")).toBe(false);
+    // Another holder's claim is not ours to release.
+    io.release!("suite-q");
+    expect(existsSync(claimPath(home, "suite-q"))).toBe(true);
+    // Our pid, but older than a window: lapsed.
+    writeFileSync(claimPath(home, "suite-q"), `${process.pid}\n`);
+    const old = (Date.now() - CLAIM_MAX_AGE_MS - 5_000) / 1000;
+    utimesSync(claimPath(home, "suite-q"), old, old);
+    expect(io.isClaimed!("suite-q")).toBe(false);
   });
 });
 

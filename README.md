@@ -867,7 +867,10 @@ suite never picks a login method and never enters or relays a Claude
 credential or code. If Claude never reaches its input box (an unrecognised
 screen), `--detach` exits **1** with `claude_not_ready` naming the screen; it
 no longer exits 0. Run on a session that already exists, `--detach` looks at it
-again and answers a recognised screen left on it.
+again and answers a recognised screen left on it. A launch poll claims its
+session (`~/.local/state/suite/sessions/<session>.answering`, its pid) for its
+window, and the watchdog's one-key look skips a claimed session, so two
+answerers never press keys into the same screen.
 
 ### Crash restore (`suite watch`)
 
