@@ -222,7 +222,8 @@ describe("every exit code is driven", () => {
     );
     expect(r.code).toBe(3);
     expect((r.doc.error as { code: string }).code).toBe("keychain_unavailable");
-    expect((r.doc.human_steps as { kind: string }[]).map((s) => s.kind)).toEqual(["keychain_unlock"]);
+    // Exit 44 is "no such item" (0.8.0 names it; it used to say keychain_unlock).
+    expect((r.doc.human_steps as { kind: string }[]).map((s) => s.kind)).toEqual(["keychain_item_missing"]);
     // Blocked before any write.
     expect(existsSync(root)).toBe(false);
   });

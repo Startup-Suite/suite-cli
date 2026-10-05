@@ -83,9 +83,13 @@ export interface ValidationVerdict {
 }
 
 export interface HumanStep {
-  /** e.g. `start_agent_session`, `keychain_unlock`. */
+  /** e.g. `start_agent_session`, `keychain_unlock`, `install_tmux`. */
   kind: string;
   text: string;
+  /** The exact command a human runs, when there is one. Never carries a value. Additive (0.8.0). */
+  command?: string;
+  /** An official page explaining the step. Additive (0.8.0). */
+  url?: string;
 }
 
 export interface StampError {

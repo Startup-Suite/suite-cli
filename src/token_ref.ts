@@ -28,7 +28,7 @@
 import { execFile } from "node:child_process";
 import { fstatSync, lstatSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
-import { EXIT_BLOCKED, EXIT_FAILED, StampFailure, refused } from "./stamp_result.ts";
+import { EXIT_BLOCKED, EXIT_FAILED, StampFailure, refused, type HumanStep } from "./stamp_result.ts";
 
 export const FILE_PREFIX = "file:";
 export const KEYCHAIN_PREFIX = "keychain:";
@@ -112,16 +112,47 @@ export function parseTokenRef(raw: string, options: { keychainService?: string }
   if (raw.startsWith(KEYCHAIN_PREFIX)) {
     const item = raw.slice(KEYCHAIN_PREFIX.length);
     if (item === "") throw refused("token_ref_invalid", "keychain: refs need an item name");
+    if (!isValidItem(item)) {
+      throw refused(
+        "token_ref_invalid",
+        `keychain item ${JSON.stringify(item)} contains whitespace or a control character; an item is one plain word`,
+      );
+    }
     const service = options.keychainService ?? "";
     if (service === "") {
       throw refused("keychain_service_missing", `keychain:${item} needs --keychain-service <service>`);
     }
     return { kind: "keychain", item, service, raw };
   }
+  const scheme = unknownScheme(raw);
+  if (scheme !== null) {
+    throw refused("token_ref_unknown_scheme", `unknown token ref scheme ${JSON.stringify(scheme)}. ${refHint()}`);
+  }
   throw refused(
     "literal_token_refused",
     `--token-ref takes a reference, not a value; a literal is refused because ${ARGV_READABLE}. ${refHint()}`,
   );
+}
+
+/**
+ * A keychain item is one plain word: non-empty, no whitespace, no control
+ * character. spec/token-ref.md, "Syntax".
+ */
+export function isValidItem(item: string): boolean {
+  return item !== "" && !/[\s\x00-\x1f\x7f]/.test(item);
+}
+
+/**
+ * The scheme of a string that LOOKS like a ref but is not one of ours, e.g.
+ * `env:` or `Keychain:`, or null. Runtime tokens are url-safe base64 and never
+ * contain `:`, so this cannot catch a real token. Only the scheme is returned:
+ * the rest of the string is not repeated anywhere.
+ */
+export function unknownScheme(raw: string): string | null {
+  const m = /^([A-Za-z][A-Za-z0-9+.-]*):/.exec(raw);
+  if (m === null) return null;
+  const scheme = `${m[1]}:`;
+  return scheme === FILE_PREFIX || scheme === KEYCHAIN_PREFIX ? null : scheme;
 }
 
 function refHint(): string {
@@ -240,9 +271,38 @@ export async function resolveTokenRef(ref: TokenRef, deps: ResolveDeps = {}): Pr
     const text =
       `The keychain did not return item ${JSON.stringify(ref.item)} of service ${JSON.stringify(ref.service)} ` +
       `(security exit ${r.exitCode}). Unlock the login keychain, or add the item, then re-run.`;
-    throw new StampFailure(EXIT_BLOCKED, "keychain_unavailable", text, [{ kind: "keychain_unlock", text }]);
+    throw new StampFailure(EXIT_BLOCKED, "keychain_unavailable", text, [keychainHumanStep(ref, r.exitCode)]);
   }
   return value;
+}
+
+/** `security` exits 44 (errSecItemNotFound) when there is no such item. */
+export const SECURITY_EXIT_ITEM_NOT_FOUND = 44;
+
+/** Apple's Keychain Access guide: the official page for both keychain steps. */
+export const KEYCHAIN_HELP_URL = "https://support.apple.com/guide/keychain-access/welcome/mac";
+
+/**
+ * What a human does about a keychain read that returned nothing. Exit 44 is
+ * "no such item": the item has to be added, which `suite secret put` does
+ * (value on stdin). Anything else is a locked keychain or a session that may
+ * not show the unlock prompt (an ssh login gets exit 36): unlock it.
+ */
+export function keychainHumanStep(ref: { item: string; service: string }, securityExit: number): HumanStep {
+  if (securityExit === SECURITY_EXIT_ITEM_NOT_FOUND) {
+    return {
+      kind: "keychain_item_missing",
+      text: `The keychain has no item ${JSON.stringify(ref.item)} in service ${JSON.stringify(ref.service)}. Add it (the value is read from stdin), then re-run.`,
+      command: `suite secret put --keychain-service ${ref.service} --item ${ref.item}`,
+      url: KEYCHAIN_HELP_URL,
+    };
+  }
+  return {
+    kind: "keychain_unlock",
+    text: `The login keychain is locked, or this session may not show the unlock prompt (security exit ${securityExit}). Unlock it, then re-run.`,
+    command: "security unlock-keychain ~/Library/Keychains/login.keychain-db",
+    url: KEYCHAIN_HELP_URL,
+  };
 }
 
 export type StdinState = "tty" | "none" | "idle" | "data";

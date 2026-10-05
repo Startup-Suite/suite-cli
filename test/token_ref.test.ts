@@ -237,13 +237,16 @@ describe("keychain: refs", () => {
     expect(failure(() => validateTokenRef(ref, { platform: "linux" })).code).toBe("keychain_unsupported_platform");
   });
 
-  test("a missing item (security exit 44) is blocked on a human: exit 3, keychain_unlock", async () => {
+  test("a missing item (security exit 44) is blocked on a human: exit 3, keychain_item_missing", async () => {
     const { bin } = fakeSecurity("", 44);
     const ref = parseTokenRef("keychain:item", { keychainService: "svc" });
     const f = await failureAsync(() => resolveTokenRef(ref, { platform: "darwin", securityBin: bin }));
     expect(f.exitCode).toBe(3);
     expect(f.code).toBe("keychain_unavailable");
-    expect(f.humanSteps.map((s) => s.kind)).toEqual(["keychain_unlock"]);
+    expect(f.humanSteps.map((s) => s.kind)).toEqual(["keychain_item_missing"]);
+    // The step names the exact command (names only) and an official page.
+    expect(f.humanSteps[0]?.command).toBe("suite secret put --keychain-service svc --item item");
+    expect(f.humanSteps[0]?.url).toStartWith("https://support.apple.com/");
     expect(f.message).toContain("item");
     expect(f.message).toContain("svc");
   });
@@ -251,7 +254,11 @@ describe("keychain: refs", () => {
   test("a locked keychain (any other non-zero exit) is exit 3 too", async () => {
     const { bin } = fakeSecurity("", 36);
     const ref = parseTokenRef("keychain:item", { keychainService: "svc" });
-    expect((await failureAsync(() => resolveTokenRef(ref, { platform: "darwin", securityBin: bin }))).exitCode).toBe(3);
+    const f = await failureAsync(() => resolveTokenRef(ref, { platform: "darwin", securityBin: bin }));
+    expect(f.exitCode).toBe(3);
+    // Exit 36 is what an ssh session gets for the login keychain (measured on rock, 2026-10-05).
+    expect(f.humanSteps.map((s) => s.kind)).toEqual(["keychain_unlock"]);
+    expect(f.humanSteps[0]?.command).toBe("security unlock-keychain ~/Library/Keychains/login.keychain-db");
   });
 
   test("a security binary that cannot be run is a failure (exit 1), not a human block", async () => {

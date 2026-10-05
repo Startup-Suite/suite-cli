@@ -1,0 +1,200 @@
+{
+  "spec": "token-ref",
+  "spec_version": 1,
+  "notes": [
+    "Shared test vectors for spec/token-ref.md. Vendored, byte for byte, by claude-code-suite-channel and openclaw-suite-channel, pinned to a suite-cli commit.",
+    "Placeholders: {dir} is a fresh temp directory per vector; {value} is a fresh random value per vector, never printed.",
+    "file.owner 'other' is simulated by telling the resolver its uid is the real uid plus one; no root is needed.",
+    "security.stdout/exit describe what a FAKE /usr/bin/security answers. Implementations reach the fake through an injected seam, never through PATH."
+  ],
+  "security": {
+    "bin": "/usr/bin/security",
+    "args": ["find-generic-password", "-s", "{service}", "-a", "{item}", "-w"]
+  },
+  "vectors": [
+    {
+      "id": "keychain_resolves",
+      "ref": "keychain:RUNTIME_TOKEN.rt-01a0d6b9",
+      "keychain_service": "suite-cli",
+      "platform": "darwin",
+      "security": { "exit": 0, "stdout": "{value}\n" },
+      "expect": {
+        "outcome": "resolved",
+        "kind": "keychain",
+        "value": "{value}",
+        "security_args": ["find-generic-password", "-s", "suite-cli", "-a", "RUNTIME_TOKEN.rt-01a0d6b9", "-w"]
+      }
+    },
+    {
+      "id": "keychain_item_missing",
+      "ref": "keychain:RUNTIME_TOKEN.absent",
+      "keychain_service": "suite-cli",
+      "platform": "darwin",
+      "security": { "exit": 44, "stdout": "" },
+      "expect": { "outcome": "refused", "kind": "keychain", "code": "keychain_unavailable", "names": ["RUNTIME_TOKEN.absent", "suite-cli"] }
+    },
+    {
+      "id": "keychain_locked",
+      "ref": "keychain:RUNTIME_TOKEN.rt",
+      "keychain_service": "suite-cli",
+      "platform": "darwin",
+      "security": { "exit": 36, "stdout": "" },
+      "expect": { "outcome": "refused", "kind": "keychain", "code": "keychain_unavailable", "names": ["RUNTIME_TOKEN.rt"] }
+    },
+    {
+      "id": "keychain_off_darwin",
+      "ref": "keychain:RUNTIME_TOKEN.rt",
+      "keychain_service": "suite-cli",
+      "platform": "linux",
+      "security": null,
+      "expect": { "outcome": "refused", "kind": "keychain", "code": "keychain_unsupported_platform" }
+    },
+    {
+      "id": "keychain_service_missing",
+      "ref": "keychain:RUNTIME_TOKEN.rt",
+      "keychain_service": null,
+      "platform": "darwin",
+      "security": null,
+      "expect": { "outcome": "refused", "kind": "keychain", "code": "keychain_service_missing" }
+    },
+    {
+      "id": "keychain_item_empty",
+      "ref": "keychain:",
+      "keychain_service": "suite-cli",
+      "platform": "darwin",
+      "security": null,
+      "expect": { "outcome": "refused", "kind": "keychain", "code": "token_ref_invalid" }
+    },
+    {
+      "id": "keychain_item_space",
+      "ref": "keychain:RUNTIME TOKEN",
+      "keychain_service": "suite-cli",
+      "platform": "darwin",
+      "security": null,
+      "expect": { "outcome": "refused", "kind": "keychain", "code": "token_ref_invalid" }
+    },
+    {
+      "id": "keychain_item_newline",
+      "ref": "keychain:RUNTIME_TOKEN.rt\n",
+      "keychain_service": "suite-cli",
+      "platform": "darwin",
+      "security": null,
+      "expect": { "outcome": "refused", "kind": "keychain", "code": "token_ref_invalid" }
+    },
+    {
+      "id": "keychain_item_tab",
+      "ref": "keychain:RUNTIME_TOKEN\trt",
+      "keychain_service": "suite-cli",
+      "platform": "darwin",
+      "security": null,
+      "expect": { "outcome": "refused", "kind": "keychain", "code": "token_ref_invalid" }
+    },
+    {
+      "id": "file_0600_resolves",
+      "ref": "file:{dir}/runtime.token",
+      "keychain_service": null,
+      "platform": "linux",
+      "file": { "kind": "regular", "mode": "0600", "owner": "caller", "content": "{value}\n" },
+      "expect": { "outcome": "resolved", "kind": "file", "value": "{value}" }
+    },
+    {
+      "id": "file_0400_resolves",
+      "ref": "file:{dir}/runtime.token",
+      "keychain_service": null,
+      "platform": "darwin",
+      "file": { "kind": "regular", "mode": "0400", "owner": "caller", "content": "{value}" },
+      "expect": { "outcome": "resolved", "kind": "file", "value": "{value}" }
+    },
+    {
+      "id": "file_mode_0644",
+      "ref": "file:{dir}/runtime.token",
+      "keychain_service": null,
+      "platform": "linux",
+      "file": { "kind": "regular", "mode": "0644", "owner": "caller", "content": "{value}\n" },
+      "expect": { "outcome": "refused", "kind": "file", "code": "token_file_mode", "names": ["0644"] }
+    },
+    {
+      "id": "file_mode_0640",
+      "ref": "file:{dir}/runtime.token",
+      "keychain_service": null,
+      "platform": "linux",
+      "file": { "kind": "regular", "mode": "0640", "owner": "caller", "content": "{value}\n" },
+      "expect": { "outcome": "refused", "kind": "file", "code": "token_file_mode" }
+    },
+    {
+      "id": "file_mode_0700",
+      "ref": "file:{dir}/runtime.token",
+      "keychain_service": null,
+      "platform": "linux",
+      "file": { "kind": "regular", "mode": "0700", "owner": "caller", "content": "{value}\n" },
+      "expect": { "outcome": "refused", "kind": "file", "code": "token_file_mode" }
+    },
+    {
+      "id": "file_foreign_owner",
+      "ref": "file:{dir}/runtime.token",
+      "keychain_service": null,
+      "platform": "linux",
+      "file": { "kind": "regular", "mode": "0600", "owner": "other", "content": "{value}\n" },
+      "expect": { "outcome": "refused", "kind": "file", "code": "token_file_foreign_owner" }
+    },
+    {
+      "id": "file_symlink",
+      "ref": "file:{dir}/runtime.token",
+      "keychain_service": null,
+      "platform": "linux",
+      "file": { "kind": "symlink", "mode": "0600", "owner": "caller", "content": "{value}\n" },
+      "expect": { "outcome": "refused", "kind": "file", "code": "token_file_not_regular" }
+    },
+    {
+      "id": "file_missing",
+      "ref": "file:{dir}/runtime.token",
+      "keychain_service": null,
+      "platform": "linux",
+      "file": { "kind": "absent" },
+      "expect": { "outcome": "refused", "kind": "file", "code": "token_file_missing" }
+    },
+    {
+      "id": "file_empty",
+      "ref": "file:{dir}/runtime.token",
+      "keychain_service": null,
+      "platform": "linux",
+      "file": { "kind": "regular", "mode": "0600", "owner": "caller", "content": "\n" },
+      "expect": { "outcome": "refused", "kind": "file", "code": "token_file_empty" }
+    },
+    {
+      "id": "file_relative_path",
+      "ref": "file:relative/runtime.token",
+      "keychain_service": null,
+      "platform": "linux",
+      "expect": { "outcome": "refused", "kind": "file", "code": "token_ref_invalid" }
+    },
+    {
+      "id": "unknown_scheme_env",
+      "ref": "env:SUITE_TOKEN",
+      "keychain_service": null,
+      "platform": "linux",
+      "expect": { "outcome": "refused", "kind": "unknown", "code": "token_ref_unknown_scheme" }
+    },
+    {
+      "id": "unknown_scheme_vault",
+      "ref": "vault:secret/suite",
+      "keychain_service": null,
+      "platform": "darwin",
+      "expect": { "outcome": "refused", "kind": "unknown", "code": "token_ref_unknown_scheme" }
+    },
+    {
+      "id": "unknown_scheme_uppercase_keychain",
+      "ref": "Keychain:RUNTIME_TOKEN.rt",
+      "keychain_service": "suite-cli",
+      "platform": "darwin",
+      "expect": { "outcome": "refused", "kind": "unknown", "code": "token_ref_unknown_scheme" }
+    },
+    {
+      "id": "literal_value",
+      "ref": "{value}",
+      "keychain_service": null,
+      "platform": "linux",
+      "expect": { "outcome": "literal", "kind": "literal", "code": "literal_token_refused" }
+    }
+  ]
+}
