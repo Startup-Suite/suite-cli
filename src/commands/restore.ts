@@ -31,6 +31,7 @@ import {
 } from "../tmux.ts";
 import { resolveTmux } from "../halt.ts";
 import { answerLaunchDialogs, liveDialogIo, type AnswerResult, type DialogIo } from "../claude_dialogs.ts";
+import { clearGuard, parseGuard, restartsPath, serializeGuard } from "../crash_guard.ts";
 
 export interface RestoreDeps {
   tmux: TmuxDeps;
@@ -43,6 +44,13 @@ export interface RestoreDeps {
    * Optional: a caller that supplies nothing answers nothing (the tests).
    */
   dialogs?: DialogIo;
+  /**
+   * The crash-loop guard file (crash_guard.ts). Optional: a caller that
+   * supplies nothing reads and clears nothing. A manual `suite restore` clears
+   * every `crash_looping` mark, because a person has now looked.
+   */
+  readGuard?(path: string): string | null;
+  writeGuard?(path: string, contents: string): void;
 }
 
 export function liveRestoreDeps(env = process.env): RestoreDeps {
@@ -62,7 +70,40 @@ export function liveRestoreDeps(env = process.env): RestoreDeps {
     now: () => new Date(),
     log: (line) => console.log(`suite restore: ${line}`),
     dialogs: liveDialogIo(liveTmuxDeps(env), env.HOME ?? "", (line) => console.log(`suite restore: ${line}`)),
+    readGuard: (p) => {
+      try {
+        return readFileSync(p, "utf8");
+      } catch {
+        return null;
+      }
+    },
+    writeGuard: (p, contents) => {
+      mkdirSync(p.slice(0, p.lastIndexOf("/")), { recursive: true });
+      writeFileSync(p, contents);
+    },
   };
+}
+
+/**
+ * Start ONE recorded agent: replay its tmux argv verbatim (only the tmux binary
+ * is re-resolved) and, for a Claude session, start answering its launch
+ * dialogs. The single restore code path: `suite restore` and the watchdog's
+ * crash-restore pass both come through here.
+ */
+export async function startEntry(
+  deps: RestoreDeps,
+  home: string,
+  entry: RosterEntry,
+): Promise<{ ok: boolean; stderr: string; answering: Promise<AnswerResult> | null }> {
+  const tmux = resolveTmux(deps.tmux.which);
+  const argv = [tmux, ...entry.command.slice(1)];
+  const { exitCode, stderr } = await deps.tmux.run(argv);
+  if (exitCode !== 0) return { ok: false, stderr, answering: null };
+  const answering =
+    entry.kind === "claude" && deps.dialogs !== undefined
+      ? answerLaunchDialogs(deps.dialogs, { session: entry.session, cwd: entry.cwd, home })
+      : null;
+  return { ok: true, stderr, answering };
 }
 
 /** Read the roster, tolerating absence — an empty roster is not an error. */
@@ -222,7 +263,6 @@ export async function runRestore(
 
   const live = await liveSessions(deps);
   const result: RestoreResult = { started: [], skipped: [], failed: [] };
-  const tmux = resolveTmux(deps.tmux.which);
   // One poll per restored Claude session, all running at once: at boot every
   // agent comes up together, and answering them one after another would make
   // the last one wait for all the others' windows.
@@ -241,19 +281,28 @@ export async function runRestore(
     }
     // Replay verbatim; only the tmux binary is re-resolved, since its path can
     // differ from the machine state at record time.
-    const argv = [tmux, ...entry.command.slice(1)];
-    const { exitCode, stderr } = await deps.tmux.run(argv);
-    if (exitCode === 0) {
+    const started = await startEntry(deps, home, entry);
+    const stderr = started.stderr;
+    if (started.ok) {
       result.started.push(entry.session);
       deps.log(`${entry.session}: started in ${entry.cwd}`);
-      if (entry.kind === "claude" && deps.dialogs !== undefined) {
-        answering.push(answerLaunchDialogs(deps.dialogs, { session: entry.session, cwd: entry.cwd, home }));
-      }
+      if (started.answering !== null) answering.push(started.answering);
     } else {
       result.failed.push(entry.session);
       deps.log(`${entry.session}: FAILED — ${stderr.trim().slice(0, 160)}`);
     }
   }
   await Promise.all(answering);
+  // A person ran restore: every crash_looping mark is cleared, so the
+  // watchdog's restore pass looks after these agents again.
+  if (opts.apply && deps.readGuard !== undefined && deps.writeGuard !== undefined) {
+    const { next, cleared } = clearGuard(parseGuard(deps.readGuard(restartsPath(home))));
+    try {
+      deps.writeGuard(restartsPath(home), serializeGuard(next));
+    } catch {
+      /* bookkeeping never fails a restore */
+    }
+    for (const s of cleared) deps.log(`${s}: crash_looping cleared — the watchdog restarts it again`);
+  }
   return result;
 }

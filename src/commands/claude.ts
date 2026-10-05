@@ -610,6 +610,8 @@ export interface ClaudeDeps {
   sleep?(ms: number): Promise<void>;
   out(line: string): void;
   err(line: string): void;
+  /** Writes the `--detach --json` document to stdout. When absent, `out` is used. */
+  emitJson?(text: string): void;
   /**
    * Run a child with the PARENT'S stdio — the attach and the direct exec both
    * need the real TTY, or Claude renders into a pipe and reads no keys. Returns
@@ -634,9 +636,56 @@ export interface ClaudeOptions {
   force: boolean;
   /** `--session NAME`, honoured by stage 4's naming rule. */
   explicitSession?: string;
+  /**
+   * `--detach`: ensure the session, answer its launch dialogs, record it and
+   * ensure the watchdog — then exit 0 WITHOUT attaching. For a caller with no
+   * terminal (the Mac app): the attach would fail there, turning a successful
+   * start into a non-zero exit.
+   */
+  detach?: boolean;
+  /** `--detach --json`: print ONE document {session, state, created} on stdout. */
+  json?: boolean;
 }
 
+/** The `suite claude --detach --json` document. Additive-only, like every machine contract here. */
+export interface DetachDocument {
+  session: string | null;
+  state: SessionState;
+  created: boolean;
+  error: { code: string; message: string } | null;
+}
+
+/** Exit code for `--detach` combined with something it cannot honour (-p). */
+export const DETACH_REFUSED_EXIT = 2;
+
 export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promise<number> {
+  if (options.detach !== true) return await runClaudeInner(deps, options);
+  let doc: DetachDocument = { session: null, state: "none", created: false, error: null };
+  const code = await runClaudeInner(deps, options, (d) => {
+    doc = { ...doc, ...d };
+  });
+  if (options.json === true) (deps.emitJson ?? ((t: string) => deps.out(t.trimEnd())))(`${JSON.stringify(doc)}\n`);
+  return code;
+}
+
+async function runClaudeInner(
+  deps: ClaudeDeps,
+  options: ClaudeOptions,
+  report: (d: Partial<DetachDocument>) => void = () => {},
+): Promise<number> {
+  const detach = options.detach === true;
+  const fail = (code: number, errCode: string, message: string): number => {
+    deps.err(`suite claude: ${message}`);
+    report({ error: { code: errCode, message } });
+    return code;
+  };
+  if (detach && isNonInteractive(options.userArgs)) {
+    return fail(DETACH_REFUSED_EXIT, "detach_with_print", "--detach starts a persistent session; it cannot be combined with -p/--print");
+  }
+  // Detached, nobody can answer an install offer: say how, and stop.
+  if (detach && deps.tmux.which(AGENT) === null) {
+    return fail(MISSING_AGENT_EXIT, "claude_not_found", "claude is not on PATH; install it with: suite harness install claude --yes");
+  }
   const state = await readState(deps.statePath);
   if (!state.noticeSeen) {
     for (const line of noticeLines(deps.color)) deps.out(line);
@@ -686,13 +735,19 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
   if (plan.warning !== undefined) deps.err(plan.warning);
   for (const note of plan.notes) deps.out(note);
 
-  if (plan.direct !== undefined) return deps.exec(plan.direct);
+  if (plan.direct !== undefined) {
+    // No tmux: there is no session to leave behind, so a detached start is impossible.
+    if (detach) return fail(1, "tmux_missing", "--detach needs tmux, which is not on PATH");
+    return deps.exec(plan.direct);
+  }
+  report({ session });
 
   if (plan.kill !== undefined) await deps.tmux.run(plan.kill);
   if (plan.create !== undefined) {
     const created = await deps.tmux.run(plan.create);
     if (created.exitCode !== 0) {
       deps.err(`tmux could not create ${session}: ${created.stderr.trim()}`);
+      report({ error: { code: "tmux_create_failed", message: `tmux could not create ${session}` } });
       return created.exitCode;
     }
 
@@ -748,8 +803,10 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
           `  every new pane inherits it. \`tmux kill-server\` fixes that, and kills every session on this box.`,
         ].join("\n"),
       );
+      report({ state, error: { code: "session_died", message: `${session} was created and exited immediately` } });
       return SESSION_DIED_EXIT;
     }
+    report({ created: true });
     if (plan.created !== undefined) deps.out(plan.created);
     // Record for restore-on-boot. A by-product of launching, never a list the
     // operator maintains — a hand-curated roster is wrong exactly when needed.
@@ -821,6 +878,13 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
     return code;
   };
 
+  if (detach) {
+    // Leave it running: wait only for the launch dialogs, then report.
+    const code = await finish(0);
+    report({ state: await detectState(session, deps.tmux) });
+    deps.err(`suite: ${session} is running detached — attach with \`suite claude\` in ${deps.cwd}`);
+    return code;
+  }
   const enter = plan.enter;
   if (enter === undefined) return finish(0);
   if (enter.kind === "refuse") {
@@ -893,6 +957,7 @@ export async function wireClaude(deps: ClaudeDeps, wiring: WiringIo): Promise<Su
 export async function liveClaudeDeps(
   env: Record<string, string | undefined> = process.env,
   prompter: Prompter = ttyPrompter(),
+  mode: { json?: boolean } = {},
 ): Promise<ClaudeDeps> {
   const config = (await readConfig({ env })) ?? emptyConfig();
   const store = createStore();
@@ -917,8 +982,10 @@ export async function liveClaudeDeps(
     config,
     statePath: statePath(env),
     color: colorEnabled(env),
-    out: (line) => console.log(line),
+    // Under --json, stdout carries ONE document: every human line goes to stderr.
+    out: mode.json === true ? (line) => console.error(line) : (line) => console.log(line),
     err: (line) => console.error(line),
+    emitJson: (text) => void process.stdout.write(text),
     async exec(argv) {
       const proc = Bun.spawn(argv, {
         env: env as Record<string, string>,

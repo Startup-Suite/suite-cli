@@ -47,8 +47,35 @@ behaviour anyone was relying on.
   with whitespace or a control character, and an unknown scheme, are refused.
   A missing keychain item (exit 44) is now the `keychain_item_missing` step,
   not `keychain_unlock`.
+- **`suite harness --json [--root DIR]`**: one row per harness (claude, codex,
+  openclaw, hermes, deepseek) with `found`, `found_off_path` and the PATH line
+  to add, `version`, `logged_in`, `suite_ready` and how to install it.
+  **`suite harness install claude --yes`** runs the official installer with no
+  prompt; every other harness gets an `install_harness` human step, never a
+  package manager.
+- **`suite login claude|codex --json --no-browser`** drives the harness's own
+  login and prints NDJSON events (`open_url`, `device_code`, `human_step`,
+  `error`, `done`). Claude Code 2.1.289 completes `claude auth login
+  --claudeai` by a localhost callback, so suite only surfaces the URL; it never
+  relays a pasted code (Anthropic's terms forbid intermediating a Claude.ai
+  sign-in) and sends a person to `claude auth login --claudeai` in a terminal
+  when the callback cannot finish. Codex uses `codex login --device-auth` under
+  the agent's `CODEX_HOME`. The login classifier lives in one shared module,
+  `src/login.ts`.
+- **`--detach [--json]` for `suite claude` and `suite codex`**: ensure the
+  session, answer the launch dialogs, record it and ensure the watchdog, then
+  exit 0 without attaching. Off a terminal, `suite claude` used to create the
+  session and then fail on the attach.
+- **`suite watch` restores crashed agents.** Each tick restarts recorded agents
+  whose session died, through the `suite restore` code path, logging each one
+  to its session log, with a crash-loop guard: at most 3 restarts per agent per
+  10 minutes, then `crash_looping` (a new `suite status --json` state) until
+  `suite restore`. **An agent stopped on purpose is restarted too while it is
+  in the roster**; retire it with `suite restore --forget NAME`.
+- `suite codex` now waits for the watchdog install it starts, instead of
+  exiting with it in flight.
 - Tuning values (CLI timeout, status poll, credential probe timeout, crash-loop
-  limit) live in `src/tuning.ts`.
+  limit, harness probe and login timeouts) live in `src/tuning.ts`.
 
 ## 0.7.0
 

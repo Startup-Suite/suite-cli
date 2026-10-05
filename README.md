@@ -188,6 +188,11 @@ again from the same place and you are back in the same session.
 | `suite hermes --root DIR [...]` | Stamps a Hermes agent root and runs its gateway in tmux. See [`suite hermes`](#suite-hermes) |
 | `suite openclaw --root DIR [...]` | Stamps an OpenClaw agent root and runs its gateway in tmux. See [`suite openclaw`](#suite-openclaw) |
 | `suite codex [--root DIR]` | Runs a Codex agent through `codex app-server`, federated into Suite, in tmux. Logs Codex in with its own device-code flow if needed. See [`suite codex`](#suite-codex) |
+| `suite claude --detach [--json]` | Ensures the session, answers its launch dialogs, records it and ensures the watchdog, then exits 0 **without attaching**. See [machine verbs](#harnesses-login-and-detached-starts-machine-verbs) |
+| `suite codex --detach [--json]` | The same for a Codex agent |
+| `suite harness --json [--root DIR]` | Which harnesses are installed (on the PATH given), where, which version, and whether each is logged in |
+| `suite harness install claude --yes` | Runs the official Claude Code installer with no prompt. Every other harness gets a human step, never a package manager |
+| `suite login claude\|codex --json --no-browser` | Runs the harness's **own** login and reports it as NDJSON events |
 | `suite hermes\|openclaw --stamp-only` | Stamps only, and prints one JSON document. See [the stamp contract](#stamp-contract---stamp-only) |
 | `suite update` | Re-runs the installer to replace this install with the latest published CLI |
 | `suite doctor` | Diagnoses a broken setup in two halves, **install connection** (`→ suite init`) and **claude harness** (mostly `→ suite claude`), with one runnable remedy per failure. A stale session is never reported green |
@@ -760,7 +765,9 @@ One document, `contract_version` 1, additive only like the stamp contract:
 | `agents` | one row per roster entry, below |
 
 Each agent: `session`, `kind`, `root`, `runtime_id`, `state` (`live`, `stale`,
-`none`; a recorded agent whose session is gone is `stale`), `channel`
+`none`, `crash_looping`; a recorded agent whose session is gone is `stale`;
+`crash_looping` means the watchdog restarted it 3 times in 10 minutes, it died
+again, and it stays down until `suite restore`), `channel`
 (`connected`, `not_connected`, `unknown`), `verdict` (the last stamp verdict for
 hermes and openclaw, else null), `token_at_rest` and `token_in_child_env`.
 
@@ -773,6 +780,92 @@ channel's `SUITE_TOKEN`). `channel` is read from the state file the Claude
 channel plugin writes on join and disconnect, and is `connected` only while that
 file says joined and its pid is alive; it is never read from `claude mcp list`,
 which would start a second channel joining as the same runtime on every poll.
+
+## Harnesses, login and detached starts (machine verbs)
+
+These are what the Mac app calls. Each is usable by hand, and none prompts.
+
+### `suite harness --json [--root DIR]`
+
+One document, `contract_version` 1, additive only: `{contract_version,
+harnesses: [...]}` with one row per kind (`claude`, `codex`, `openclaw`,
+`hermes`, `deepseek`):
+
+| Field | Meaning |
+| --- | --- |
+| `found` | on the PATH this process was given (the app passes the user's login PATH) |
+| `found_off_path` | not on that PATH, but at an official install location (`~/.local/bin/claude`, Homebrew's `codex`) |
+| `path`, `path_line` | the binary, and for `found_off_path` the exact `export PATH=...` line to add |
+| `version` | the first version-looking token of `--version` |
+| `logged_in` | `true`, `false` or `unknown`. Claude: `claude auth status --json`. Codex: `codex login status` with `CODEX_HOME=<root>/.codex`, the agent's own home |
+| `suite_ready` | on PATH, and for claude and codex logged in |
+| `install` | `{mode: auto\|command\|link, command, url}`: claude is `auto` (the official installer); codex is `npm install -g @openai/codex` (github.com/openai/codex); openclaw, hermes and deepseek are their `suite` verb |
+| `notes` | plain sentences |
+
+`suite harness install claude --yes [--json]` runs the official installer
+(`curl -fsSL https://claude.ai/install.sh | bash`, user-owned, no sudo) and
+re-detects. Without `--yes` it is refused (exit 2). Any other harness returns a
+`human_steps` entry `{kind: install_harness, command, url}` with exit 3:
+suite-cli runs no package manager for anyone.
+
+### `suite login claude|codex [--root DIR] --json --no-browser`
+
+Drives the harness's own login and prints NDJSON events on stdout:
+`{event: open_url, url}`, `{event: device_code, code, url, expires_at}`,
+`{event: human_step, kind: complete_login_in_terminal, command, reason}`,
+`{event: error, code, message}` and finally `{event: done, logged_in}`. Exit 0
+logged in, 1 failed or timed out, 3 finish in a terminal, 4 not installed.
+
+**No credential passes through suite.** Anthropic's Claude Code legal page
+(code.claude.com/docs/en/legal-and-compliance) says developers "may not
+collect, store, or intermediate Claude.ai credentials or session tokens —
+sign-in to a Claude account must complete through Anthropic's own flow." So:
+
+* **Claude** (measured on 2.1.289): `claude auth login --claudeai` completes by a
+  **localhost callback**. With `--no-browser`, `$BROWSER` is a shim that only
+  records the URL Claude hands it; suite emits that URL as `open_url`, and the
+  user's own browser talks to Anthropic and back to Claude Code. Claude also
+  prints a paste-code fallback. **suite never relays a pasted code**: the
+  harness's stdin is `/dev/null` and this verb never reads its own. When the
+  localhost flow cannot finish, the event is `human_step`
+  `complete_login_in_terminal` with `claude auth login --claudeai`, run in a
+  terminal where the person pastes into Claude Code itself.
+  `paste_code_needed` is never emitted.
+* **Codex**: `codex login --device-auth` with `CODEX_HOME=<root>/.codex`. The
+  user types the one-time code on OpenAI's own page; suite shows what Codex
+  printed, in the one `device_code` event, and never logs it.
+
+### `--detach`
+
+`suite claude --detach` and `suite codex --detach` ensure the session, answer
+the launch dialogs (Claude), record the roster and ensure the watchdog, then
+exit 0 without attaching. With `--json`, stdout is one document `{session,
+state, created, error}`. `suite claude --detach` refuses `-p` (exit 2), will
+not offer an install (exit 4: run `suite harness install claude --yes`), and
+needs tmux. `suite codex --detach` refuses a Codex that is not logged in
+(exit 7: run `suite login codex`). Off a terminal, plain `suite codex` already
+returned without attaching; `--detach` makes that hold on a terminal too.
+
+### Crash restore (`suite watch`)
+
+Each `suite watch` tick restores **recorded** agents whose session has died,
+through the same code path as `suite restore` (a Claude session's launch
+dialogs are answered as in 0.6.1), and writes every restore to the agent's
+session log (`~/.local/state/suite/sessions/<session>.log`). A session that
+exists with no agent in it is killed by exact name first.
+
+**Crash-loop guard:** at most 3 restarts per agent per 10 minutes
+(`src/tuning.ts`). The next death marks the agent `crash_looping` (in
+`~/.local/state/suite/restarts.json` and in `suite status --json`) and the
+watchdog leaves it down until someone runs `suite restore`, which clears it.
+
+**An agent you stop on purpose is restarted too** while it is in the roster —
+a killed session and a crashed one look the same from outside. Retire an agent
+with `suite restore --forget NAME`.
+
+The watchdog starts at login: the macOS LaunchAgent
+(`technology.milvenan.suite-watch`) has `RunAtLoad` and `KeepAlive`, and the
+Linux user unit is `WantedBy=default.target`.
 
 ## Five decisions, stated rather than guessed
 

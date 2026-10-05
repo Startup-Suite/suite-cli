@@ -9,7 +9,7 @@
  *    connection: {suite_url, runtime_id, token_ref|null,
  *                 token_at_rest: keychain|file|inline|env|none},
  *    watchdog: {installed, loaded},
- *    agents: [{session, kind, root, runtime_id, state: live|stale|none,
+ *    agents: [{session, kind, root, runtime_id, state: live|stale|none|crash_looping,
  *              channel: connected|not_connected|unknown, verdict,
  *              token_at_rest, token_in_child_env}]}
  *
@@ -27,7 +27,12 @@
  * `SUITE_TOKEN`). These are the exceptions that exist today, surfaced rather
  * than hidden.
  *
- * `state` is the three-way session state. A RECORDED agent whose session is
+ * `crash_looping` (added in 0.8.0 stage 2, additively): the watchdog's restore
+ * pass restarted this agent 3 times in 10 minutes, it died again, and it is
+ * left down until `suite restore` (crash_guard.ts). Reported only while the
+ * agent is not live.
+ *
+ * `state` is otherwise the three-way session state. A RECORDED agent whose session is
  * gone is `stale`, never `none` (see status.ts recordedState), so `none` does
  * not occur for a roster row today; it stays in the enum for the contract.
  *
@@ -48,6 +53,7 @@ import { STAMP_FILE } from "../stamp.ts";
 import { LAUNCHD_LABEL, SERVICE_NAME } from "../supervisor.ts";
 import { detectState, type SessionState, type TmuxDeps } from "../tmux.ts";
 import { VERSION } from "../version.ts";
+import { emptyGuard, isCrashLooping, parseGuard, restartsPath, type GuardState } from "../crash_guard.ts";
 import { AGENT_CONFIG_FILE, AGENT_STATE_FILE } from "./deepseek.ts";
 import { CHANNEL_SERVER, claudeJsonPath } from "./init.ts";
 import { agentNameForKind, lastVerdict, recordedState, STAMPED_KINDS } from "./status.ts";
@@ -58,13 +64,14 @@ export const STATUS_CONTRACT_VERSION = 1 as const;
 
 export type TokenAtRest = "keychain" | "file" | "inline" | "env" | "none";
 export type ChannelState = "connected" | "not_connected" | "unknown";
+export type AgentState = SessionState | "crash_looping";
 
 export interface AgentRow {
   session: string;
   kind: RosterEntry["kind"];
   root: string;
   runtime_id: string | null;
-  state: SessionState;
+  state: AgentState;
   channel: ChannelState;
   /** The last stamp verdict for stamped kinds (`pass`/`fail`/...), else null. */
   verdict: string | null;
@@ -161,9 +168,10 @@ function rootConfig(deps: StatusJsonDeps, root: string): SuiteConfig | null {
 }
 
 /** One roster entry as a row. */
-export async function agentRow(deps: StatusJsonDeps, entry: RosterEntry): Promise<AgentRow> {
+export async function agentRow(deps: StatusJsonDeps, entry: RosterEntry, guard: GuardState = emptyGuard()): Promise<AgentRow> {
   const machine = deps.config;
-  const state = recordedState(await detectState(entry.session, deps.tmux, agentNameForKind(entry.kind)));
+  const detected = recordedState(await detectState(entry.session, deps.tmux, agentNameForKind(entry.kind)));
+  const state: AgentState = detected !== "live" && isCrashLooping(guard, entry.session) ? "crash_looping" : detected;
   const row: AgentRow = {
     session: entry.session,
     kind: entry.kind,
@@ -245,8 +253,9 @@ export async function statusDocument(deps: StatusJsonDeps): Promise<StatusDocume
     deps.platform === "darwin"
       ? `${deps.home}/Library/LaunchAgents/${LAUNCHD_LABEL}.plist`
       : `${deps.home}/.config/systemd/user/${SERVICE_NAME}.service`;
+  const guard = deps.home === "" ? emptyGuard() : parseGuard(deps.readFile(restartsPath(deps.home)));
   const agents: AgentRow[] = [];
-  for (const entry of roster) agents.push(await agentRow(deps, entry));
+  for (const entry of roster) agents.push(await agentRow(deps, entry, guard));
   return {
     contract_version: STATUS_CONTRACT_VERSION,
     suite_version: VERSION,

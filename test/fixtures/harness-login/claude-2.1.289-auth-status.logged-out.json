@@ -1,0 +1,8 @@
+{
+  "loggedIn": false,
+  "authMethod": "none",
+  "apiProvider": "firstParty",
+  "analyticsDisabled": false,
+  "projectsDirectory": "/private/tmp/suite-01a0d6b9-s2/home/.claude/projects",
+  "configDirectory": "/private/tmp/suite-01a0d6b9-s2/home/.claude"
+}

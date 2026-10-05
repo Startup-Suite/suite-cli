@@ -1,0 +1,12 @@
+ ▐▛███▛█   Claude Code v2.1.289
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   ~/agent-01a0d6b9
+
+▎ --dangerously-load-development-channels ignored (server:suite-channel)
+▎ Channels are not currently available
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+                                                    Not logged in · Run /login

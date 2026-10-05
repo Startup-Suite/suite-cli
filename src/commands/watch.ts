@@ -31,7 +31,26 @@ import {
 } from "../halt.ts";
 import { SESSION_PREFIX, type TmuxDeps, detectState, liveTmuxDeps } from "../tmux.ts";
 import { RSS_CEILING_BYTES, SUPERVISED_ENV } from "../supervisor.ts";
-import { answerOnce, liveDialogIo, type DialogIo } from "../claude_dialogs.ts";
+import { answerOnce, liveDialogIo, sessionLogger, type DialogIo } from "../claude_dialogs.ts";
+import { crashRestorePass, type CrashRestoreDeps } from "./crash_restore.ts";
+import { liveRestoreDeps } from "./restore.ts";
+
+/** Live crash-restore deps: the restore deps, logging as `suite watch`, plus the guard file and the session log. */
+export function liveCrashRestoreDeps(env: Record<string, string | undefined> = process.env, tmux?: TmuxDeps): CrashRestoreDeps {
+  const base = liveRestoreDeps(env as NodeJS.ProcessEnv);
+  const echo = (line: string) => console.log(`suite watch: ${line}`);
+  const t = tmux ?? base.tmux;
+  return {
+    ...base,
+    tmux: t,
+    log: echo,
+    dialogs: liveDialogIo(t, env.HOME ?? "", echo),
+    readGuard: base.readGuard!,
+    writeGuard: base.writeGuard!,
+    // File only: the pass already echoes each line through `log`.
+    sessionLog: sessionLogger(env.HOME ?? "", () => {}),
+  };
+}
 
 export interface WatchDeps {
   tmux: TmuxDeps;
@@ -49,6 +68,12 @@ export interface WatchDeps {
    * Optional: a caller that supplies nothing answers nothing.
    */
   dialogs?: DialogIo;
+  /**
+   * The crash-restore pass (crash_restore.ts): recorded agents whose session
+   * died are restored each tick, under the crash-loop guard. Optional: a caller
+   * that supplies nothing restores nothing (the halt tests).
+   */
+  crashRestore?: CrashRestoreDeps;
 }
 
 export interface WatchOptions {
@@ -328,6 +353,15 @@ export function overCeiling(rssBytes: number, ceiling = RSS_CEILING_BYTES): stri
 }
 
 export async function runWatch(deps: WatchDeps, opts: WatchOptions): Promise<HaltEvent[]> {
+  // FIRST: bring back recorded agents that died. A restored Claude session's
+  // dialogs are answered inside the pass; the halt sweep below then sees it.
+  if (deps.crashRestore !== undefined) {
+    try {
+      await crashRestorePass(deps.crashRestore, opts.home, { apply: opts.apply });
+    } catch (err) {
+      deps.log(`crash restore pass failed: ${(err as Error).message}`);
+    }
+  }
   const panes = await deps.tmux.run([
     resolveTmux(deps.tmux.which),
     "list-panes",
@@ -505,6 +539,7 @@ export function liveWatchDeps(
     newestTranscript: liveNewestTranscript,
     log: (line) => console.log(`suite watch: ${line}`),
     dialogs: liveDialogIo(tmux ?? liveTmuxDeps(env), env.HOME ?? "", (line) => console.log(`suite watch: ${line}`)),
+    crashRestore: liveCrashRestoreDeps(env, tmux),
     async post(url, body, contentType, auth) {
       try {
         const res = await fetch(url, {

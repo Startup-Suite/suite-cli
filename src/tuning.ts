@@ -38,3 +38,20 @@ export const CRASH_LOOP_WINDOW_MS = 10 * 60_000;
  * this stays under it and the helper fails with a named error instead.
  */
 export const MCP_HEADERS_TIMEOUT_MS = 8_000;
+
+/** How long `suite harness` waits for one `<harness> --version` / login-status probe. */
+export const HARNESS_PROBE_TIMEOUT_MS = 5_000;
+
+/**
+ * How long `suite login` lets a harness's own login run before giving up on it.
+ * Codex's device code lives 15 minutes (measured, codex-cli 0.157.0); a person
+ * finishing a browser sign-in needs no longer than that either.
+ */
+export const LOGIN_TIMEOUT_MS = 15 * 60_000;
+
+/**
+ * How long `suite login claude --no-browser` waits for Claude Code to hand its
+ * localhost-callback URL to the browser shim. Measured on rock: well under a
+ * second. Past this, the caller is told to finish in a terminal instead.
+ */
+export const LOGIN_BROWSER_WAIT_MS = 20_000;

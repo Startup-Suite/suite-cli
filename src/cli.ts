@@ -51,6 +51,8 @@ import { ttyPrompter } from "./secrets.ts";
 import { isNonInteractiveInit, liveInitRefDeps, runInitRef } from "./commands/init_ref.ts";
 import { runSecret } from "./commands/secret.ts";
 import { runMcpHeaders } from "./commands/mcp_headers.ts";
+import { liveHarnessDeps, runHarness } from "./commands/harness.ts";
+import { liveLoginDeps, runLogin } from "./commands/login.ts";
 import { liveSupervisorIo as liveSupervisorIoForInit } from "./supervisor.ts";
 import { liveTmuxDeps } from "./tmux.ts";
 import { liveWatchdogLoaded, livePidAlive, renderStatusDocument, statusDocument } from "./commands/status_json.ts";
@@ -60,6 +62,8 @@ export type Verb =
   | "init"
   | "secret"
   | "mcp-headers"
+  | "harness"
+  | "login"
   | "claude"
   | "claude new"
   | "deepseek"
@@ -78,7 +82,7 @@ export interface Dispatch {
   args: string[];
 }
 
-const VERBS = new Set(["init", "secret", "mcp-headers", "claude", "deepseek", "hermes", "openclaw", "codex", "doctor", "status", "update", "watch", "restore"]);
+const VERBS = new Set(["init", "secret", "mcp-headers", "harness", "login", "claude", "deepseek", "hermes", "openclaw", "codex", "doctor", "status", "update", "watch", "restore"]);
 
 /**
  * Pure: map argv to a verb plus untouched passthrough arguments.
@@ -111,9 +115,16 @@ export function parse(argv: string[]): Dispatch {
  * Returns the name plus the arguments with the pair removed, because a flag we
  * consumed must not ALSO reach Claude.
  */
-export function parseClaudeOptions(args: string[]): { session?: string; rest: string[] } {
+export function parseClaudeOptions(args: string[]): { session?: string; detach?: true; json?: true; rest: string[] } {
   const rest: string[] = [];
   let session: string | undefined;
+  // `--detach` (and `--json`, ONLY beside `--detach`) are ours too, before a
+  // `--`. A lone `--json` stays Claude's: it is not a wrapper flag unless the
+  // caller asked for the machine form of a detached start.
+  const terminator = args.indexOf("--");
+  const head = terminator === -1 ? args : args.slice(0, terminator);
+  const detach = head.includes("--detach");
+  let json = false;
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     if (arg === "--") {
@@ -127,9 +138,19 @@ export function parseClaudeOptions(args: string[]): { session?: string; rest: st
       i++;
       continue;
     }
+    if (arg === "--detach") continue;
+    if (arg === "--json" && detach) {
+      json = true;
+      continue;
+    }
     if (arg !== undefined) rest.push(arg);
   }
-  return session === undefined ? { rest } : { session, rest };
+  return {
+    ...(session === undefined ? {} : { session }),
+    ...(detach ? { detach: true as const } : {}),
+    ...(json ? { json: true as const } : {}),
+    rest,
+  };
 }
 
 /**
@@ -160,12 +181,15 @@ export function usage(): string {
     row("init", "connect this machine to a Suite install (url, runtime id, token, watchdog)"),
     row("init --token-ref", "the same without a terminal: --suite-url --runtime-id --token-ref [--json]"),
     row("secret", "put|delete a keychain item (value on stdin) — macOS"),
+    row("harness", "which harnesses are installed and logged in (--json [--root DIR]); install claude --yes"),
+    row("login", "run claude's or codex's OWN login (claude|codex [--root DIR] --json --no-browser): NDJSON events"),
     row("claude", "set up Claude Code for Suite in this folder if needed, then run it in a persistent session"),
+    row("claude --detach", "start (or keep) the session without attaching; --json prints {session, state, created}"),
     row("claude new", "force a new session"),
     row("deepseek", "run a DeepSeek Harness agent federated into Suite"),
     row("hermes", "stamp a Hermes agent root and run its gateway (--stamp-only: JSON contract)"),
     row("openclaw", "stamp an OpenClaw agent root and run its gateway (--stamp-only: JSON contract)"),
-    row("codex", "run a Codex agent through codex app-server, federated into Suite, in a persistent session"),
+    row("codex", "run a Codex agent through codex app-server, federated into Suite, in a persistent session (--detach [--json])"),
     row("doctor", "diagnose a broken setup"),
     row("status", "show federation, session state and stamped agents (kind, root, live/stale, last verdict); --json"),
     row("watch", "recover halted agent sessions (--dry-run, --once, --interval N, --force SESSION)"),
@@ -202,6 +226,8 @@ export async function run(argv: string[]): Promise<number> {
     return exitCode;
   }
   if (verb === "secret") return await runSecret(argv.slice(1));
+  if (verb === "harness") return await runHarness(argv.slice(1), liveHarnessDeps());
+  if (verb === "login") return await runLogin(argv.slice(1), liveLoginDeps());
   if (verb === "mcp-headers") {
     // Hidden: Claude Code's headersHelper. stdout is the headers object, for Claude alone.
     return await runMcpHeaders(argv.slice(1), {
@@ -229,11 +255,13 @@ export async function run(argv: string[]): Promise<number> {
     // Everything after the verb is Claude's, verbatim, EXCEPT `--session NAME`
     // before a `--`. That one flag is ours; see parseClaudeOptions.
     const { args } = parse(argv);
-    const { session, rest } = parseClaudeOptions(args);
-    return runClaude(await liveClaudeDeps(), {
+    const { session, rest, detach, json } = parseClaudeOptions(args);
+    return runClaude(await liveClaudeDeps(process.env, ttyPrompter(), { json: json === true }), {
       userArgs: rest,
       force: verb === "claude new",
       explicitSession: session,
+      detach: detach === true,
+      json: json === true,
     });
   }
   if (verb === "deepseek") {

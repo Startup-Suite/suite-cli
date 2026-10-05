@@ -39,7 +39,7 @@ import { readConfig, type SuiteConfig } from "../config.ts";
 import { createStore, TOKEN_KEY, assertNoSecretsInArgv, ttyPrompter, type Prompter } from "../secrets.ts";
 import { ensureConnection, ensureToken, hasConnection } from "../connection.ts";
 import { harnessChildEnv } from "../harness_env.ts";
-import { nameDigest, type TmuxDeps } from "../tmux.ts";
+import { detectState, liveTmuxDeps, nameDigest, type TmuxDeps } from "../tmux.ts";
 import { channelWsUrl, toolsHttpUrl } from "./init.ts";
 import { agentNameFromRuntimeId, liveDeepseekDeps, loadCredentials, runInSession, selfArgv, sessionNameForAgent, type DeepseekDeps } from "./deepseek.ts";
 import { liveRestoreDeps, loadRoster, recordLaunch, type RestoreDeps } from "./restore.ts";
@@ -76,6 +76,18 @@ export interface CodexOptions {
   sandbox: SandboxMode;
   codexHome?: string;
   codexBin?: string;
+  /** `--detach`: ensure the session and exit 0 without attaching, even on a terminal. */
+  detach?: boolean;
+  /** `--json` (with --detach): ONE document {session, state, created} on stdout. */
+  json?: boolean;
+}
+
+/** The `suite codex --detach --json` document — the same shape as `suite claude --detach --json`. */
+export interface CodexDetachDocument {
+  session: string | null;
+  state: "live" | "stale" | "none";
+  created: boolean;
+  error: { code: string; message: string } | null;
 }
 
 /**
@@ -100,6 +112,8 @@ export function parseCodexOptions(args: string[]): CodexOptions {
     };
     if (a === "--root") out.root = resolve(value());
     else if (a === "--no-session") out.noSession = true;
+    else if (a === "--detach") out.detach = true;
+    else if (a === "--json") out.json = true;
     else if (a === "--reply-mcp") out.replyMcp = true;
     else if (a === "--codex-home") out.codexHome = resolve(value());
     else if (a === "--codex") out.codexBin = value();
@@ -187,6 +201,8 @@ export interface CodexDeps {
   /** Run a child and capture its output (login status). */
   capture(argv: string[], opts: { env: Record<string, string> }): Promise<{ exitCode: number; stdout: string }>;
   stderr: { write(text: string): void };
+  /** Where the `--detach --json` document goes. Absent: stderr. */
+  stdout?: { write(text: string): void };
   prompter?: Prompter;
   session: Pick<DeepseekDeps, "isTTY" | "exec" | "stderr">;
   tmux?: TmuxDeps;
@@ -232,6 +248,26 @@ export async function runCodex(args: string[], deps: CodexDeps): Promise<number>
     return 2;
   }
   if (opts.replyMcp) return await runReplyMcp(deps.env, VERSION);
+  if (opts.detach !== true) return await runCodexInner(opts, deps);
+  if (opts.noSession) {
+    deps.stderr.write("suite codex: --detach and --no-session contradict each other\n");
+    return 2;
+  }
+  let doc: CodexDetachDocument = { session: null, state: "none", created: false, error: null };
+  const code = await runCodexInner(opts, deps, (d) => {
+    doc = { ...doc, ...d };
+  });
+  if (code !== 0 && doc.error === null) doc = { ...doc, error: { code: "failed", message: `suite codex exited ${code}; see stderr` } };
+  if (opts.json === true) (deps.stdout ?? deps.stderr).write(`${JSON.stringify(doc)}\n`);
+  return code;
+}
+
+async function runCodexInner(
+  opts: CodexOptions,
+  deps: CodexDeps,
+  report: (d: Partial<CodexDetachDocument>) => void = () => {},
+): Promise<number> {
+  const detach = opts.detach === true;
 
   // The connection: the one `suite init` saved, or the init questions asked
   // right here from a terminal — the same as `suite claude`.
@@ -285,7 +321,8 @@ export async function runCodex(args: string[], deps: CodexDeps): Promise<number>
   mkdirSync(codexHome, { recursive: true, mode: 0o700 });
 
   if (!(await codexLoggedIn(deps, codexBin, codexHome))) {
-    if (opts.noSession || !deps.isTTY()) {
+    if (detach) report({ error: { code: "not_logged_in", message: `Codex is not logged in (CODEX_HOME=${codexHome}); run suite login codex --root ${root}` } });
+    if (opts.noSession || detach || !deps.isTTY()) {
       deps.stderr.write(
         `suite codex: Codex is not logged in (CODEX_HOME=${codexHome}). Log in from a terminal with\n` +
           `suite codex:   CODEX_HOME=${codexHome} codex login --device-auth\n` +
@@ -343,13 +380,22 @@ export async function runCodex(args: string[], deps: CodexDeps): Promise<number>
   assertNoSecretsInArgv(relaunch, store);
   const home = deps.env.HOME ?? "";
   const sessionEnv = harnessChildEnv(deps.env, { TMUX: deps.env.TMUX });
-  return await runInSession(session, relaunch, root, sessionEnv, store, deps.session, {
+  // MEASURED from runInSession (deepseek.ts): off a terminal it already
+  // creates the session and returns 0 without attaching. --detach makes that
+  // the behaviour on a terminal too, and adds the JSON and an awaited watchdog.
+  const sessionDeps = detach ? { ...deps.session, isTTY: () => false } : deps.session;
+  let supervising: Promise<unknown> | null = null;
+  report({ session });
+  const code = await runInSession(session, relaunch, root, sessionEnv, store, sessionDeps, {
     agentName: AGENT,
     tmux: deps.tmux,
     onCreated: (createArgv) => {
+      report({ created: true });
       if (deps.restore) recordLaunch(deps.restore, home, { session, command: createArgv, cwd: root, kind: "codex" });
       if (deps.supervisorIo) {
-        void ensureSupervision(deps.supervisorIo, {
+        // Awaited below: a process that exits right after this (a detached
+        // start, a service manager) must not cut the watchdog install short.
+        supervising = ensureSupervision(deps.supervisorIo, {
           platform: deps.platform as NodeJS.Platform,
           home,
           binary: `${home}/.local/bin/suite`,
@@ -361,6 +407,9 @@ export async function runCodex(args: string[], deps: CodexDeps): Promise<number>
     },
     wasRecorded: () => deps.restore !== undefined && loadRoster(deps.restore, home).some((e) => e.session === session),
   });
+  if (supervising !== null) await supervising;
+  if (detach) report({ state: await detectState(session, deps.tmux ?? liveTmuxDeps(sessionEnv), AGENT) });
+  return code;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -471,6 +520,7 @@ export function liveCodexDeps(): CodexDeps {
       return { exitCode, stdout };
     },
     stderr: process.stderr,
+    stdout: process.stdout,
     prompter: ttyPrompter(),
     session,
     restore: liveRestoreDeps(),
