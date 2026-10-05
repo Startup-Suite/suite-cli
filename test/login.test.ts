@@ -371,6 +371,57 @@ describe("LEAK: the real suite login never relays a paste code, and shows a devi
     expect(readdirSync(tmp).filter((n) => n.startsWith("suite-login-"))).toEqual([]);
   }, 20_000);
 
+  test("a cancelled login (SIGTERM) removes the browser shim directory and stops the harness", async () => {
+    const root = temp("cancel");
+    const home = join(root, "home");
+    const bin = join(root, "bin");
+    const rec = join(root, "rec");
+    const tmp = join(home, "tmp");
+    for (const d of [home, bin, rec, tmp]) mkdirSync(d, { recursive: true });
+    // A claude that hands $BROWSER its URL and then waits for a callback that never comes.
+    writeFileSync(
+      join(bin, "claude"),
+      `#!/bin/sh
+if [ "$2" = "status" ]; then echo '{"loggedIn": false}'; exit 1; fi
+echo $$ > '${rec}/pid'
+"$BROWSER" "https://claude.com/cai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A50999%2Fcallback&state=S"
+exec sleep 60
+`,
+    );
+    chmodSync(join(bin, "claude"), 0o755);
+    const proc = Bun.spawn([process.execPath, CLI, "login", "claude", "--json", "--no-browser"], {
+      cwd: home,
+      env: { HOME: home, PATH: `${bin}:/usr/bin:/bin`, TMPDIR: tmp, LANG: "C" },
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    const reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
+    let seen = "";
+    while (!seen.includes("open_url")) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      seen += new TextDecoder().decode(value);
+    }
+    expect(seen).toContain("open_url");
+    // Positive control: while it runs, the shim directory exists.
+    expect(readdirSync(tmp).filter((n) => n.startsWith("suite-login-")).length).toBe(1);
+    proc.kill("SIGTERM");
+    await proc.exited;
+    expect(readdirSync(tmp).filter((n) => n.startsWith("suite-login-"))).toEqual([]);
+    const pid = Number(readFileSync(join(rec, "pid"), "utf8"));
+    let alive = true;
+    for (let i = 0; i < 50 && alive; i++) {
+      try {
+        process.kill(pid, 0);
+        await Bun.sleep(100);
+      } catch {
+        alive = false;
+      }
+    }
+    expect(alive).toBe(false);
+  }, 20_000);
+
   test("codex: the device code appears once, in the stdout event, and nowhere else", async () => {
     const root = temp("codex");
     const home = join(root, "home");

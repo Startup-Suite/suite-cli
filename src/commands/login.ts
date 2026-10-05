@@ -212,7 +212,12 @@ async function loginClaude(deps: LoginDeps, opts: LoginOptions, bin: string, emi
     const proc = deps.spawn([bin, "auth", "login", "--claudeai"], { env });
     // Read for shape only, never forwarded: it holds the paste-code fallback URL.
     proc.onStdout(() => {});
-    deps.onCancel?.(() => proc.kill());
+    // A cancelled login exits without reaching `finally`: stop the harness AND
+    // remove the shim directory here (measured on rock: it was left behind).
+    deps.onCancel?.(() => {
+      proc.kill();
+      shim?.cleanup();
+    });
     const started = deps.now();
     const deadline = started + (deps.timeouts?.loginMs ?? LOGIN_TIMEOUT_MS);
     const browserDeadline = started + (deps.timeouts?.browserWaitMs ?? LOGIN_BROWSER_WAIT_MS);
