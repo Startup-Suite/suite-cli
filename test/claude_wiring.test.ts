@@ -283,6 +283,24 @@ describe("no saved connection: suite claude asks the init questions itself", () 
     expect(adds(fx)).toEqual([]);
     expect(deps.errLines.join("\n")).toContain("not connected to a Suite install");
     expect(deps.errLines.join("\n")).toContain("suite init");
+    expect(deps.errLines.join("\n")).toContain(`suite init\` in ${fx.root}`);
+    expect(deps.execed).toHaveLength(1);
+  });
+
+  test("off a terminal, a record with no saved token says which folder needs its token, and launches unwired", async () => {
+    const fx = machine();
+    writeAgentConnection(fx.env, fx.root, { suiteUrl: SUITE_URL, runtimeId: RUNTIME_ID, headerNames: [] }, { token: "", headers: {} });
+    const prompter = mute();
+    const deps = claudeDeps(fx, prompter, false);
+
+    expect(await runClaude(deps, { userArgs: ["-p", "x"], force: false })).toBe(0);
+
+    expect(prompter.asked).toEqual([]);
+    expect(adds(fx)).toEqual([]);
+    const err = deps.errLines.join("\n");
+    expect(err).toContain(`the Claude MCP entries for ${fx.root} need writing`);
+    expect(err).toContain(`suite init\` in ${fx.root}`);
+    expect(err).not.toContain("this folder");
     expect(deps.execed).toHaveLength(1);
   });
 

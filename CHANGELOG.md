@@ -46,7 +46,12 @@ behaviour anyone was relying on.
   entry. It names the folder and the runtime ids, reads `~/.claude.json`
   directly, never runs `claude mcp get/list`, and writes nothing. Its `install`
   check reads this folder's record.
-- **`suite status` lists every agent folder** with its runtime and install.
+- **`suite status` lists every agent folder** with its runtime and install,
+  from the same inventory as `--json`, so both count the same agents. A folder
+  wired only by its Claude entries is listed as `(unrecorded — run suite init)`.
+- **An unwired `suite claude` names the folder** it could not connect, and
+  where to run `suite init`; so do the `suite codex` and `suite deepseek`
+  refusals.
   **`suite status --json [--dir PATH]`** prints one document,
   `contract_version` 1, with `connection`, `legacy_connection` and an `agents`
   row per agent (`session`, `kind`, `root`, `runtime_id`, `suite_url`, `state`,

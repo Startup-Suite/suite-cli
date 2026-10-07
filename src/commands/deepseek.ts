@@ -454,8 +454,8 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   if (config === null || config.suiteUrl === "" || config.runtimeId === "") {
     deps.stderr.write(
       explicitRoot === undefined
-        ? "suite: this machine is not connected to Suite yet, and there is no terminal to ask in.\n" +
-            "suite: run `suite init` (or this command from a terminal, which asks for the connection),\n" +
+        ? `suite: ${agentDir} is not connected to Suite yet, and there is no terminal to ask in.\n` +
+            `suite: run \`suite init --dir ${agentDir}\` (or this command from a terminal, which asks for the connection),\n` +
             `suite: or run this from an agent folder that has its own ${AGENT_CONFIG_FILE} (or pass --root).\n`
         : `suite: no Suite config found. Run \`suite init\`, or put one at ${join(explicitRoot, AGENT_CONFIG_FILE)}\n`,
     );
@@ -475,7 +475,7 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
     config = await ensureToken({ env: process.env, prompter, store, out: say }, connDir, config);
   }
   if (store.get(TOKEN_KEY) === undefined) {
-    deps.stderr.write("suite: no runtime token found. Run `suite init` to capture one.\n");
+    deps.stderr.write(`suite: no runtime token found for ${connDir}. Run \`suite init --dir ${connDir}\` to capture one.\n`);
     return 1;
   }
 

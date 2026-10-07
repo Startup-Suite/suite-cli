@@ -285,6 +285,12 @@ describe("migration from the 0.7.0 single machine connection", () => {
     expect(inB.code).toBe(0);
     expect(addsShown(bx)).toEqual([]);
     expect(inB.err.join("\n")).toContain("suite init");
+    // b/ (no record, no entries, nobody to ask) names ITS folder, as a/ does:
+    // on a machine of several agents "this folder" identifies none of them.
+    // Both lines: what is wrong, and where to run `suite init`.
+    expect(inB.err.find((l) => l.includes("not connected to a Suite install"))).toContain(bx.b);
+    expect(inB.err.find((l) => l.includes("suite init"))).toContain(`suite init\` in ${bx.b}`);
+    expect(inB.err.join("\n")).not.toContain("this folder");
 
     // I4: the legacy files are never written or deleted, and ~/.claude.json is untouched.
     expect([sha(legacyConfig), sha(legacyCreds), sha(claudeJson(bx))]).toEqual(hashes);

@@ -33,7 +33,7 @@ import {
   type InitOptions,
 } from "../src/commands/init.ts";
 import { runRestore, type RestoreDeps } from "../src/commands/restore.ts";
-import { connectionsOf, runStatus, type StatusDeps } from "../src/commands/status.ts";
+import { connectionsOf, liveStatusJsonInput, runStatus, statusDocument, type StatusDeps } from "../src/commands/status.ts";
 import { runWatch, runtimeIdResolver, type WatchDeps } from "../src/commands/watch.ts";
 import { ensureConnection } from "../src/connection.ts";
 import { emptyConfig, serializeConfig } from "../src/config.ts";
@@ -598,6 +598,46 @@ describe("status lists every agent folder", () => {
     expect(lines.filter((l) => l.includes(L.runtime))).toHaveLength(1);
     expect(lines.join("\n")).not.toContain("not federated");
     expect(connectionsOf(bx.fx.env).records).toEqual([]);
+  });
+
+  test("human status and status --json count the same agents, an entries-only folder included", async () => {
+    // The reviewer's case 2 shape (measured at 186b081: human `agents 0`,
+    // JSON one unrecorded row): a/ has Claude entries and no record, b/ is
+    // recorded, and a legacy connection names neither.
+    const { A, B } = agents();
+    const bx = box();
+    await initIn(bx, bx.b, B);
+    const L: Agent = { url: "https://legacy.example.invalid", runtime: "rt-legacy-0000", token: canary("tokL") };
+    seedLegacy(bx, L);
+    const raw = existsSync(claudeJson(bx)) ? (JSON.parse(readFileSync(claudeJson(bx), "utf8")) as { projects?: Record<string, unknown> }) : {};
+    const projects = { ...(raw.projects ?? {}) };
+    projects[bx.a] = {
+      mcpServers: {
+        [CHANNEL_SERVER]: { command: "bun", args: [], env: { SUITE_RUNTIME_ID: A.runtime, SUITE_URL: "wss://one.example.invalid/runtime/ws", SUITE_TOKEN: A.token } },
+        [TOOLS_SERVER]: { type: "http", url: `${A.url}/mcp`, headers: { Authorization: `Bearer ${A.token}` } },
+      },
+    };
+    writeFileSync(claudeJson(bx), JSON.stringify({ ...raw, projects }), { mode: 0o600 });
+
+    const lines: string[] = [];
+    await runStatus(statusDeps(bx, lines), 1_800_000_000);
+    const tmux = { env: {}, which: () => null, run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) };
+    const doc = await statusDocument(liveStatusJsonInput(bx.fx.env, bx.a, tmux));
+
+    // Positive control: the JSON view does list the entries-only folder.
+    expect(doc.agents.map((r) => r.root).sort()).toEqual([bx.a, bx.b].sort());
+    const human = lines.join("\n");
+    expect(human).toMatch(new RegExp(`agents\\s+${doc.agents.length}\\b`));
+    for (const r of doc.agents) {
+      const line = lines.find((l) => l.includes(r.root)) ?? "";
+      expect(line).toContain(r.runtime_id ?? "no runtime id");
+      if (r.recorded) expect(line).not.toContain("unrecorded");
+      else expect(line).toContain("(unrecorded — run suite init)");
+    }
+    // Neither view gives the legacy runtime to a folder, and no token is printed.
+    expect(doc.agents.some((r) => r.runtime_id === L.runtime)).toBe(false);
+    expect(lines.filter((l) => l.includes(L.runtime))).toHaveLength(1);
+    for (const t of [A.token, B.token, L.token]) expect(scanTexts({ text: human }, t)).toEqual([]);
   });
 
   test("nothing at all is 'not federated'", async () => {

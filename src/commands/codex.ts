@@ -248,7 +248,7 @@ export async function runCodex(args: string[], deps: CodexDeps): Promise<number>
   if (!hasConnection(config)) {
     deps.stderr.write(
       `suite codex: ${agentDir} is not connected to Suite yet, and there is no terminal to ask in.\n` +
-        "suite codex: run `suite init` in this folder, or this command from a terminal.\n",
+        `suite codex: run \`suite init --dir ${agentDir}\`, or this command from a terminal.\n`,
     );
     return 1;
   }

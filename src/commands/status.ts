@@ -5,9 +5,10 @@
  * that tells you what is wrong and how to fix it, and duplicating its
  * remediation here would give two places to keep true.
  *
- *  1. WHICH AGENTS ARE FEDERATED, AS WHICH RUNTIME. One line per agent folder
- *     record (src/agent_connections.ts): folder, runtime id, suite URL —
- *     NEVER the token. A 0.7.0 machine-level connection is reported as
+ *  1. WHICH AGENTS ARE FEDERATED, AS WHICH RUNTIME. One line per agent in
+ *     the inventory (src/agent_inventory.ts — the rows `status --json` emits):
+ *     folder, runtime id, suite URL, and a marker for a folder with no record
+ *     (src/agent_connections.ts) — NEVER the token. A 0.7.0 machine-level connection is reported as
  *     `legacy`, assigned to no folder, because it identifies none. The id is what Suite shows in its own UI, so it is the
  *     value that lets a human match this machine to a row on a screen; the
  *     token identifies nothing to a human and printing it puts a credential in
@@ -70,6 +71,13 @@ export interface StatusDeps extends DoctorDeps {
    * reads both from `env` (see {@link connectionsOf}). Never the token.
    */
   connections?(): StatusConnections;
+  /**
+   * Everything the agent inventory reads (src/agent_inventory.ts), the SAME
+   * source `status --json` lists its agents from. Optional: absent, it is the
+   * live one ({@link liveInventorySource}) — or, when `connections` is
+   * injected, those records and this roster with no Claude entries.
+   */
+  inventorySource?(): InventorySource;
 }
 
 export interface StatusConnections {
@@ -94,9 +102,48 @@ export function connectionsOf(env: Record<string, string | undefined>): StatusCo
   return { records, legacy };
 }
 
-/** One federated agent folder: its folder, runtime and install. Never a token. */
-export function connectionLine(record: AgentConnection["record"]): string {
-  return row("", record.dir, `${record.runtimeId}  ${record.suiteUrl}`);
+/**
+ * One agent row from the inventory, as a human reads it: folder, runtime,
+ * install, and why it is not plainly a recorded folder. The rows are the SAME
+ * ones `status --json` emits as `agents[]`. A stamped row is not printed here:
+ * the stamped section lists it, once, with its session state and verdict.
+ * Never a token: an inventory row holds none.
+ */
+export function agentIdentityLine(r: InventoryRow): string {
+  const marks: string[] = [];
+  if (!r.recorded) marks.push("(unrecorded — run suite init)");
+  if (r.wiring === "cross_wired") marks.push("(cross-wired — run suite doctor)");
+  const detail = [r.runtime_id ?? "no runtime id", r.suite_url ?? "", ...marks].filter((p) => p !== "").join("  ");
+  return row("", r.root, detail);
+}
+
+/** The inventory rows `suite status` lists, from the same source and function as `status --json`. */
+export async function statusInventory(
+  deps: StatusDeps,
+  records: AgentConnection[],
+  roster: RosterEntry[],
+): Promise<InventoryRow[]> {
+  // Records and roster alone, no Claude entries: what status can say when
+  // nothing else is readable. Status never throws on an unreadable machine.
+  const bare: InventorySource = {
+    records,
+    roster,
+    claudeJson: { projects: {}, userScope: [] },
+    sessionNaming: "cwd",
+    readFile: deps.readFile ?? (() => null),
+  };
+  let src: InventorySource = bare;
+  try {
+    if (deps.inventorySource !== undefined) src = deps.inventorySource();
+    // The live machine, but this status's own roster read (deps.home), so the
+    // stamped section below and these rows describe one roster.
+    else if (deps.connections === undefined) src = { ...liveInventorySource(deps.env), records, roster };
+  } catch {
+    src = bare;
+  }
+  // A human line shows no session state, so none is probed: tmux is not asked
+  // anything twice, and the row SET does not depend on state.
+  return inventoryRows(src, async () => "none");
 }
 
 /** The 0.7.0 machine connection, said to belong to no folder. */
@@ -253,19 +300,35 @@ export async function runStatus(deps: StatusDeps, now: number = Math.floor(Date.
   const roster = readRoster(deps);
   say("");
 
-  // 1. Federation identity, per agent folder. The token is not read, let alone printed.
-  if (records.length === 0 && legacy === null) {
+  // 1. Federation identity, per agent: the agent inventory's rows, the same
+  // ones `status --json` emits, so a folder wired only by its Claude entries
+  // (no record) is counted here too, marked unrecorded. The token is not read,
+  // let alone printed.
+  const agents = await statusInventory(deps, records, roster);
+  if (agents.length === 0 && legacy === null) {
     say(row("agents", "not federated", "no agent folder has a saved connection"));
     say("");
     say("suite init");
-    // A stamped agent carries its own identity in its root, so it is listed
-    // even on a box that `suite init` never federated.
     await sayAgents(deps, roster, options);
     return 1;
   }
-  say(row("agents", String(records.length)));
-  for (const c of records) say(connectionLine(c.record));
+  // Every inventory row is counted; a stamped one is listed under `stamped`
+  // (section 4) rather than twice, so lines here + stamped lines = the count.
+  const isStamped = (a: InventoryRow): boolean => a.kind !== null && STAMPED_KINDS.includes(a.kind);
+  const stampedCount = agents.filter(isStamped).length;
+  say(row("agents", String(agents.length), stampedCount === 0 ? "" : `${stampedCount} stamped, listed under stamped`));
+  for (const a of agents) if (!isStamped(a)) say(agentIdentityLine(a));
   if (legacy !== null) say(legacyLine(legacy));
+  if (records.length === 0 && legacy === null) {
+    // Agents, but none with a saved connection: unfederated as before. A
+    // stamped agent carries its own identity in its root, so it is listed
+    // even on a box that `suite init` never federated.
+    say(row("", "not federated", "no agent folder has a saved connection"));
+    say("");
+    say("suite init");
+    await sayAgents(deps, roster, options);
+    return 1;
+  }
 
   // 2. The channel, health-checked.
   const claudePath = deps.which("claude");

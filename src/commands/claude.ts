@@ -869,9 +869,12 @@ export type WireDeps = Pick<ClaudeDeps, "env" | "cwd" | "prompter" | "store" | "
 
 export async function wireClaude(deps: WireDeps, wiring: WiringIo): Promise<SuiteConfig | number> {
   const io = { env: deps.env, prompter: deps.prompter, store: deps.store, out: deps.err };
+  // Every unwired launch names the folder: several agents share a machine, and
+  // a warning that says only "this folder" cannot be told apart in a log that
+  // restore or a supervisor wrote for all of them.
   const unwired = (why: string): SuiteConfig => {
     deps.err(`suite: ${why}; starting Claude Code without Suite wiring.`);
-    deps.err("suite: run `suite init` in this folder, or `suite claude` from a terminal, to connect it.");
+    deps.err(`suite: run \`suite init\` in ${deps.cwd}, or \`suite claude\` from a terminal there, to connect it.`);
     return deps.config;
   };
   try {
@@ -888,13 +891,13 @@ export async function wireClaude(deps: WireDeps, wiring: WiringIo): Promise<Suit
       if (entries === null || entries[CHANNEL_SERVER] !== undefined || entries[TOOLS_SERVER] !== undefined) {
         // (b)
         deps.err(
-          `suite: no saved connection for ${deps.cwd}; its Claude entries were left as they are. Run suite init in this folder`,
+          `suite: no saved connection for ${deps.cwd}; its Claude entries were left as they are. Run suite init in ${deps.cwd}`,
         );
         return deps.config;
       }
       // (d)
       if (!wiring.canPrompt) {
-        return unwired("this folder is not connected to a Suite install and there is no terminal to ask in");
+        return unwired(`${deps.cwd} is not connected to a Suite install and there is no terminal to ask in`);
       }
       // (c)
       const ensured = await ensureConnection(io, deps.cwd);
@@ -905,7 +908,7 @@ export async function wireClaude(deps: WireDeps, wiring: WiringIo): Promise<Suit
     // only for a folder whose record has none — never on a wired folder.
     const plan = planMcp({ env: deps.env, cwd: deps.cwd, store: deps.store }, config, defaultCheckout(deps.env));
     if (needsRegistration(plan) && plan.want.tokenLiteral === null) {
-      if (!wiring.canPrompt) return unwired("the Claude MCP entries need writing and no token is saved for this folder");
+      if (!wiring.canPrompt) return unwired(`the Claude MCP entries for ${deps.cwd} need writing and no token is saved for it`);
       config = await ensureToken(io, dir, config);
     }
     await ensureClaudeWiring(
