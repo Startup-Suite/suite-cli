@@ -12,7 +12,18 @@ import { liveDeps, runInit } from "./commands/init.ts";
 import { liveClaudeDeps, restoreWirer, runClaude } from "./commands/claude.ts";
 import { liveDoctorDeps, runDoctor } from "./commands/doctor.ts";
 import { hostname } from "node:os";
-import { liveStatusDeps, runStatus } from "./commands/status.ts";
+import {
+  legacyLine,
+  liveStatusDeps,
+  liveStatusJsonInput,
+  parseStatusArgs,
+  renderStatusDocument,
+  runStatus,
+  statusDocument,
+} from "./commands/status.ts";
+import { divertStdout } from "./stamp_result.ts";
+import { liveTmuxDeps } from "./tmux.ts";
+import { resolve as resolvePath } from "node:path";
 import {
   forceRecover,
   liveWatchDeps,
@@ -163,7 +174,8 @@ export function usage(): string {
     row("openclaw", "stamp an OpenClaw agent root and run its gateway (--stamp-only: JSON contract)"),
     row("codex", "run a Codex agent through codex app-server, federated into Suite, in a persistent session"),
     row("doctor", "diagnose a broken setup"),
-    row("status", "show federation, session state and stamped agents (kind, root, live/stale, last verdict)"),
+    row("status", "show every agent folder, session state and stamped agents (kind, root, live/stale, last verdict)"),
+    row("", "--json [--dir PATH]: one JSON document on stdout (see README, Status contract)"),
     row("watch", "recover halted agent sessions (--dry-run, --once, --interval N, --force SESSION)"),
     row("restore", "bring recorded agents back up (--adopt, --dry-run, --forget NAME)"),
     row("update", "install the latest suite CLI"),
@@ -322,6 +334,19 @@ export async function run(argv: string[]): Promise<number> {
   }
   if (verb === "update") return runUpdate(liveUpdateDeps());
   if (verb === "doctor") return runDoctor(await liveDoctorDeps());
+  const statusArgs = parseStatusArgs(argv.slice(1));
+  if (statusArgs.json) {
+    // ONE document on stdout; every other write is diverted to stderr.
+    return divertStdout(async (io) => {
+      const dir = resolvePath(process.cwd(), statusArgs.dir ?? ".");
+      const input = liveStatusJsonInput(process.env, dir, liveTmuxDeps(process.env));
+      const doc = await statusDocument(input);
+      io.stdout(renderStatusDocument(doc));
+      io.stderr(`suite status: ${doc.agents.length} agents\n`);
+      if (input.legacy !== null) io.stderr(`${legacyLine(input.legacy)}\n`);
+      return 0;
+    });
+  }
   return runStatus(await liveStatusDeps());
 }
 

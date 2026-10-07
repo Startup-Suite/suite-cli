@@ -10,6 +10,52 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.7.1
+
+- **The connection is per agent folder, not per machine.** Through 0.7.0,
+  `suite init` saved ONE connection per machine, so `suite init` in a second
+  agent folder silently re-pointed the first: the next `suite claude` there
+  treated its own MCP entries as stale and rewrote them with the other agent's
+  runtime, URL and token. Now `suite init` saves the connection for one folder
+  (the working directory, or `--dir PATH`) under
+  `~/.config/suite/agents/<key>.json` plus a 0600 `.credentials.json`, outside
+  the folder. `suite init` in folder B cannot change folder A's bytes.
+- **The legacy machine connection is assigned to no folder.** A 0.7.0
+  `config.json` / `credentials.json` connection is still read and reported
+  (`suite status` prints it as `legacy`), but it is never written, deleted or
+  used to identify or wire a folder. **Re-run `suite init` (or
+  `suite init --from-mcp-json`) in each agent folder after upgrading.** Until
+  then, `suite claude` in a folder that has Claude entries and no record
+  leaves the entries as they are, registers nothing and says so; in a folder
+  with neither, it asks the init questions when it has a terminal.
+- **Existing entries are repaired when the agent is next started, not by
+  `init`.** `suite init --from-mcp-json` alone does not rewrite a folder's local
+  Claude entries; `suite init` never runs `claude`. Once a folder has a record,
+  the next `suite claude` there, or the next `suite restore` that starts that
+  folder's agent, compares the entries with the record and rewrites the ones
+  that differ. `suite restore` now does that before replaying each `claude`
+  roster entry. It skips an agent whose session is already live, and does not
+  rewire it.
+- **`suite init --from-mcp-json`** adopts the folder's own `.mcp.json`, so no
+  token passes through an argv, a shell or a terminal. It refuses, naming fields
+  and never values, when the entries are missing, name different hosts, or carry
+  different tokens.
+- **`suite doctor` has an `agents` check.** It fails on any cross-wired agent
+  folder on the machine, where the record, the local Claude entry and
+  `.mcp.json` name different runtimes or hosts, and on any user-scope Suite
+  entry. It names the folder and the runtime ids, reads `~/.claude.json`
+  directly, never runs `claude mcp get/list`, and writes nothing. Its `install`
+  check reads this folder's record.
+- **`suite status` lists every agent folder** with its runtime and install.
+  **`suite status --json [--dir PATH]`** prints one document,
+  `contract_version` 1, with `connection`, `legacy_connection` and an `agents`
+  row per agent (`session`, `kind`, `root`, `runtime_id`, `suite_url`, `state`,
+  `channel`, `verdict`, `recorded`, `wiring`). No token value or token field
+  appears, and no row takes its runtime id from the legacy connection. See the
+  README's status contract.
+- **`suite watch` telemetry events carry `runtime_id`** from the event's folder
+  record, or null.
+
 ## 0.7.0
 
 - **`suite codex`: a Codex agent in Suite, through `codex app-server`.** It
