@@ -35,7 +35,8 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { readConfig, type SuiteConfig } from "../config.ts";
+import type { SuiteConfig } from "../config.ts";
+import { agentConfig, readAgentConnection } from "../agent_connections.ts";
 import { createStore, TOKEN_KEY, assertNoSecretsInArgv, ttyPrompter, type Prompter } from "../secrets.ts";
 import { ensureConnection, ensureToken, hasConnection } from "../connection.ts";
 import { harnessChildEnv } from "../harness_env.ts";
@@ -231,23 +232,30 @@ export async function runCodex(args: string[], deps: CodexDeps): Promise<number>
 
   // The connection: the one `suite init` saved, or the init questions asked
   // right here from a terminal — the same as `suite claude`.
-  let config = await readConfig({ env: deps.env });
+  // THIS AGENT FOLDER's connection (the --root, else the cwd), never the
+  // machine-level one: see src/agent_connections.ts.
+  const agentDir = opts.root ?? deps.cwd();
+  const found = readAgentConnection(deps.env, agentDir).connection;
+  let config: SuiteConfig | null = found === null ? null : agentConfig(deps.env, found.record);
+  let connDir = found?.record.dir ?? agentDir;
   const interactive = deps.prompter !== undefined && deps.isTTY();
   const say = (line: string) => deps.stderr.write(`${line}\n`);
   if (!hasConnection(config) && interactive) {
-    config = (await ensureConnection({ env: deps.env, prompter: deps.prompter as Prompter, store: createStore(), out: say })).config;
+    const ensured = await ensureConnection({ env: deps.env, prompter: deps.prompter as Prompter, store: createStore(), out: say }, agentDir);
+    config = ensured.config;
+    connDir = ensured.dir;
   }
   if (!hasConnection(config)) {
     deps.stderr.write(
-      "suite codex: this machine is not connected to Suite yet, and there is no terminal to ask in.\n" +
-        "suite codex: run `suite init`, or this command from a terminal.\n",
+      `suite codex: ${agentDir} is not connected to Suite yet, and there is no terminal to ask in.\n` +
+        `suite codex: run \`suite init --dir ${agentDir}\`, or this command from a terminal.\n`,
     );
     return 1;
   }
   const store = createStore();
-  for (const [k, v] of Object.entries(await loadCredentials(config, {} as DeepseekDeps))) store.set(k, v);
+  for (const [k, v] of Object.entries(await loadCredentials(config, {} as DeepseekDeps, connDir, deps.env))) store.set(k, v);
   if (store.get(TOKEN_KEY) === undefined && interactive) {
-    config = await ensureToken({ env: deps.env, prompter: deps.prompter as Prompter, store, out: say }, config);
+    config = await ensureToken({ env: deps.env, prompter: deps.prompter as Prompter, store, out: say }, connDir, config);
   }
   const token = store.get(TOKEN_KEY);
   if (token === undefined) {

@@ -36,6 +36,7 @@ import {
   type ProbeRequest,
   type ProbeResult,
 } from "../src/commands/doctor.ts";
+import type { InventorySource } from "../src/agent_inventory.ts";
 import { CHANNEL_SERVER, TOOLS_SERVER } from "../src/commands/init.ts";
 import { emptyConfig, type SuiteConfig } from "../src/config.ts";
 import { killSessionArgv, liveTmuxDeps, newSessionArgv, sessionNameFor } from "../src/tmux.ts";
@@ -100,6 +101,27 @@ interface FakeOptions {
   config?: SuiteConfig | null;
   color?: boolean;
   utf8?: boolean;
+  /** The agent inventory doctor's `agents` check reads. Default: one folder, wired as itself. */
+  inventory?: () => InventorySource;
+}
+
+/** A healthy inventory: the session folder recorded, its entries naming the same runtime and host. */
+function healthyInventory(): InventorySource {
+  return {
+    records: [
+      {
+        record: { dir: SESSION_CWD, suiteUrl: SUITE_URL, runtimeId: "fixture-runtime", headerNames: [] },
+        path: "/fixture/home/.config/suite/agents/example-ledger-0000000000000000.json",
+      },
+    ],
+    roster: [],
+    claudeJson: {
+      projects: { [SESSION_CWD]: { runtimeId: "fixture-runtime", channelUrl: null, toolsUrl: `${SUITE_URL}/mcp` } },
+      userScope: [],
+    },
+    sessionNaming: "cwd",
+    readFile: () => null,
+  };
 }
 
 const PLUGIN_PATH = "/opt/example/claude-code-suite-channel/src/index.ts";
@@ -225,6 +247,7 @@ function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[]; ar
     exists: options.exists ?? (() => true),
     config: options.config === undefined ? config() : options.config,
     configFile: "/fixture/home/.config/suite/config.json",
+    inventory: options.inventory ?? healthyInventory,
     tmux: { env: {}, which: (name) => (has(name) ? `/fixture/bin/${name}` : null), run },
     probe:
       options.probe ??
@@ -258,20 +281,21 @@ async function report(options: FakeOptions = {}): Promise<{ text: string; code: 
 /* ------------------------------------------------------------------------- */
 
 describe("an all-healthy machine", () => {
-  test("passes all eleven checks and exits 0", async () => {
+  test("passes all twelve checks and exits 0", async () => {
     const { text, code, checks } = await report();
-    expect(checks).toHaveLength(11);
-    expect(checks.filter((c) => c.status === "pass")).toHaveLength(11);
+    expect(checks).toHaveLength(12);
+    expect(checks.filter((c) => c.status === "pass")).toHaveLength(12);
     expect(code).toBe(0);
-    expect(text).toContain("11 checks passed.");
+    expect(text).toContain("12 checks passed.");
     expect(text).not.toContain("✘");
     expect(text).not.toContain("⋯");
   });
 
-  test("the eleven checks are listed in dependency order: install connection, then the claude harness", async () => {
+  test("the twelve checks are listed in dependency order: install connection, then the claude harness", async () => {
     const { checks, text } = await report();
     expect(checks.map((c) => c.id)).toEqual([
       "install",
+      "agents",
       "tmux",
       "claude",
       "auth",
@@ -477,7 +501,7 @@ describe("a broken upstream check skips its dependants rather than reddening the
     expect(text).toContain("skipped — needs a working plugin path");
     // Exactly one failure, not a wall of red pointing at one real cause.
     expect(checks.filter((c) => c.status === "fail")).toHaveLength(1);
-    expect(text).toContain("1 of 11 failed.");
+    expect(text).toContain("1 of 12 failed.");
   });
 
   test("no claude at all skips everything that needs it, and still exits 1", async () => {
@@ -489,7 +513,7 @@ describe("a broken upstream check skips its dependants rather than reddening the
       ),
     ).toEqual(["skip", "skip", "skip", "skip", "skip", "skip"]);
     expect(code).toBe(1);
-    expect(text).toContain("1 of 11 failed.");
+    expect(text).toContain("1 of 12 failed.");
   });
 });
 
@@ -573,7 +597,7 @@ describe("the report obeys the design rules", () => {
   test("(d) the closing line is a count and an instruction, not a paragraph", async () => {
     const { text } = await report({ auth: APIKEY_AUTH, exists: () => false });
     const last = text.trimEnd().split("\n").pop() ?? "";
-    expect(last).toContain("2 of 11 failed.");
+    expect(last).toContain("2 of 12 failed.");
     expect(last).toContain("Fix the first one, run suite doctor again.");
     expect(last.split(".").filter((s) => s.trim() !== "")).toHaveLength(2);
   });

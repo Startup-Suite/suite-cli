@@ -39,15 +39,25 @@
  * `suite init --repair` was never shipped: rule (b) says a `→` must be
  * runnable, and `suite claude` is now the non-interactive repair it wanted.)
  */
-import { statSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { resolve } from "node:path";
-import { emptyConfig, readConfig, type SuiteConfig } from "../config.ts";
-import { configPath } from "../paths.ts";
-import { readCredentials } from "../connection.ts";
+import { emptyConfig, type SuiteConfig } from "../config.ts";
+import {
+  agentConfig,
+  agentConfigPath,
+  canonicalDir,
+  listAgentConnections,
+  readAgentConnection,
+  readAgentSecrets,
+} from "../agent_connections.ts";
+import { claimsPhrase, inventoryRows, parseClaudeJson, type InventoryRow, type InventorySource } from "../agent_inventory.ts";
+import { projectKeys } from "../claude_wiring.ts";
+import { parseRoster, rosterPath } from "../roster.ts";
 import {
   CHANNEL_SERVER,
   PENDING_APPROVAL_REMEDY,
   TOOLS_SERVER,
+  claudeJsonPath,
   parseServerStatus,
   whichBin,
   type ServerStatus,
@@ -113,6 +123,7 @@ export type CheckResult = Pass | Failure | Skipped;
 
 export const CHECK_IDS = [
   "install",
+  "agents",
   "tmux",
   "claude",
   "auth",
@@ -137,7 +148,7 @@ export type CheckId = (typeof CHECK_IDS)[number];
 export type CheckGroup = "install connection" | "claude harness";
 
 export function groupOf(id: string): CheckGroup {
-  return id === "install" || id === "tmux" ? "install connection" : "claude harness";
+  return id === "install" || id === "agents" || id === "tmux" ? "install connection" : "claude harness";
 }
 
 /* ------------------------------------------------------------------------- */
@@ -661,6 +672,12 @@ export interface DoctorDeps {
    * known", and the install check then says nothing about the token.
    */
   tokenSaved?: boolean;
+  /**
+   * Every agent folder on this machine, ALREADY READ (records, roster,
+   * ~/.claude.json reduced to identity — see agent_inventory.ts). Optional:
+   * absent, the `agents` check is skipped rather than guessed.
+   */
+  inventory?(): InventorySource;
   tmux: TmuxDeps;
   color: boolean;
   utf8: boolean;
@@ -687,6 +704,9 @@ export async function runChecks(deps: DoctorDeps): Promise<CheckResult[]> {
 
   // 0. The install connection: harness-neutral, set up by `suite init` ---
   checks.push(installCheck(deps));
+
+  // 0a. Every agent folder on the machine is wired as itself -------------
+  checks.push(await agentsCheck(deps));
 
   // 0b. tmux — every harness's sessions need it -----------------------
   const tmuxPath = deps.which(TMUX);
@@ -836,8 +856,8 @@ function installCheck(deps: DoctorDeps): CheckResult {
       value: "not connected",
       detail: deps.configFile,
       consequence: [
-        "No harness on this machine knows which Suite to join or as which runtime,",
-        "so every agent here starts unfederated.",
+        "This folder has no saved connection, so no harness started here knows which",
+        "Suite to join or as which runtime. Connections are per agent folder.",
       ],
       remedy: "suite init",
     };
@@ -856,6 +876,126 @@ function installCheck(deps: DoctorDeps): CheckResult {
     status: "pass",
     value: config.runtimeId,
     detail: [config.suiteUrl, token].filter((x) => x !== "").join(" · "),
+  };
+}
+
+/**
+ * IS EVERY AGENT FOLDER ON THIS MACHINE WIRED AS ITSELF?
+ *
+ * The failure this exists for is silent: folder A's Claude entries name folder
+ * B's runtime, so A joins Suite as B — B's tasks land in A, and B's own socket
+ * is refused as a duplicate. Every surface A can see reports healthy.
+ *
+ * For every folder in union(saved records, ~/.claude.json projects with Suite
+ * entries, roster cwds) it compares the runtime id and Suite host named by the
+ * folder's record, its local Claude entry and its own `.mcp.json`; any
+ * disagreement is `cross-wired`, naming the folder and the ids (ids are not
+ * secrets). It ALSO fails on a USER-scope Suite entry, because that one applies
+ * to every folder that has no local entry of its own.
+ *
+ * READ-ONLY. It reads ~/.claude.json directly, as claude_wiring.ts localEntries
+ * does, and NEVER runs `claude mcp get/list` — those health-check a stdio
+ * server by STARTING it, which joins Suite as that runtime a second time. It
+ * writes nothing and stamps nothing: the remedy is a command for a human.
+ */
+async function agentsCheck(deps: DoctorDeps): Promise<CheckResult> {
+  const id = "agents";
+  const label = "agents";
+  if (deps.inventory === undefined) return { id, label, status: "skip", reason: "agent folders not read" };
+  let source: InventorySource;
+  try {
+    source = deps.inventory();
+  } catch {
+    return { id, label, status: "skip", reason: "agent folders could not be read" };
+  }
+  // State is not this check's question, and tmux is not needed to answer it.
+  const rows = await inventoryRows(source, async () => "none");
+  return agentsVerdict(rows, source.claudeJson?.userScope ?? [], source.claudeJson === null);
+}
+
+/** The `agents` verdict from inventory rows. Pure; exported for the tests. */
+export function agentsVerdict(
+  rows: InventoryRow[],
+  userScope: Array<{ name: string; runtimeId: string | null }>,
+  claudeJsonUnreadable: boolean,
+): CheckResult {
+  const id = "agents";
+  const label = "agents";
+  const folders = new Map<string, InventoryRow>();
+  for (const r of rows) if (!folders.has(r.root)) folders.set(r.root, r);
+  const crossed = [...folders.values()].filter((r) => r.wiring === "cross_wired");
+  const userLines = userScope.map(
+    (u) => `user-scope ${u.name}${u.runtimeId === null ? "" : ` names ${u.runtimeId}`}: applies to every folder without its own entries`,
+  );
+
+  if (crossed.length > 0) {
+    const first = crossed[0] as InventoryRow;
+    const hasMcpJson = first.claims.some((c) => c.source === ".mcp.json");
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "cross-wired",
+      detail: crossed.map((r) => r.root).join(", "),
+      consequence: [
+        ...crossed.map((r) => `${r.root}: ${claimsPhrase(r.claims)}`),
+        ...userLines,
+        "A cross-wired folder joins Suite as another agent's runtime: that agent's work lands here and its own socket is refused.",
+      ],
+      remedy: `cd ${first.root} && ${hasMcpJson ? "suite init --from-mcp-json" : "suite init"}`,
+    };
+  }
+  if (userScope.length > 0) {
+    return {
+      id,
+      label,
+      status: "fail",
+      value: "user-scope entry",
+      detail: userScope.map((u) => u.name).join(", "),
+      consequence: [
+        ...userLines,
+        "Run suite init in each agent folder first (suite status lists them), then remove the user-scope entries.",
+      ],
+      remedy: userScope.map((u) => `claude mcp remove ${u.name} -s user`).join(" && "),
+    };
+  }
+  if (claudeJsonUnreadable) return { id, label, status: "skip", reason: "~/.claude.json could not be read" };
+  const recorded = [...folders.values()].filter((r) => r.recorded).length;
+  return {
+    id,
+    label,
+    status: "pass",
+    value: folders.size === 0 ? "none on this machine" : "each wired as itself",
+    detail: folders.size === 0 ? "" : `${folders.size} folders, ${recorded} recorded`,
+  };
+}
+
+/**
+ * The agent inventory as this machine has it, read from disk. Never a token:
+ * ~/.claude.json and `.mcp.json` are reduced to runtime ids and hosts on read.
+ */
+export function liveInventorySource(env: Record<string, string | undefined>): InventorySource {
+  const read = (path: string): string | null => {
+    try {
+      return readFileSync(path, "utf8");
+    } catch {
+      return null;
+    }
+  };
+  const home = env.HOME ?? "";
+  const rosterText = home === "" ? null : read(rosterPath(home));
+  const claudePath = claudeJsonPath(env);
+  const claudeText = read(claudePath);
+  const claudeJson =
+    claudeText === null ? (existsSync(claudePath) ? null : { projects: {}, userScope: [] }) : parseClaudeJson(claudeText);
+  return {
+    records: listAgentConnections(env),
+    roster: rosterText === null ? [] : parseRoster(rosterText),
+    claudeJson,
+    sessionNaming: agentConfig(env, null).sessionNaming,
+    readFile: read,
+    canon: canonicalDir,
+    keysFor: (dir) => projectKeys(dir),
   };
 }
 
@@ -1403,16 +1543,20 @@ export async function runDoctor(deps: DoctorDeps): Promise<number> {
 
 export async function liveDoctorDeps(
   env: Record<string, string | undefined> = process.env,
+  cwd: string = process.cwd(),
 ): Promise<DoctorDeps> {
   const tmux = liveTmuxDeps(env);
+  // THIS folder's record: identity never comes from the legacy machine connection.
+  const own = readAgentConnection(env, cwd).connection;
   return {
     env,
-    cwd: process.cwd(),
+    cwd,
     which: (name) => whichBin(name, env),
     exists: pathResolves,
-    config: await readConfig({ env }),
-    configFile: configPath(env),
-    tokenSaved: (readCredentials(env)?.token ?? "") !== "",
+    config: agentConfig(env, own?.record ?? null),
+    configFile: own?.path ?? agentConfigPath(env, cwd),
+    tokenSaved: own === null ? false : (readAgentSecrets(env, own.record.dir)?.token ?? "") !== "",
+    inventory: () => liveInventorySource(env),
     tmux,
     color: colorEnabled(env),
     utf8: utf8Enabled(env),

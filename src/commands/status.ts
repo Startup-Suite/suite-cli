@@ -5,8 +5,11 @@
  * that tells you what is wrong and how to fix it, and duplicating its
  * remediation here would give two places to keep true.
  *
- *  1. WHICH RUNTIME IS THIS BOX FEDERATED AS. The runtime id, from config —
- *     NEVER the token. The id is what Suite shows in its own UI, so it is the
+ *  1. WHICH AGENTS ARE FEDERATED, AS WHICH RUNTIME. One line per agent in
+ *     the inventory (src/agent_inventory.ts — the rows `status --json` emits):
+ *     folder, runtime id, suite URL, and a marker for a folder with no record
+ *     (src/agent_connections.ts) — NEVER the token. A 0.7.0 machine-level connection is reported as
+ *     `legacy`, assigned to no folder, because it identifies none. The id is what Suite shows in its own UI, so it is the
  *     value that lets a human match this machine to a row on a screen; the
  *     token identifies nothing to a human and printing it puts a credential in
  *     a terminal scrollback, a screenshot and a pasted bug report.
@@ -32,8 +35,22 @@ import { CHANNEL_SERVER, whichBin } from "./init.ts";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AGENT_NAME, SESSION_PREFIX, TMUX, detectState, type SessionState } from "../tmux.ts";
-import { channelStatus, liveDoctorDeps, type DoctorDeps } from "./doctor.ts";
-import { emptyConfig } from "../config.ts";
+import { channelStatus, liveDoctorDeps, liveInventorySource, type DoctorDeps } from "./doctor.ts";
+import {
+  legacyConnection,
+  listAgentConnections,
+  readAgentConnection,
+  type AgentConnection,
+} from "../agent_connections.ts";
+import {
+  STAMPED_KINDS,
+  inventoryRows,
+  lastVerdict,
+  recordedState,
+  type InventoryRow,
+  type InventorySource,
+} from "../agent_inventory.ts";
+import { VERSION } from "../version.ts";
 import { parseRoster, rosterPath, type RosterEntry } from "../roster.ts";
 import { STAMP_FILE } from "../stamp.ts";
 import { HERMES_AGENT_COMM } from "./hermes.ts";
@@ -49,6 +66,89 @@ export interface StatusDeps extends DoctorDeps {
   home?: string;
   /** A file's text, or null when it cannot be read. Never throws. */
   readFile?(path: string): string | null;
+  /**
+   * The per-folder records and the legacy machine connection. Optional: absent
+   * reads both from `env` (see {@link connectionsOf}). Never the token.
+   */
+  connections?(): StatusConnections;
+  /**
+   * Everything the agent inventory reads (src/agent_inventory.ts), the SAME
+   * source `status --json` lists its agents from. Optional: absent, it is the
+   * live one ({@link liveInventorySource}) — or, when `connections` is
+   * injected, those records and this roster with no Claude entries.
+   */
+  inventorySource?(): InventorySource;
+}
+
+export interface StatusConnections {
+  records: AgentConnection[];
+  legacy: { suiteUrl: string; runtimeId: string } | null;
+}
+
+/** Every folder record plus the legacy connection, from `env`. Never throws; nothing readable is none. */
+export function connectionsOf(env: Record<string, string | undefined>): StatusConnections {
+  let records: AgentConnection[] = [];
+  let legacy: StatusConnections["legacy"] = null;
+  try {
+    records = listAgentConnections(env);
+  } catch {
+    records = [];
+  }
+  try {
+    legacy = legacyConnection(env);
+  } catch {
+    legacy = null;
+  }
+  return { records, legacy };
+}
+
+/**
+ * One agent row from the inventory, as a human reads it: folder, runtime,
+ * install, and why it is not plainly a recorded folder. The rows are the SAME
+ * ones `status --json` emits as `agents[]`. A stamped row is not printed here:
+ * the stamped section lists it, once, with its session state and verdict.
+ * Never a token: an inventory row holds none.
+ */
+export function agentIdentityLine(r: InventoryRow): string {
+  const marks: string[] = [];
+  if (!r.recorded) marks.push("(unrecorded — run suite init)");
+  if (r.wiring === "cross_wired") marks.push("(cross-wired — run suite doctor)");
+  const detail = [r.runtime_id ?? "no runtime id", r.suite_url ?? "", ...marks].filter((p) => p !== "").join("  ");
+  return row("", r.root, detail);
+}
+
+/** The inventory rows `suite status` lists, from the same source and function as `status --json`. */
+export async function statusInventory(
+  deps: StatusDeps,
+  records: AgentConnection[],
+  roster: RosterEntry[],
+): Promise<InventoryRow[]> {
+  // Records and roster alone, no Claude entries: what status can say when
+  // nothing else is readable. Status never throws on an unreadable machine.
+  const bare: InventorySource = {
+    records,
+    roster,
+    claudeJson: { projects: {}, userScope: [] },
+    sessionNaming: "cwd",
+    readFile: deps.readFile ?? (() => null),
+  };
+  let src: InventorySource = bare;
+  try {
+    if (deps.inventorySource !== undefined) src = deps.inventorySource();
+    // The live machine, but this status's own roster read (deps.home), so the
+    // stamped section below and these rows describe one roster.
+    else if (deps.connections === undefined) src = { ...liveInventorySource(deps.env), records, roster };
+  } catch {
+    src = bare;
+  }
+  // A human line shows no session state, so none is probed: tmux is not asked
+  // anything twice, and the row SET does not depend on state.
+  return inventoryRows(src, async () => "none");
+}
+
+/** The 0.7.0 machine connection, said to belong to no folder. */
+export function legacyLine(legacy: { runtimeId: string; suiteUrl: string }): string {
+  return row("legacy", legacy.runtimeId, `not assigned to any folder; run suite init in each agent folder (${legacy.suiteUrl})`);
 }
 
 /**
@@ -74,32 +174,9 @@ export function agentNameForKind(kind: RosterEntry["kind"]): string {
   }
 }
 
-/** The verbs whose agents are stamped (and so have a `.suite-stamp.json`). */
-export const STAMPED_KINDS: readonly RosterEntry["kind"][] = ["hermes", "openclaw"];
-
-/**
- * The state of a RECORDED agent. `none` from tmux means no session by that
- * name; for an agent the roster says was started, that is an agent that died,
- * not one that never was — so it is `stale`.
- */
-export function recordedState(detected: SessionState): SessionState {
-  return detected === "none" ? "stale" : detected;
-}
-
-/**
- * The last stamp verdict recorded in `<root>/.suite-stamp.json`. Only the
- * verdict is read out: the record also carries the token REF, and status has
- * no reason to print even that.
- */
-export function lastVerdict(text: string | null): string {
-  if (text === null) return "none";
-  try {
-    const v = (JSON.parse(text) as { verdict?: unknown }).verdict;
-    return v === "pass" || v === "fail" || v === "unparseable" ? v : "unreadable";
-  } catch {
-    return "unreadable";
-  }
-}
+// Shared with the agent inventory (status --json and doctor's `agents` check),
+// which must not import this module: doctor is imported here.
+export { STAMPED_KINDS, lastVerdict, recordedState } from "../agent_inventory.ts";
 
 export interface StampedAgentRow {
   session: string;
@@ -218,22 +295,40 @@ export function sessionLine(
 
 export async function runStatus(deps: StatusDeps, now: number = Math.floor(Date.now() / 1000)): Promise<number> {
   const options = { color: deps.color, utf8: deps.utf8 };
-  const config = deps.config ?? emptyConfig();
+  const { records, legacy } = (deps.connections ?? (() => connectionsOf(deps.env)))();
   const say = deps.out;
   const roster = readRoster(deps);
   say("");
 
-  // 1. Federation identity. The token is not read, let alone printed.
-  if (config.runtimeId === "") {
-    say(row("runtime", "not federated", deps.configFile));
+  // 1. Federation identity, per agent: the agent inventory's rows, the same
+  // ones `status --json` emits, so a folder wired only by its Claude entries
+  // (no record) is counted here too, marked unrecorded. The token is not read,
+  // let alone printed.
+  const agents = await statusInventory(deps, records, roster);
+  if (agents.length === 0 && legacy === null) {
+    say(row("agents", "not federated", "no agent folder has a saved connection"));
     say("");
     say("suite init");
-    // A stamped agent carries its own identity in its root, so it is listed
-    // even on a box that `suite init` never federated.
     await sayAgents(deps, roster, options);
     return 1;
   }
-  say(row("runtime", config.runtimeId, config.suiteUrl));
+  // Every inventory row is counted; a stamped one is listed under `stamped`
+  // (section 4) rather than twice, so lines here + stamped lines = the count.
+  const isStamped = (a: InventoryRow): boolean => a.kind !== null && STAMPED_KINDS.includes(a.kind);
+  const stampedCount = agents.filter(isStamped).length;
+  say(row("agents", String(agents.length), stampedCount === 0 ? "" : `${stampedCount} stamped, listed under stamped`));
+  for (const a of agents) if (!isStamped(a)) say(agentIdentityLine(a));
+  if (legacy !== null) say(legacyLine(legacy));
+  if (records.length === 0 && legacy === null) {
+    // Agents, but none with a saved connection: unfederated as before. A
+    // stamped agent carries its own identity in its root, so it is listed
+    // even on a box that `suite init` never federated.
+    say(row("", "not federated", "no agent folder has a saved connection"));
+    say("");
+    say("suite init");
+    await sayAgents(deps, roster, options);
+    return 1;
+  }
 
   // 2. The channel, health-checked.
   const claudePath = deps.which("claude");
@@ -292,9 +387,143 @@ async function sayAgents(
   const agents = await stampedAgents(deps, roster);
   if (agents.length === 0) return true;
   deps.out("");
-  deps.out(row("agents", String(agents.length)));
+  // `stamped`, not `agents`: the agents header is the per-folder connections above.
+  deps.out(row("stamped", String(agents.length)));
   for (const agent of agents) deps.out(agentLine(agent, options));
   return agents.every((a) => a.state === "live");
+}
+
+/* ------------------------------------------------------------------------- */
+/* `suite status --json` — the machine contract                               */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * `contract_version` 1, ADDITIVE ONLY: a field may be added, never renamed,
+ * retyped or removed without a bump. Field names MATCH the desktop branch's
+ * StatusDocument (01a0d6b9, src/commands/status_json.ts at 054671a2), so the
+ * suite-desktop-mac decoder (agents required with a String session, every
+ * other field optional) reads this document unchanged.
+ *
+ * NO TOKEN VALUE AND NO TOKEN FIELD. NO RUNTIME ID FROM THE LEGACY CONNECTION:
+ * the 0.7.0 machine connection appears only as `legacy_connection`.
+ */
+export const STATUS_CONTRACT_VERSION = 1 as const;
+
+export interface StatusAgentRow {
+  /** Always a string: a never-launched agent gets the name `suite claude` would give it. */
+  session: string;
+  /** From the roster, or null for an agent never launched. */
+  kind: InventoryRow["kind"];
+  root: string;
+  /** The folder's record, else its own local Claude entry, else its suite.json. Never the legacy connection. */
+  runtime_id: string | null;
+  suite_url: string | null;
+  state: InventoryRow["state"];
+  /** `unknown`: the channel state-file read belongs to 01a0d6b9. */
+  channel: "unknown";
+  /** The last stamp verdict for stamped kinds, else null. */
+  verdict: string | null;
+  /** Whether the folder has a saved per-folder connection. */
+  recorded: boolean;
+  wiring: InventoryRow["wiring"];
+}
+
+export interface StatusDocument {
+  contract_version: typeof STATUS_CONTRACT_VERSION;
+  suite_version: string;
+  /** The record for `--dir` (or the working directory), or null. */
+  connection: { dir: string; suite_url: string; runtime_id: string } | null;
+  /** A 0.7.0 machine-level connection, assigned to no folder, or null. */
+  legacy_connection: { suite_url: string; runtime_id: string } | null;
+  agents: StatusAgentRow[];
+}
+
+export const STATUS_FIELDS = [
+  "contract_version",
+  "suite_version",
+  "connection",
+  "legacy_connection",
+  "agents",
+] as const satisfies readonly (keyof StatusDocument)[];
+
+export const AGENT_FIELDS = [
+  "session",
+  "kind",
+  "root",
+  "runtime_id",
+  "suite_url",
+  "state",
+  "channel",
+  "verdict",
+  "recorded",
+  "wiring",
+] as const satisfies readonly (keyof StatusAgentRow)[];
+
+export interface StatusJsonInput {
+  source: InventorySource;
+  /** The record `--dir` (or cwd) resolves to, or null. */
+  connection: AgentConnection | null;
+  legacy: { suiteUrl: string; runtimeId: string } | null;
+  detect(session: string, kind: InventoryRow["kind"]): Promise<InventoryRow["state"]>;
+}
+
+/** The document. Pure given its input. */
+export async function statusDocument(input: StatusJsonInput): Promise<StatusDocument> {
+  const rows = await inventoryRows(input.source, input.detect);
+  const c = input.connection?.record ?? null;
+  return {
+    contract_version: STATUS_CONTRACT_VERSION,
+    suite_version: VERSION,
+    connection: c === null ? null : { dir: c.dir, suite_url: c.suiteUrl, runtime_id: c.runtimeId },
+    legacy_connection: input.legacy === null ? null : { suite_url: input.legacy.suiteUrl, runtime_id: input.legacy.runtimeId },
+    agents: rows.map((r) => ({
+      session: r.session,
+      kind: r.kind,
+      root: r.root,
+      runtime_id: r.runtime_id,
+      suite_url: r.suite_url,
+      state: r.state,
+      channel: r.channel,
+      verdict: r.verdict,
+      recorded: r.recorded,
+      wiring: r.wiring,
+    })),
+  };
+}
+
+/** The exact bytes: fields in contract order, indent 2, newline. */
+export function renderStatusDocument(doc: StatusDocument): string {
+  const ordered: Record<string, unknown> = {};
+  for (const k of STATUS_FIELDS) ordered[k] = doc[k];
+  ordered.agents = doc.agents.map((a) => {
+    const o: Record<string, unknown> = {};
+    for (const k of AGENT_FIELDS) o[k] = a[k];
+    return o;
+  });
+  return `${JSON.stringify(ordered, null, 2)}\n`;
+}
+
+/** `--dir PATH` out of `suite status` arguments. */
+export function parseStatusArgs(args: string[]): { json: boolean; dir?: string } {
+  const out: { json: boolean; dir?: string } = { json: args.includes("--json") };
+  const i = args.indexOf("--dir");
+  if (i !== -1 && args[i + 1] !== undefined) out.dir = args[i + 1];
+  return out;
+}
+
+/** The live input for {@link statusDocument}. Reads; never writes; never reads a token. */
+export function liveStatusJsonInput(
+  env: Record<string, string | undefined>,
+  dir: string,
+  tmux: DoctorDeps["tmux"],
+): StatusJsonInput {
+  const { legacy } = connectionsOf(env);
+  return {
+    source: liveInventorySource(env),
+    connection: readAgentConnection(env, dir).connection,
+    legacy,
+    detect: (session, kind) => detectState(session, tmux, agentNameForKind(kind ?? "claude")),
+  };
 }
 
 /** The live file read: text, or null for anything unreadable. */

@@ -187,6 +187,11 @@ describe("D: no saved connection — the init prompts run inline, never 'run sui
     expect(await runDeepseek(["--no-session"], d)).toBe(1);
     expect(asked).toEqual([]);
     expect(c.stderr).toContain("suite init");
+    // Names the folder that is not connected, not "this machine": the
+    // connection is per agent folder.
+    expect(c.stderr).toContain(`${join(base, "home", "agents")} is not connected to Suite yet`);
+    expect(c.stderr).toContain(`suite init --dir ${join(base, "home", "agents")}`);
+    expect(c.stderr).not.toContain("this machine");
     expect(c.execs).toHaveLength(0);
   });
 });

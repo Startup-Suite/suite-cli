@@ -43,7 +43,7 @@ interface FakeOptions {
   sessions?: Array<{ name: string; age: number; live: boolean }>;
 }
 
-function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[] } {
+function fakeDeps(options: FakeOptions = {}): StatusDeps & { lines: string[] } {
   const tools = options.tools ?? ["claude", "tmux"];
   const sessions = options.sessions ?? [];
   const lines: string[] = [];
@@ -76,8 +76,21 @@ function fakeDeps(options: FakeOptions = {}): DoctorDeps & { lines: string[] } {
   };
 
   const which = (name: string) => (tools.includes(name) ? `/fixture/bin/${name}` : null);
+  const cfg = options.config === undefined ? config() : options.config;
+  // Identity now comes from the per-folder records, not from `config`: a
+  // federated fixture is ONE agent folder recorded as that runtime.
+  const records =
+    cfg === null || cfg.runtimeId === ""
+      ? []
+      : [
+          {
+            record: { dir: "/projects/example-ledger", suiteUrl: cfg.suiteUrl, runtimeId: cfg.runtimeId, headerNames: [] },
+            path: "/fixture/home/.config/suite/agents/example-ledger-0000000000000000.json",
+          },
+        ];
   return {
     env: {},
+    connections: () => ({ records, legacy: null }),
     cwd: "/projects/example-ledger",
     run,
     which,
@@ -482,7 +495,9 @@ describe("stamped agents in the fake-tmux status", () => {
     deps.home = join(WORK_DIR, "no-such-home");
     deps.readFile = readFileOrNull;
     const code = await runStatus(deps, NOW);
-    expect(deps.lines.join("\n")).not.toContain("agents");
+    // No stamped section (its header is `stamped`; `agents` is now the per-folder connections).
+    expect(deps.lines.join("\n")).not.toContain("stamped");
+    expect(deps.lines.join("\n")).not.toContain("suite-lobster");
     expect(code).toBe(0);
   });
 });

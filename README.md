@@ -16,8 +16,11 @@ goes away.
 ## The model: an install connection, then harness wiring
 
 * **An install** is the server: a URL, a runtime id and a token.
-  **`suite init`** connects this machine to one. It saves those three values,
-  checks `bun` and `tmux`, and installs the watchdog. It never runs `claude`
+  **`suite init`** connects ONE AGENT FOLDER to one — the folder you run it in,
+  or `--dir PATH`. It saves those three values for that folder only, checks
+  `bun` and `tmux`, and installs the watchdog. A machine running several agents
+  runs `suite init` once in each agent folder; each can be a different runtime
+  on a different install. It never runs `claude`
   or any other harness, so it cannot fail because one is missing.
 * **Harness wiring** is what one harness needs on top. Each harness verb does
   its own, from the saved connection, without asking for credentials again,
@@ -91,17 +94,52 @@ The installer never uses `sudo`. It installs to `$XDG_BIN_HOME`, or
 `PATH`, and prints the exact `export PATH=` line to add. If a `suite` is
 already installed it names the version it would replace and asks first.
 
-## Connect this machine
+## Connect an agent folder
 
 ```sh
-suite init
+cd ~/agents/brosnan && suite init          # this folder
+suite init --dir ~/agents/moore            # or name the folder explicitly
+suite init --dir ~/agents/moore --from-mcp-json   # adopt that folder's own .mcp.json
 ```
 
 `init` detects `bun` and `tmux` (offering to install either, never unasked),
-asks for the Suite URL, runtime id and token, saves them, and installs the
-watchdog. That is all it does. Re-run it to fix a URL or rotate a token. The
-next `suite claude` in each agent folder rewrites any MCP entry that no longer
-matches.
+asks for the Suite URL, runtime id and token, saves them **for this folder**,
+and installs the watchdog. That is all it does. It prints
+`agent <dir> connected as <runtime> (<url>)`. Re-run it to fix a URL or rotate a
+token. The next `suite claude` in that folder rewrites any MCP entry that no
+longer matches.
+
+**The connection is per agent folder.** `suite init` in folder B cannot change
+folder A's connection: each folder's record is its own file pair (see
+[Credentials and config](#credentials-and-config)). `suite init` in `$HOME`
+warns that agents in other folders will not use that record.
+
+**`--from-mcp-json`** reads the folder's own `.mcp.json` — the `suite-channel`
+entry's `SUITE_RUNTIME_ID` and `SUITE_TOKEN`, the `startup-suite` entry's URL
+(the Suite URL is that minus `/mcp`) and headers — and saves that as the
+folder's connection, so no token passes through an argv, a shell or a terminal.
+It refuses, naming fields and never values, and writes nothing, when either
+entry or field is missing, when the two entries name different hosts, or when
+the channel token and the tools bearer differ. A `${VAR}` token is recorded as
+the variable name, not resolved.
+
+**`init --from-mcp-json` alone does not rewrite a folder's existing Claude
+entries.** `suite init` never runs `claude`. A folder whose local entries name
+another runtime keeps them until the next `suite claude` in that folder, or the
+next `suite restore` that STARTS that folder's agent; either compares the
+entries with the folder's record and rewrites the ones that differ. `suite
+restore` skips an agent whose session is already live, and does not rewire it.
+
+**Upgrading from 0.7.0 or earlier.** Those versions kept one connection per
+machine in `config.json` / `credentials.json`. That connection is now *legacy*:
+it is still read and reported (`suite status` prints it as `legacy`), but it is
+assigned to no folder and never used to wire one, and nothing deletes it. Run
+`suite init` (or `suite init --from-mcp-json`) once in each agent folder. Until
+you do, `suite claude` in a folder that has Claude entries and no record leaves
+the entries exactly as they are, registers nothing and says so; in a folder with
+neither, it asks the init questions when it has a terminal. Existing roster entries are repaired
+at the next `suite restore` that starts them, or the next `suite claude` in
+their folder, once the folder has a record.
 
 ## Claude Code's wiring (done by `suite claude`)
 
@@ -172,7 +210,7 @@ again from the same place and you are back in the same session.
 
 | Command | What it does |
 | --- | --- |
-| `suite init` | Connects this machine to a Suite install: detects `bun` and `tmux`, saves the URL, runtime id and token, installs the watchdog. Harness-neutral |
+| `suite init [--dir PATH] [--from-mcp-json]` | Connects ONE agent folder (here, or `--dir`) to a Suite install: detects `bun` and `tmux`, saves the URL, runtime id and token for that folder, installs the watchdog. Harness-neutral. `--from-mcp-json` adopts the folder's own `.mcp.json` |
 | `suite claude [...]` | Sets up this folder's Claude wiring if anything is missing (plugin, MCP entries, `CLAUDE.md`), then runs Claude Code in the persistent session for this directory; re-attaches when one is already live. Every argument passes through verbatim |
 | `suite claude new [...]` | **The force-new verb.** Creates a second session even when one exists, under the next free name (`…-2`) |
 | `suite claude -p '…'` | One-shot, non-interactive: **bypasses tmux entirely** and execs Claude directly |
@@ -185,8 +223,9 @@ again from the same place and you are back in the same session.
 | `suite codex [--root DIR]` | Runs a Codex agent through `codex app-server`, federated into Suite, in tmux. Logs Codex in with its own device-code flow if needed. See [`suite codex`](#suite-codex) |
 | `suite hermes\|openclaw --stamp-only` | Stamps only, and prints one JSON document. See [the stamp contract](#stamp-contract---stamp-only) |
 | `suite update` | Re-runs the installer to replace this install with the latest published CLI |
-| `suite doctor` | Diagnoses a broken setup in two halves, **install connection** (`→ suite init`) and **claude harness** (mostly `→ suite claude`), with one runnable remedy per failure. A stale session is never reported green |
-| `suite status` | Shows which runtime this box is federated as, the state and age of each session, and each stamped agent's kind, root, state and last verdict |
+| `suite doctor` | Diagnoses a broken setup in two halves, **install connection** (`→ suite init`) and **claude harness** (mostly `→ suite claude`), with one runnable remedy per failure. A stale session is never reported green. The `agents` check reports any cross-wired agent folder on the machine |
+| `suite status` | Shows every agent folder with its runtime and install (and a legacy machine connection, if any), the state and age of each session, and each stamped agent's kind, root, state and last verdict |
+| `suite status --json [--dir PATH]` | One JSON document on stdout for every agent on the machine. See [the status contract](#status-contract-status---json) |
 | `suite --version`, `suite --help` | Version, and the verb list |
 
 ### What `suite doctor` checks that nothing else does
@@ -215,6 +254,20 @@ point at *different* hosts — say `suite.example.invalid` and
 `suite.localhost.invalid`, two deployments on one box — two credentials is the
 correct configuration, so the check reports `⋯ skipped` rather than inventing a
 verdict.
+
+**Each agent folder should be wired as itself.** The `agents` check looks at
+every folder that has a saved record, Suite entries in `~/.claude.json`, or a
+roster entry. For each one it compares the runtime id and Suite host named by
+the folder's record, its local Claude entry and its own `.mcp.json`. Any
+disagreement fails as `cross-wired`, naming the folder and each source's runtime
+id (`recorded rt-a, entry rt-b, .mcp.json rt-a`). Runtime ids are not secrets,
+and no token is read. The remedy is `cd <dir> && suite init`, or
+`suite init --from-mcp-json` when the folder has a `.mcp.json`. A user-scope
+`suite-channel` or `startup-suite` entry (top-level `mcpServers` in
+`~/.claude.json`) also fails, because it applies to every folder that has no
+local entry of its own. The check reads `~/.claude.json` directly and never runs
+`claude mcp get` or `claude mcp list`: those health-check the channel by
+starting a second copy of it. It writes nothing.
 
 One state is deliberately neither: `⏸ Pending approval` in `claude mcp list` is
 a *project-approval* state, not a connectivity verdict. A pending server is
@@ -467,7 +520,7 @@ suite codex                    connection, Codex login, then tmux session suite-
           └ suite codex --reply-mcp   the suite-channel MCP server (suite_reply …)
 ```
 
-- **Connection.** The one `suite init` saved (`~/.config/suite/credentials.json`),
+- **Connection.** The one `suite init` saved for this folder (`agents/<key>.credentials.json`),
   or the init questions asked inline from a terminal, as `suite claude` does.
 - **Login is Codex's.** If `codex login status` says no, `suite codex` runs
   `codex login --device-auth`: a code you enter on any device, so it works over
@@ -629,6 +682,47 @@ Hermes env ships `ruamel.yaml`, because Hermes needs it to read its own config.
    dependency venv Hermes selected at stamp time, which Hermes may replace on
    `hermes update`. A re-run of the stamp repairs it; nothing does in between.
 
+## Status contract (`status --json`)
+
+`suite status --json` is a machine-callable view of every agent on this machine.
+stdout carries **exactly one JSON document** (indent 2, trailing newline) and
+nothing else; human lines go to stderr. `--dir PATH` chooses which folder's
+record is reported as `connection` (default: the working directory). It exits 0.
+
+The field names match the desktop app's `StatusDocument` decoder, which
+requires `agents` with a string `session` and treats every other field as
+optional.
+
+### Fields
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `contract_version` | number | `1` |
+| `suite_version` | string | This CLI's version |
+| `connection` | object or null | `{dir, suite_url, runtime_id}`: the record for `--dir` (or the working directory), or null when that folder has none |
+| `legacy_connection` | object or null | `{suite_url, runtime_id}`: a machine-level connection saved by 0.7.0 or earlier. It is assigned to no folder, and no agent row ever takes its runtime id |
+| `agents` | array | One row per roster entry, plus one per folder that has a record or Suite entries in `~/.claude.json` and no roster entry. Ordered by root, then session |
+
+Each `agents` row:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `session` | string | Always a string. The roster's session, or for an agent never launched, the name `suite claude` would give it |
+| `kind` | string or null | `claude`, `deepseek`, `hermes`, `openclaw` or `codex` from the roster; null for an agent never launched |
+| `root` | string | The agent folder |
+| `runtime_id` | string or null | The folder's record, else its own local Claude entry, else its own `suite.json`. Never the legacy or machine connection |
+| `suite_url` | string or null | The install URL, from the same sources in the same order |
+| `state` | string | `live`, `stale` or `none`. A roster agent with no session is `stale`, never `none`; a folder with no roster entry is `none` unless a session by its name exists |
+| `channel` | string | `unknown` for now. The channel state-file read is a later addition |
+| `verdict` | string or null | The last stamp verdict for `hermes` and `openclaw`; null for other kinds |
+| `recorded` | boolean | Whether the folder has a saved per-folder connection |
+| `wiring` | string | `match`: the record, the local Claude entry and `.mcp.json` agree. `cross_wired`: two of them name different runtimes or hosts. `unrecorded`: no record and nothing disagrees. `unknown`: nothing to compare, or `~/.claude.json` unreadable |
+
+There is no token value and no token field anywhere in the document.
+
+**`contract_version: 1` changes additively only.** A new field may appear. An
+existing field is never renamed, retyped or removed without bumping the version.
+
 ## Five decisions, stated rather than guessed
 
 These are the questions the design had to answer, each answered here rather
@@ -672,14 +766,20 @@ Nothing you paste is echoed. The token confirmation is a character count
 (`set, 44 chars`) and never a prefix or a last-four tail: a tail is still a
 partial echo, and a count already answers the only question you have.
 
-`~/.config/suite/config.json` (or `$XDG_CONFIG_HOME/suite/config.json`) is the
-repeatable-install file. It holds the Suite URL, the runtime id, the **names**
-of any extra headers, and the session-naming preference. **It never holds a
-secret value** — a test asserts the serialised bytes contain neither the token
-nor any header value.
+Each agent folder's connection is a file pair under the user config dir
+(`~/.config/suite`, or `$XDG_CONFIG_HOME/suite`), **outside the agent folder**:
 
-The token and header values are saved beside it in `credentials.json`, mode
-600, so every harness verb can reuse them without asking again. With
+* `agents/<key>.json` holds the folder, the Suite URL, the runtime id and the
+  **names** of any extra headers. **It never holds a secret value** — a test
+  asserts the serialised bytes contain neither the token nor any header value.
+* `agents/<key>.credentials.json`, mode 600, holds the token and header values,
+  so every harness verb can reuse them without asking again.
+
+`<key>` is the folder's basename plus a digest of its canonical path, the same
+rule tmux session names use. `config.json` keeps the machine-level settings
+(session naming, telemetry). Its connection fields, and `credentials.json`,
+are what 0.7.0 and earlier wrote; they are the legacy connection, read only for
+reporting, never written, deleted or used to wire a folder. With
 `suite init --token-from-env VAR`, only the variable name is saved and the
 token is not written to disk.
 
@@ -951,13 +1051,10 @@ re-attaches to its own agent on the next run. It is the **one** option the
 wrapper parses; everything else still passes through verbatim, and after a `--`
 even `--session` belongs to Claude again.
 
-`sessionNaming: "runtime"` in `config.json` looks like the answer and usually is
-not. It names the session after the runtime id — but the runtime id comes from
-`config.json`, and agents sharing a `HOME` share that file. Two agents under one
-account would therefore resolve to the **same** session and silently attach to
-each other: a collision that looks exactly like a successful re-attach. It is
-the right rule only when a box runs one agent, or when each agent has its own
-`XDG_CONFIG_HOME`.
+`sessionNaming: "runtime"` in `config.json` names the session after the runtime
+id of the folder's own record. Two folders federated as different runtimes get
+different sessions. Two `--session`-less runs in ONE folder still resolve to the
+same session, so `--session` remains the way to run two agents in one directory.
 
 ### The first-run notice
 

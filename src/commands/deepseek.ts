@@ -30,9 +30,10 @@ import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readConfig, type SuiteConfig } from "../config.ts";
+import type { SuiteConfig } from "../config.ts";
+import { agentConfig, readAgentConnection, readAgentSecrets } from "../agent_connections.ts";
 import { createStore, TOKEN_KEY, assertNoSecretsInArgv, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
-import { ensureConnection, ensureToken, hasConnection, readCredentials } from "../connection.ts";
+import { ensureConnection, ensureToken, hasConnection } from "../connection.ts";
 import { dataDir } from "../paths.ts";
 import {
   attachArgv,
@@ -432,7 +433,12 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   // agent root is not that agent.
   const explicitRoot = options.root ?? cwdAgentRoot(deps.cwd?.() ?? process.cwd());
   const rootConfig = explicitRoot === undefined ? null : await readAgentConfig(explicitRoot);
-  let config = rootConfig ?? (await readConfig());
+  // Without a suite.json, THIS AGENT FOLDER's record (the root, else the
+  // cwd) — never the legacy machine-level connection. src/agent_connections.ts.
+  const agentDir = explicitRoot ?? deps.cwd?.() ?? process.cwd();
+  const found = rootConfig === null ? readAgentConnection(process.env, agentDir).connection : null;
+  let connDir = found?.record.dir ?? agentDir;
+  let config: SuiteConfig | null = rootConfig ?? (found === null ? null : agentConfig(process.env, found.record));
   // NO CHICKEN AND EGG: on a machine with no saved connection, a terminal user
   // is asked for it here — URL, runtime id, token — exactly as `suite init`
   // would, and it is saved for next time. Off a terminal there is nobody to
@@ -441,13 +447,15 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   const interactive = prompter !== undefined && deps.isTTY();
   if (rootConfig === null && !hasConnection(config) && interactive) {
     const say = (line: string) => deps.stderr.write(`${line}\n`);
-    config = (await ensureConnection({ env: process.env, prompter, store: createStore(), out: say })).config;
+    const ensured = await ensureConnection({ env: process.env, prompter, store: createStore(), out: say }, agentDir);
+    config = ensured.config;
+    connDir = ensured.dir;
   }
   if (config === null || config.suiteUrl === "" || config.runtimeId === "") {
     deps.stderr.write(
       explicitRoot === undefined
-        ? "suite: this machine is not connected to Suite yet, and there is no terminal to ask in.\n" +
-            "suite: run `suite init` (or this command from a terminal, which asks for the connection),\n" +
+        ? `suite: ${agentDir} is not connected to Suite yet, and there is no terminal to ask in.\n` +
+            `suite: run \`suite init --dir ${agentDir}\` (or this command from a terminal, which asks for the connection),\n` +
             `suite: or run this from an agent folder that has its own ${AGENT_CONFIG_FILE} (or pass --root).\n`
         : `suite: no Suite config found. Run \`suite init\`, or put one at ${join(explicitRoot, AGENT_CONFIG_FILE)}\n`,
     );
@@ -457,17 +465,17 @@ export async function runDeepseek(args: string[], deps: DeepseekDeps): Promise<n
   const store = createStore({ token: "", headers: {} });
   const credentials =
     rootConfig === null
-      ? await loadCredentials(config, deps)
+      ? await loadCredentials(config, deps, connDir)
       : await loadAgentCredentials(explicitRoot as string, config);
   for (const [key, value] of Object.entries(credentials)) store.set(key, value);
   if (store.get(TOKEN_KEY) === undefined && rootConfig === null && interactive) {
     // A machine connected by an older CLI never saved its token. Ask for it
     // once — URL and runtime id are already known — and save it.
     const say = (line: string) => deps.stderr.write(`${line}\n`);
-    config = await ensureToken({ env: process.env, prompter, store, out: say }, config);
+    config = await ensureToken({ env: process.env, prompter, store, out: say }, connDir, config);
   }
   if (store.get(TOKEN_KEY) === undefined) {
-    deps.stderr.write("suite: no runtime token found. Run `suite init` to capture one.\n");
+    deps.stderr.write(`suite: no runtime token found for ${connDir}. Run \`suite init --dir ${connDir}\` to capture one.\n`);
     return 1;
   }
 
@@ -702,12 +710,17 @@ export async function runInSession(
  * Separated so the run path above has one place to fail on a missing token
  * rather than three.
  */
-export async function loadCredentials(config: SuiteConfig, _deps: DeepseekDeps): Promise<Record<string, string>> {
+export async function loadCredentials(
+  config: SuiteConfig,
+  _deps: DeepseekDeps,
+  dir: string,
+  env: Record<string, string | undefined> = process.env,
+): Promise<Record<string, string>> {
   const out: Record<string, string> = {};
   // `suite init --token-from-env VAR`: the token is in the environment only.
   const fromEnv = config.tokenEnv === undefined ? undefined : process.env[config.tokenEnv];
-  // What `suite init` (or an inline connection) saved, beside config.json.
-  const saved = readCredentials();
+  // What `suite init` (or an inline connection) saved for THIS agent folder.
+  const saved = readAgentSecrets(env, dir);
   if (saved !== null) {
     if (saved.token !== "") out[TOKEN_KEY] = saved.token;
     for (const name of config.headerNames) {
@@ -716,22 +729,8 @@ export async function loadCredentials(config: SuiteConfig, _deps: DeepseekDeps):
     }
   }
   if (fromEnv !== undefined && fromEnv !== "") out[TOKEN_KEY] = fromEnv;
-  if (out[TOKEN_KEY] !== undefined) return out;
-  return { ...(await loadLegacyState(config)), ...out };
-}
-
-/** The pre-credentials.json location: `token` / `headers` in state.json. */
-async function loadLegacyState(config: SuiteConfig): Promise<Record<string, string>> {
-  const { statePath } = await import("../paths.ts");
-  const file = Bun.file(statePath());
-  if (!(await file.exists())) return {};
-  const raw = (await file.json()) as { token?: string; headers?: Record<string, string> };
-  const out: Record<string, string> = {};
-  if (typeof raw.token === "string" && raw.token !== "") out[TOKEN_KEY] = raw.token;
-  for (const name of config.headerNames) {
-    const value = raw.headers?.[name];
-    if (typeof value === "string" && value !== "") out[name] = value;
-  }
+  // No fallback to a machine-level token (state.json / credentials.json): a
+  // machine token belongs to whichever runtime last ran init, not to this folder.
   return out;
 }
 

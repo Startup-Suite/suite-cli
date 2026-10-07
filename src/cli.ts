@@ -9,10 +9,21 @@
 import { VERSION } from "./version.ts";
 import { row, nextCommand } from "./ui.ts";
 import { liveDeps, runInit } from "./commands/init.ts";
-import { liveClaudeDeps, runClaude } from "./commands/claude.ts";
+import { liveClaudeDeps, restoreWirer, runClaude } from "./commands/claude.ts";
 import { liveDoctorDeps, runDoctor } from "./commands/doctor.ts";
 import { hostname } from "node:os";
-import { liveStatusDeps, runStatus } from "./commands/status.ts";
+import {
+  legacyLine,
+  liveStatusDeps,
+  liveStatusJsonInput,
+  parseStatusArgs,
+  renderStatusDocument,
+  runStatus,
+  statusDocument,
+} from "./commands/status.ts";
+import { divertStdout } from "./stamp_result.ts";
+import { liveTmuxDeps } from "./tmux.ts";
+import { resolve as resolvePath } from "node:path";
 import {
   forceRecover,
   liveWatchDeps,
@@ -131,14 +142,20 @@ export function parseInitOptions(args: string[]): {
   checkout?: string;
   tokenFromEnv?: string;
   noSupervisor?: boolean;
+  dir?: string;
+  fromMcpJson?: boolean;
 } {
-  const out: { checkout?: string; tokenFromEnv?: string; noSupervisor?: boolean } = {};
+  const out: { checkout?: string; tokenFromEnv?: string; noSupervisor?: boolean; dir?: string; fromMcpJson?: boolean } = {};
   for (let i = 0; i < args.length; i++) {
     const next = args[i + 1];
     if (args[i] === "--checkout" && next !== undefined) out.checkout = next;
     if (args[i] === "--token-from-env" && next !== undefined) out.tokenFromEnv = next;
     // Opting OUT. Installing the watchdog is the default; see InitOptions.
     if (args[i] === "--no-supervisor") out.noSupervisor = true;
+    // The agent folder this connection is for. Default: the working directory.
+    if (args[i] === "--dir" && next !== undefined) out.dir = next;
+    // Adopt <dir>/.mcp.json: the token never passes through argv or a terminal.
+    if (args[i] === "--from-mcp-json") out.fromMcpJson = true;
   }
   return out;
 }
@@ -148,7 +165,8 @@ export function usage(): string {
     "",
     row("suite", VERSION),
     "",
-    row("init", "connect this machine to a Suite install (url, runtime id, token, watchdog)"),
+    row("init", "connect THIS agent folder to a Suite install (url, runtime id, token, watchdog)"),
+    row("", "--dir PATH: the agent folder (default: here); --from-mcp-json: adopt PATH/.mcp.json"),
     row("claude", "set up Claude Code for Suite in this folder if needed, then run it in a persistent session"),
     row("claude new", "force a new session"),
     row("deepseek", "run a DeepSeek Harness agent federated into Suite"),
@@ -156,7 +174,8 @@ export function usage(): string {
     row("openclaw", "stamp an OpenClaw agent root and run its gateway (--stamp-only: JSON contract)"),
     row("codex", "run a Codex agent through codex app-server, federated into Suite, in a persistent session"),
     row("doctor", "diagnose a broken setup"),
-    row("status", "show federation, session state and stamped agents (kind, root, live/stale, last verdict)"),
+    row("status", "show every agent folder, session state and stamped agents (kind, root, live/stale, last verdict)"),
+    row("", "--json [--dir PATH]: one JSON document on stdout (see README, Status contract)"),
     row("watch", "recover halted agent sessions (--dry-run, --once, --interval N, --force SESSION)"),
     row("restore", "bring recorded agents back up (--adopt, --dry-run, --forget NAME)"),
     row("update", "install the latest suite CLI"),
@@ -300,17 +319,34 @@ export async function run(argv: string[]): Promise<number> {
     const { args } = parse(argv);
     const i = args.indexOf("--forget");
     const forget = i === -1 ? undefined : args[i + 1];
-    const res = await runRestore(liveRestoreDeps(), process.env.HOME ?? "", {
-      apply: !args.includes("--dry-run"),
-      forget,
-      adopt: args.includes("--adopt"),
-    });
+    const res = await runRestore(
+      { ...liveRestoreDeps(), wire: restoreWirer(process.env, (line) => console.error(`suite restore: ${line}`)) },
+      process.env.HOME ?? "",
+      {
+        apply: !args.includes("--dry-run"),
+        forget,
+        adopt: args.includes("--adopt"),
+      },
+    );
     // Failing to restore an agent is a real failure; a fully-skipped run on a
     // healthy box is a success, which is what makes this safe to run at boot.
     return res.failed.length > 0 ? 1 : 0;
   }
   if (verb === "update") return runUpdate(liveUpdateDeps());
   if (verb === "doctor") return runDoctor(await liveDoctorDeps());
+  const statusArgs = parseStatusArgs(argv.slice(1));
+  if (statusArgs.json) {
+    // ONE document on stdout; every other write is diverted to stderr.
+    return divertStdout(async (io) => {
+      const dir = resolvePath(process.cwd(), statusArgs.dir ?? ".");
+      const input = liveStatusJsonInput(process.env, dir, liveTmuxDeps(process.env));
+      const doc = await statusDocument(input);
+      io.stdout(renderStatusDocument(doc));
+      io.stderr(`suite status: ${doc.agents.length} agents\n`);
+      if (input.legacy !== null) io.stderr(`${legacyLine(input.legacy)}\n`);
+      return 0;
+    });
+  }
   return runStatus(await liveStatusDeps());
 }
 

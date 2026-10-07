@@ -30,6 +30,7 @@
  *     parse is a FAILURE that prints the raw line — never a false green.
  */
 import { resolve } from "node:path";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { mkdir } from "node:fs/promises";
 import {
@@ -40,7 +41,8 @@ import {
   type SpawnResult,
 } from "../secrets.ts";
 import { dataDir } from "../paths.ts";
-import { credentialsPath, promptConnection } from "../connection.ts";
+import { promptConnection } from "../connection.ts";
+import { canonicalDir, writeAgentConnection } from "../agent_connections.ts";
 import { nextCommand, row } from "../ui.ts";
 import {
   type SupervisorIo,
@@ -109,6 +111,8 @@ export interface InitDeps {
    */
   supervisorIo?: SupervisorIo;
   out(line: string): void;
+  /** Refusals. Optional: a caller that supplies none gets them on {@link InitDeps.out}. */
+  err?(line: string): void;
 }
 
 export interface InitOptions {
@@ -133,6 +137,18 @@ export interface InitOptions {
    * automatically is not wanted, not as a way to defer the decision.
    */
   noSupervisor?: boolean;
+  /**
+   * `--dir <path>`: the agent folder this connection is FOR. Defaults to the
+   * working directory. Relative paths resolve against it. The connection is
+   * saved as that folder's record and no other folder's.
+   */
+  dir?: string;
+  /**
+   * `--from-mcp-json`: adopt the connection from the folder's OWN
+   * `<dir>/.mcp.json` instead of asking. No token passes through argv, a shell
+   * or a terminal; see {@link adoptMcpJson}.
+   */
+  fromMcpJson?: boolean;
 }
 
 export const PLUGIN_REPO = "https://github.com/Startup-Suite/claude-code-suite-channel.git";
@@ -788,6 +804,123 @@ export async function registerServers(
 }
 
 /* ------------------------------------------------------------------------- */
+/* --from-mcp-json: adopt a folder's own .mcp.json                            */
+/* ------------------------------------------------------------------------- */
+
+export const MCP_JSON = ".mcp.json";
+
+/** What a folder's `.mcp.json` says its connection is. Holds the token: never print it. */
+export interface AdoptedConnection {
+  suiteUrl: string;
+  runtimeId: string;
+  /** Set when the entries carry `${VAR}` rather than a value: the name, recorded, never resolved. */
+  tokenEnv?: string;
+  /** The literal token, or "" for an env reference. */
+  token: string;
+  /** Extra tools-entry headers beyond Authorization, by name. */
+  headers: Record<string, string>;
+}
+
+export type AdoptResult = { ok: true; connection: AdoptedConnection } | { ok: false; problems: string[] };
+
+/** A non-reversible fingerprint, for comparing two credentials without holding either in a message. */
+function fingerprint(secret: string): string {
+  return createHash("sha256").update(secret).digest("hex").slice(0, 8);
+}
+
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url.trim()).host.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+const ENV_REF = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+
+/**
+ * Read a folder's connection out of its own `.mcp.json`. Pure.
+ *
+ * Takes the channel entry's SUITE_RUNTIME_ID and SUITE_TOKEN, and the tools
+ * entry's URL (the suite URL is that minus a trailing `/mcp`) and headers.
+ * REFUSES — naming fields, never values — when either entry is missing, a field
+ * is missing, the two entries name different hosts, or the channel token and
+ * the tools bearer differ (compared by fingerprint, as doctor's token check
+ * does). Adopting a file that disagrees with itself would be guessing which
+ * half is right.
+ */
+export function adoptMcpJson(text: string): AdoptResult {
+  let servers: Record<string, unknown>;
+  try {
+    const raw = JSON.parse(text) as { mcpServers?: unknown };
+    if (typeof raw.mcpServers !== "object" || raw.mcpServers === null || Array.isArray(raw.mcpServers)) {
+      return { ok: false, problems: ["mcpServers is missing"] };
+    }
+    servers = raw.mcpServers as Record<string, unknown>;
+  } catch {
+    return { ok: false, problems: [`${MCP_JSON} is not valid JSON`] };
+  }
+  const problems: string[] = [];
+  const channel = servers[CHANNEL_SERVER] as { env?: Record<string, unknown> } | undefined;
+  const tools = servers[TOOLS_SERVER] as { url?: unknown; headers?: Record<string, unknown> } | undefined;
+  if (typeof channel !== "object" || channel === null) problems.push(`the ${CHANNEL_SERVER} entry is missing`);
+  if (typeof tools !== "object" || tools === null) problems.push(`the ${TOOLS_SERVER} entry is missing`);
+  if (problems.length > 0) return { ok: false, problems };
+
+  const env = (typeof channel?.env === "object" && channel.env !== null ? channel.env : {}) as Record<string, unknown>;
+  const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
+  const runtimeId = str(env.SUITE_RUNTIME_ID);
+  const channelToken = str(env.SUITE_TOKEN);
+  const channelUrl = str(env.SUITE_URL);
+  const toolsUrl = str(tools?.url);
+  const headers = (typeof tools?.headers === "object" && tools.headers !== null ? tools.headers : {}) as Record<string, unknown>;
+  const authKey = Object.keys(headers).find((k) => k.toLowerCase() === "authorization");
+  const bearer = /^bearer\s+(.+)$/i.exec(str(authKey === undefined ? "" : headers[authKey]))?.[1]?.trim() ?? "";
+
+  if (runtimeId === "") problems.push(`${CHANNEL_SERVER} env SUITE_RUNTIME_ID is missing`);
+  if (channelToken === "") problems.push(`${CHANNEL_SERVER} env SUITE_TOKEN is missing`);
+  if (toolsUrl === "") problems.push(`${TOOLS_SERVER} url is missing`);
+  if (bearer === "") problems.push(`${TOOLS_SERVER} Authorization bearer is missing`);
+  if (problems.length > 0) return { ok: false, problems };
+
+  const toolsHost = hostOf(toolsUrl);
+  if (toolsHost === null) return { ok: false, problems: [`${TOOLS_SERVER} url is not a URL`] };
+  if (channelUrl !== "") {
+    const channelHost = hostOf(channelUrl);
+    if (channelHost === null) return { ok: false, problems: [`${CHANNEL_SERVER} env SUITE_URL is not a URL`] };
+    if (channelHost !== toolsHost) {
+      problems.push(`${CHANNEL_SERVER} SUITE_URL and ${TOOLS_SERVER} url name different hosts`);
+    }
+  }
+  if (fingerprint(channelToken) !== fingerprint(bearer)) {
+    problems.push(`${CHANNEL_SERVER} SUITE_TOKEN and ${TOOLS_SERVER} Authorization bearer differ`);
+  }
+  if (problems.length > 0) return { ok: false, problems };
+
+  const u = new URL(toolsUrl);
+  u.pathname = u.pathname.replace(/\/mcp\/?$/, "") || "/";
+  u.search = "";
+  u.hash = "";
+  const suiteUrl = u.toString().replace(/\/$/, "");
+  const extra: Record<string, string> = {};
+  for (const [k, v] of Object.entries(headers)) {
+    if (k === authKey) continue;
+    if (typeof v === "string" && v !== "") extra[k] = v;
+  }
+  const ref = ENV_REF.exec(channelToken);
+  return {
+    ok: true,
+    connection: {
+      suiteUrl,
+      runtimeId,
+      ...(ref !== null ? { tokenEnv: ref[1] as string } : {}),
+      token: ref !== null ? "" : channelToken,
+      headers: extra,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------------- */
 /* Orchestration                                                              */
 /* ------------------------------------------------------------------------- */
 
@@ -809,7 +942,7 @@ export interface InitResult {
  *
  *     bun          the runtime this CLI itself runs on
  *     tmux         persistence for every harness's session
- *     connection   suite url, runtime id, token (config.json + credentials.json)
+ *     connection   suite url, runtime id, token — for THIS folder (agents/<key>.json + .credentials.json)
  *     watchdog     session supervision, and the restore-on-boot unit
  *
  * NOTHING CLAUDE-SPECIFIC. The channel plugin clone, `claude mcp add` and
@@ -820,6 +953,29 @@ export interface InitResult {
  */
 export async function runInit(deps: InitDeps, options: InitOptions = {}): Promise<InitResult> {
   const say = deps.out;
+  const complain = deps.err ?? deps.out;
+  // The agent this connection is FOR. Explicit with --dir, else the folder we are in.
+  const dir = canonicalDir(options.dir === undefined ? deps.cwd : resolve(deps.cwd, options.dir));
+
+  // --from-mcp-json is decided BEFORE anything else runs, so a refusal leaves
+  // the machine exactly as it was: nothing installed, nothing written.
+  let adopted: AdoptedConnection | null = null;
+  if (options.fromMcpJson) {
+    const file = resolve(dir, MCP_JSON);
+    let text: string | null = null;
+    try {
+      text = readFileSync(file, "utf8");
+    } catch {
+      text = null;
+    }
+    const result: AdoptResult = text === null ? { ok: false, problems: [`${file} cannot be read`] } : adoptMcpJson(text);
+    if (!result.ok) {
+      complain(`suite init: refusing --from-mcp-json for ${dir}; nothing was written:`);
+      for (const p of result.problems) complain(`  ${p}`);
+      return { supervisor: null, exitCode: 1, tmuxMissing: false, configPath: "" };
+    }
+    adopted = result.connection;
+  }
   say("");
 
   // 1. bun --------------------------------------------------------------
@@ -879,20 +1035,56 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
   // The saved values are offered as defaults. A harness verb picks the change
   // up on its next launch — `suite claude` rewrites an entry that no longer
   // matches what is saved here.
-  const { configPath: configFile } = await promptConnection(
-    { env: deps.env, prompter: deps.prompter, store: deps.store, out: say },
-    options.tokenFromEnv === undefined ? {} : { tokenFromEnv: options.tokenFromEnv },
-  );
+  // Saved as THIS FOLDER's connection (deps.cwd): init in another folder can
+  // never change it. See src/agent_connections.ts.
+  let configFile: string;
+  let credentialsFile: string;
+  let connectedAs: { runtimeId: string; suiteUrl: string };
+  let tokenEnv: string | undefined = options.tokenFromEnv;
+  if (adopted !== null) {
+    if (options.tokenFromEnv !== undefined && adopted.tokenEnv === undefined) {
+      say(row("", "", "--token-from-env is ignored with --from-mcp-json: the token comes from .mcp.json"));
+    }
+    tokenEnv = adopted.tokenEnv;
+    const paths = writeAgentConnection(
+      deps.env,
+      dir,
+      {
+        suiteUrl: adopted.suiteUrl,
+        runtimeId: adopted.runtimeId,
+        headerNames: Object.keys(adopted.headers),
+        ...(adopted.tokenEnv !== undefined ? { tokenEnv: adopted.tokenEnv } : {}),
+      },
+      { token: adopted.token, headers: adopted.headers },
+    );
+    configFile = paths.configPath;
+    credentialsFile = paths.credentialsPath;
+    connectedAs = { runtimeId: adopted.runtimeId, suiteUrl: adopted.suiteUrl };
+    say(row("adopted", resolve(dir, MCP_JSON)));
+  } else {
+    const prompted = await promptConnection(
+      { env: deps.env, prompter: deps.prompter, store: deps.store, out: say },
+      dir,
+      options.tokenFromEnv === undefined ? {} : { tokenFromEnv: options.tokenFromEnv },
+    );
+    configFile = prompted.configPath;
+    credentialsFile = prompted.credentialsPath;
+    connectedAs = { runtimeId: prompted.config.runtimeId, suiteUrl: prompted.config.suiteUrl };
+  }
   say(row("config", configFile));
-  say(row("credentials", credentialsPath(deps.env), "mode 600"));
-  if (options.tokenFromEnv !== undefined) {
-    say(row("", "", `token read from ${options.tokenFromEnv} at launch and not saved; export it before starting an agent`));
+  say(row("credentials", credentialsFile, "mode 600"));
+  if (tokenEnv !== undefined) {
+    say(row("", "", `token read from ${tokenEnv} at launch and not saved; export it before starting an agent`));
+  }
+  say(row("agent", dir, `connected as ${connectedAs.runtimeId} (${connectedAs.suiteUrl})`));
+  const home = deps.env.HOME ?? "";
+  if (home !== "" && dir === canonicalDir(home)) {
+    say(row("", "", "this is your home folder: agents in OTHER folders will not use this connection; run suite init in each agent folder"));
   }
 
   // 4. the watchdog, installed unless explicitly declined ---------------
   let supervisor: SupervisorResult | null = null;
   if (!options.noSupervisor && deps.supervisorIo) {
-    const home = deps.env.HOME ?? "";
     const plan = supervisorPlan({
       platform: deps.platform,
       home,
@@ -928,8 +1120,8 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
   }
 
   say("");
-  say("this machine is connected. now start an agent from its folder — each sets up its own harness:");
-  say(nextCommand("suite claude"));
+  say(`agent ${dir} connected as ${connectedAs.runtimeId} (${connectedAs.suiteUrl}). start it from its folder:`);
+  say(nextCommand(`cd ${dir} && suite claude`));
 
   return {
     supervisor,
@@ -949,6 +1141,7 @@ export function liveDeps(prompter: Prompter, store: CredentialStore = createStor
     isTTY: Boolean(process.stdout.isTTY),
     cwd: process.cwd(),
     out: (line) => void process.stdout.write(`${line}\n`),
+    err: (line) => void process.stderr.write(`${line}\n`),
     run: (argv, options) => spawnWithSecrets(argv, store, options),
     supervisorIo: {
       mkdirp: (dir) => void mkdirSync(dir, { recursive: true }),
