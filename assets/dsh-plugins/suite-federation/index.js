@@ -74,6 +74,25 @@ function summarize(events, fromSeq) {
   return { text, reason, usage, provider, model }
 }
 
+/**
+ * The task and stage a dispatch belongs to, for the `usage_event` frame.
+ *
+ * Core reads top-level `task_id` and `metadata.stage_id`
+ * (`Platform.Analytics.UsageEvent`); a report without them can never be
+ * matched to a dispatch, so its token figures stay unattributed. The
+ * TaskRouter sets `signal.task_id`; `context` is `ContextAssembler.build/1`,
+ * whose `plan.stages[]` carry `id` and `status`. A non-task dispatch (a plain
+ * mention) has neither, and we send null rather than invent one.
+ */
+export function dispatchRefs(payload) {
+  const taskId = payload?.signal?.task_id ?? payload?.context?.task?.id ?? null
+  const stages = payload?.context?.plan?.stages
+  const running = Array.isArray(stages)
+    ? stages.find((s) => s?.status === 'running')
+    : undefined
+  return { taskId, stageId: running?.id ?? null }
+}
+
 /** Render an inbound attention payload as the user turn the agent sees. */
 function renderPrompt(payload) {
   const sig = payload.signal ?? {}
@@ -247,6 +266,7 @@ export function apply(ctx, config) {
       // agent_usage_events; without a provider report there is nothing true to
       // send, so we stay silent rather than post a zero row.
       if (provider && model) {
+        const { taskId, stageId } = dispatchRefs(payload)
         channel?.push('usage_event', {
           space_id: spaceId,
           model,
@@ -262,7 +282,8 @@ export function apply(ctx, config) {
             usage.cacheReadTokens +
             usage.cacheWriteTokens,
           latency_ms: Date.now() - startedAt,
-          metadata: { harness: 'dsh', runtime_id: runtimeId },
+          task_id: taskId,
+          metadata: { harness: 'dsh', runtime_id: runtimeId, stage_id: stageId },
         })
       }
     } catch (error) {

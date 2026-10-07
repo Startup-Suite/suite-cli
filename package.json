@@ -1,6 +1,6 @@
 {
   "name": "suite-cli",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Connects a machine to a Startup Suite install, then sets up and runs its agent harness",
   "license": "MIT",
   "type": "module",
