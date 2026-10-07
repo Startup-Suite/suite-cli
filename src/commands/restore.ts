@@ -43,6 +43,13 @@ export interface RestoreDeps {
    * Optional: a caller that supplies nothing answers nothing (the tests).
    */
   dialogs?: DialogIo;
+  /**
+   * Puts a recorded `claude` agent's MCP entries right from its folder's saved
+   * connection before the replay, as `suite claude` would (claude.ts
+   * restoreWirer). Null to go ahead; an exit code to leave that agent down.
+   * Optional: a caller that supplies nothing replays unchecked.
+   */
+  wire?(entry: RosterEntry): Promise<number | null>;
 }
 
 export function liveRestoreDeps(env = process.env): RestoreDeps {
@@ -238,6 +245,17 @@ export async function runRestore(
       deps.log(`${entry.session}: would start (${reason})`);
       result.started.push(entry.session);
       continue;
+    }
+    // The recorded pane runs `claude` itself, not `suite claude`, so the replay
+    // alone never compares the folder's entries to its saved connection. Do
+    // that first, or a cross-wired folder comes back as the wrong runtime.
+    if (entry.kind === "claude" && deps.wire !== undefined) {
+      const code = await deps.wire(entry);
+      if (code !== null) {
+        result.failed.push(entry.session);
+        deps.log(`${entry.session}: FAILED — could not check its Suite wiring (exit ${code}); not started`);
+        continue;
+      }
     }
     // Replay verbatim; only the tmux binary is re-resolved, since its path can
     // differ from the machine state at record time.

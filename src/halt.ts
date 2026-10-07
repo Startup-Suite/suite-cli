@@ -225,6 +225,13 @@ export interface HaltEvent {
    * covers every agent on a box.
    */
   rss_bytes?: number | null;
+  /**
+   * The runtime the session's agent folder is recorded as (agents/<key>.json),
+   * or null when that folder has no record. NEVER taken from the machine-level
+   * connection: on a box with several agents that names at most one of them.
+   * Additive: a collector that does not know the field ignores it.
+   */
+  runtime_id?: string | null;
   recovered: boolean;
   event_time: string;
   source: "suite_cli_halt_watch";

@@ -5,8 +5,10 @@
  * that tells you what is wrong and how to fix it, and duplicating its
  * remediation here would give two places to keep true.
  *
- *  1. WHICH RUNTIME IS THIS BOX FEDERATED AS. The runtime id, from config —
- *     NEVER the token. The id is what Suite shows in its own UI, so it is the
+ *  1. WHICH AGENTS ARE FEDERATED, AS WHICH RUNTIME. One line per agent folder
+ *     record (src/agent_connections.ts): folder, runtime id, suite URL —
+ *     NEVER the token. A 0.7.0 machine-level connection is reported as
+ *     `legacy`, assigned to no folder, because it identifies none. The id is what Suite shows in its own UI, so it is the
  *     value that lets a human match this machine to a row on a screen; the
  *     token identifies nothing to a human and printing it puts a credential in
  *     a terminal scrollback, a screenshot and a pasted bug report.
@@ -33,7 +35,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AGENT_NAME, SESSION_PREFIX, TMUX, detectState, type SessionState } from "../tmux.ts";
 import { channelStatus, liveDoctorDeps, type DoctorDeps } from "./doctor.ts";
-import { emptyConfig } from "../config.ts";
+import { legacyConnection, listAgentConnections, type AgentConnection } from "../agent_connections.ts";
 import { parseRoster, rosterPath, type RosterEntry } from "../roster.ts";
 import { STAMP_FILE } from "../stamp.ts";
 import { HERMES_AGENT_COMM } from "./hermes.ts";
@@ -49,6 +51,43 @@ export interface StatusDeps extends DoctorDeps {
   home?: string;
   /** A file's text, or null when it cannot be read. Never throws. */
   readFile?(path: string): string | null;
+  /**
+   * The per-folder records and the legacy machine connection. Optional: absent
+   * reads both from `env` (see {@link connectionsOf}). Never the token.
+   */
+  connections?(): StatusConnections;
+}
+
+export interface StatusConnections {
+  records: AgentConnection[];
+  legacy: { suiteUrl: string; runtimeId: string } | null;
+}
+
+/** Every folder record plus the legacy connection, from `env`. Never throws; nothing readable is none. */
+export function connectionsOf(env: Record<string, string | undefined>): StatusConnections {
+  let records: AgentConnection[] = [];
+  let legacy: StatusConnections["legacy"] = null;
+  try {
+    records = listAgentConnections(env);
+  } catch {
+    records = [];
+  }
+  try {
+    legacy = legacyConnection(env);
+  } catch {
+    legacy = null;
+  }
+  return { records, legacy };
+}
+
+/** One federated agent folder: its folder, runtime and install. Never a token. */
+export function connectionLine(record: AgentConnection["record"]): string {
+  return row("", record.dir, `${record.runtimeId}  ${record.suiteUrl}`);
+}
+
+/** The 0.7.0 machine connection, said to belong to no folder. */
+export function legacyLine(legacy: { runtimeId: string; suiteUrl: string }): string {
+  return row("legacy", legacy.runtimeId, `not assigned to any folder; run suite init in each agent folder (${legacy.suiteUrl})`);
 }
 
 /**
@@ -218,14 +257,14 @@ export function sessionLine(
 
 export async function runStatus(deps: StatusDeps, now: number = Math.floor(Date.now() / 1000)): Promise<number> {
   const options = { color: deps.color, utf8: deps.utf8 };
-  const config = deps.config ?? emptyConfig();
+  const { records, legacy } = (deps.connections ?? (() => connectionsOf(deps.env)))();
   const say = deps.out;
   const roster = readRoster(deps);
   say("");
 
-  // 1. Federation identity. The token is not read, let alone printed.
-  if (config.runtimeId === "") {
-    say(row("runtime", "not federated", deps.configFile));
+  // 1. Federation identity, per agent folder. The token is not read, let alone printed.
+  if (records.length === 0 && legacy === null) {
+    say(row("agents", "not federated", "no agent folder has a saved connection"));
     say("");
     say("suite init");
     // A stamped agent carries its own identity in its root, so it is listed
@@ -233,7 +272,9 @@ export async function runStatus(deps: StatusDeps, now: number = Math.floor(Date.
     await sayAgents(deps, roster, options);
     return 1;
   }
-  say(row("runtime", config.runtimeId, config.suiteUrl));
+  say(row("agents", String(records.length)));
+  for (const c of records) say(connectionLine(c.record));
+  if (legacy !== null) say(legacyLine(legacy));
 
   // 2. The channel, health-checked.
   const claudePath = deps.which("claude");
@@ -292,7 +333,8 @@ async function sayAgents(
   const agents = await stampedAgents(deps, roster);
   if (agents.length === 0) return true;
   deps.out("");
-  deps.out(row("agents", String(agents.length)));
+  // `stamped`, not `agents`: the agents header is the per-folder connections above.
+  deps.out(row("stamped", String(agents.length)));
   for (const agent of agents) deps.out(agentLine(agent, options));
   return agents.every((a) => a.state === "live");
 }

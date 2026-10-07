@@ -9,7 +9,7 @@
 import { VERSION } from "./version.ts";
 import { row, nextCommand } from "./ui.ts";
 import { liveDeps, runInit } from "./commands/init.ts";
-import { liveClaudeDeps, runClaude } from "./commands/claude.ts";
+import { liveClaudeDeps, restoreWirer, runClaude } from "./commands/claude.ts";
 import { liveDoctorDeps, runDoctor } from "./commands/doctor.ts";
 import { hostname } from "node:os";
 import { liveStatusDeps, runStatus } from "./commands/status.ts";
@@ -131,14 +131,20 @@ export function parseInitOptions(args: string[]): {
   checkout?: string;
   tokenFromEnv?: string;
   noSupervisor?: boolean;
+  dir?: string;
+  fromMcpJson?: boolean;
 } {
-  const out: { checkout?: string; tokenFromEnv?: string; noSupervisor?: boolean } = {};
+  const out: { checkout?: string; tokenFromEnv?: string; noSupervisor?: boolean; dir?: string; fromMcpJson?: boolean } = {};
   for (let i = 0; i < args.length; i++) {
     const next = args[i + 1];
     if (args[i] === "--checkout" && next !== undefined) out.checkout = next;
     if (args[i] === "--token-from-env" && next !== undefined) out.tokenFromEnv = next;
     // Opting OUT. Installing the watchdog is the default; see InitOptions.
     if (args[i] === "--no-supervisor") out.noSupervisor = true;
+    // The agent folder this connection is for. Default: the working directory.
+    if (args[i] === "--dir" && next !== undefined) out.dir = next;
+    // Adopt <dir>/.mcp.json: the token never passes through argv or a terminal.
+    if (args[i] === "--from-mcp-json") out.fromMcpJson = true;
   }
   return out;
 }
@@ -148,7 +154,8 @@ export function usage(): string {
     "",
     row("suite", VERSION),
     "",
-    row("init", "connect this machine to a Suite install (url, runtime id, token, watchdog)"),
+    row("init", "connect THIS agent folder to a Suite install (url, runtime id, token, watchdog)"),
+    row("", "--dir PATH: the agent folder (default: here); --from-mcp-json: adopt PATH/.mcp.json"),
     row("claude", "set up Claude Code for Suite in this folder if needed, then run it in a persistent session"),
     row("claude new", "force a new session"),
     row("deepseek", "run a DeepSeek Harness agent federated into Suite"),
@@ -300,11 +307,15 @@ export async function run(argv: string[]): Promise<number> {
     const { args } = parse(argv);
     const i = args.indexOf("--forget");
     const forget = i === -1 ? undefined : args[i + 1];
-    const res = await runRestore(liveRestoreDeps(), process.env.HOME ?? "", {
-      apply: !args.includes("--dry-run"),
-      forget,
-      adopt: args.includes("--adopt"),
-    });
+    const res = await runRestore(
+      { ...liveRestoreDeps(), wire: restoreWirer(process.env, (line) => console.error(`suite restore: ${line}`)) },
+      process.env.HOME ?? "",
+      {
+        apply: !args.includes("--dry-run"),
+        forget,
+        adopt: args.includes("--adopt"),
+      },
+    );
     // Failing to restore an agent is a real failure; a fully-skipped run on a
     // healthy box is a success, which is what makes this safe to run at boot.
     return res.failed.length > 0 ? 1 : 0;

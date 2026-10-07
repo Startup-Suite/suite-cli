@@ -33,6 +33,7 @@ import { createStore, spawnWithSecrets, ttyPrompter, type CredentialStore, type 
 import { ensureConnection, ensureToken, loadSavedSecrets } from "../connection.ts";
 import { ensureClaudeWiring, localEntries, needsRegistration, planMcp } from "../claude_wiring.ts";
 import { type RestoreDeps, liveRestoreDeps, recordLaunch } from "./restore.ts";
+import type { RosterEntry } from "../roster.ts";
 import { type SupervisorIo, ensureSupervision, liveSupervisorIo } from "../supervisor.ts";
 import { CHANNEL_SERVER, TOOLS_SERVER, confirm, defaultCheckout, type InstallPlan, type Runner } from "./init.ts";
 import { CLAUDE_CODE_URL } from "./doctor.ts";
@@ -864,7 +865,9 @@ export interface WiringIo {
  * Returns the connection to launch with, or an exit code to stop with. All
  * output goes to stderr, so a `-p` caller's captured stdout stays Claude's.
  */
-export async function wireClaude(deps: ClaudeDeps, wiring: WiringIo): Promise<SuiteConfig | number> {
+export type WireDeps = Pick<ClaudeDeps, "env" | "cwd" | "prompter" | "store" | "err" | "config">;
+
+export async function wireClaude(deps: WireDeps, wiring: WiringIo): Promise<SuiteConfig | number> {
   const io = { env: deps.env, prompter: deps.prompter, store: deps.store, out: deps.err };
   const unwired = (why: string): SuiteConfig => {
     deps.err(`suite: ${why}; starting Claude Code without Suite wiring.`);
@@ -914,6 +917,51 @@ export async function wireClaude(deps: ClaudeDeps, wiring: WiringIo): Promise<Su
     deps.err(`suite: could not set up Claude Code for Suite: ${error instanceof Error ? error.message : String(error)}`);
     return WIRING_FAILED_EXIT;
   }
+}
+
+/**
+ * `suite restore`'s wiring step for one recorded `claude` agent.
+ *
+ * WHY RESTORE NEEDS IT. The roster records the tmux `new-session` argv, and
+ * the pane in it runs `claude` itself, not `suite claude` — so replaying it
+ * would start the agent on whatever its local MCP entries say, without ever
+ * comparing them to the folder's saved connection. A folder a 0.7.0 CLI
+ * cross-wired would come back up as the wrong runtime on every boot. So before
+ * each replay restore runs exactly the check `suite claude` runs, for that
+ * entry's folder, with nobody to ask (off a terminal): a recorded folder is
+ * put right from ITS record; a folder with no record keeps its entries as they
+ * are and is never stamped (I2).
+ *
+ * Returns null to go ahead, or the exit code `suite claude` would have
+ * stopped with.
+ */
+export function restoreWirer(
+  env: Record<string, string | undefined>,
+  log: (line: string) => void,
+  run?: Runner,
+): (entry: Pick<RosterEntry, "session" | "cwd">) => Promise<number | null> {
+  return async (entry) => {
+    const store = createStore();
+    const refuse = async (question: string): Promise<string> => {
+      throw new Error(`restore cannot ask: ${question}`);
+    };
+    const wired = await wireClaude(
+      {
+        env,
+        cwd: entry.cwd,
+        prompter: { ask: refuse, askSecret: refuse, say: () => {} },
+        store,
+        err: (line) => log(`${entry.session}: ${line}`),
+        config: agentConfig(env, null),
+      },
+      {
+        run: run ?? ((argv, options) => spawnWithSecrets(argv, store, { ...options, env })),
+        isTTY: false,
+        canPrompt: false,
+      },
+    );
+    return typeof wired === "number" ? wired : null;
+  };
 }
 
 /* ------------------------------------------------------------------------- */

@@ -32,6 +32,7 @@ import {
 import { SESSION_PREFIX, type TmuxDeps, detectState, liveTmuxDeps } from "../tmux.ts";
 import { RSS_CEILING_BYTES, SUPERVISED_ENV } from "../supervisor.ts";
 import { answerOnce, liveDialogIo, type DialogIo } from "../claude_dialogs.ts";
+import { readAgentConnection } from "../agent_connections.ts";
 
 export interface WatchDeps {
   tmux: TmuxDeps;
@@ -49,6 +50,23 @@ export interface WatchDeps {
    * Optional: a caller that supplies nothing answers nothing.
    */
   dialogs?: DialogIo;
+  /**
+   * The runtime id the agent folder `cwd` is recorded as, or null. Optional: a
+   * caller that supplies nothing reports null for every event. Never resolved
+   * from the machine-level connection.
+   */
+  runtimeIdFor?(cwd: string): string | null;
+}
+
+/** {@link WatchDeps.runtimeIdFor} from the per-folder store under `env`. Never throws. */
+export function runtimeIdResolver(env: Record<string, string | undefined>): (cwd: string) => string | null {
+  return (cwd) => {
+    try {
+      return readAgentConnection(env, cwd).connection?.record.runtimeId ?? null;
+    } catch {
+      return null;
+    }
+  };
 }
 
 export interface WatchOptions {
@@ -364,6 +382,16 @@ export async function runWatch(deps: WatchDeps, opts: WatchOptions): Promise<Hal
   const psOut = await deps.tmux.run(["ps", "-eo", "pid=,ppid=,rss=,args="]);
   const rss = rssBySession(panePids.stdout, psOut.stdout);
   const covered = new Set<string>();
+  // Each owned session's runtime, from ITS folder's record. Resolved once per pass.
+  const runtimeBySession = new Map<string, string | null>();
+  const runtimeOf = (session: string | null): string | null => {
+    if (session === null || session === "" || deps.runtimeIdFor === undefined) return null;
+    if (!runtimeBySession.has(session)) {
+      const target = targets.find((t) => t.session === session);
+      runtimeBySession.set(session, target === undefined ? null : deps.runtimeIdFor(target.cwd));
+    }
+    return runtimeBySession.get(session) ?? null;
+  };
 
   for (const dir of deps.listProjectDirs(opts.home)) {
     const newest = deps.newestTranscript(dir);
@@ -396,6 +424,7 @@ export async function runWatch(deps: WatchDeps, opts: WatchOptions): Promise<Hal
         file_bytes: newest.bytes,
         context_tokens: contextTokens(tail),
         rss_bytes: session ? (rss.get(session) ?? null) : null,
+        runtime_id: runtimeOf(session),
         recovered: false,
         event_time: deps.now().toISOString(),
         source: "suite_cli_halt_watch",
@@ -441,6 +470,7 @@ export async function runWatch(deps: WatchDeps, opts: WatchOptions): Promise<Hal
       file_bytes: newest.bytes,
       context_tokens: contextTokens(tail),
       rss_bytes: session ? (rss.get(session) ?? null) : null,
+      runtime_id: runtimeOf(session),
       recovered,
       event_time: deps.now().toISOString(),
       source: "suite_cli_halt_watch",
@@ -464,6 +494,7 @@ export async function runWatch(deps: WatchDeps, opts: WatchOptions): Promise<Hal
       file_bytes: 0,
       context_tokens: null,
       rss_bytes: bytes,
+      runtime_id: runtimeOf(session),
       recovered: false,
       event_time: deps.now().toISOString(),
       source: "suite_cli_halt_watch",
@@ -505,6 +536,7 @@ export function liveWatchDeps(
     newestTranscript: liveNewestTranscript,
     log: (line) => console.log(`suite watch: ${line}`),
     dialogs: liveDialogIo(tmux ?? liveTmuxDeps(env), env.HOME ?? "", (line) => console.log(`suite watch: ${line}`)),
+    runtimeIdFor: runtimeIdResolver(env),
     async post(url, body, contentType, auth) {
       try {
         const res = await fetch(url, {
