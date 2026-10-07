@@ -10,6 +10,16 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.7.2
+
+- **dsh `usage_event` names the task and stage it belongs to.** The
+  suite-federation plugin now sends top-level `task_id` (from the dispatch
+  signal, falling back to `context.task.id`) and `metadata.stage_id` (the plan
+  stage whose status is `running`). Core matches usage reports to dispatches
+  on those two keys; without them every dsh agent's client-side token and turn
+  figures were unattributable. A dispatch with no task (a plain mention) sends
+  null for both, never an invented id.
+
 ## 0.7.1
 
 - **The connection is per agent folder, not per machine.** Through 0.7.0,
