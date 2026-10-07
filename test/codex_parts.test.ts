@@ -3,7 +3,7 @@
  * suite-channel MCP server and its socket to the bridge, and the verb itself.
  */
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PhoenixChannel, redactUrl, socketUrl, type SocketLike } from "../src/codex/phoenix.ts";
@@ -21,6 +21,7 @@ import {
   type CodexDeps,
 } from "../src/commands/codex.ts";
 import { kindFromArgv, parseRoster, serializeRoster } from "../src/roster.ts";
+import { writeAgentConnection } from "../src/agent_connections.ts";
 
 const TMP = mkdtempSync(join(tmpdir(), "suite-codex-parts-"));
 afterAll(() => rmSync(TMP, { recursive: true, force: true }));
@@ -259,8 +260,14 @@ describe("suite codex options and argv", () => {
 async function deps(over: Partial<CodexDeps> & { loggedIn?: boolean[]; tty?: boolean } = {}) {
   const home = mkdtempSync(join(TMP, "home-"));
   const cfgDir = join(home, ".config", "suite");
-  await Bun.write(join(cfgDir, "config.json"), JSON.stringify({ suiteUrl: "https://suite.example", runtimeId: "oddjob-codex", headerNames: [] }));
-  await Bun.write(join(cfgDir, "credentials.json"), JSON.stringify({ token: "tok-123", headers: {} }));
+  // The agent folder's own saved connection (agent_connections.ts), keyed by the cwd below.
+  mkdirSync(join(home, "agent"), { recursive: true });
+  writeAgentConnection(
+    { HOME: home, XDG_CONFIG_HOME: join(home, ".config") },
+    join(home, "agent"),
+    { suiteUrl: "https://suite.example", runtimeId: "oddjob-codex", headerNames: [] },
+    { token: "tok-123", headers: {} },
+  );
   const loggedIn = [...(over.loggedIn ?? [true])];
   const ran: { argv: string[]; env: Record<string, string> }[] = [];
   const bridges: BridgeInput[] = [];

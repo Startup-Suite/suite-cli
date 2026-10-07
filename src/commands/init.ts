@@ -40,7 +40,7 @@ import {
   type SpawnResult,
 } from "../secrets.ts";
 import { dataDir } from "../paths.ts";
-import { credentialsPath, promptConnection } from "../connection.ts";
+import { promptConnection } from "../connection.ts";
 import { nextCommand, row } from "../ui.ts";
 import {
   type SupervisorIo,
@@ -809,7 +809,7 @@ export interface InitResult {
  *
  *     bun          the runtime this CLI itself runs on
  *     tmux         persistence for every harness's session
- *     connection   suite url, runtime id, token (config.json + credentials.json)
+ *     connection   suite url, runtime id, token — for THIS folder (agents/<key>.json + .credentials.json)
  *     watchdog     session supervision, and the restore-on-boot unit
  *
  * NOTHING CLAUDE-SPECIFIC. The channel plugin clone, `claude mcp add` and
@@ -879,12 +879,15 @@ export async function runInit(deps: InitDeps, options: InitOptions = {}): Promis
   // The saved values are offered as defaults. A harness verb picks the change
   // up on its next launch — `suite claude` rewrites an entry that no longer
   // matches what is saved here.
-  const { configPath: configFile } = await promptConnection(
+  // Saved as THIS FOLDER's connection (deps.cwd): init in another folder can
+  // never change it. See src/agent_connections.ts.
+  const { configPath: configFile, credentialsPath: credentialsFile } = await promptConnection(
     { env: deps.env, prompter: deps.prompter, store: deps.store, out: say },
+    deps.cwd,
     options.tokenFromEnv === undefined ? {} : { tokenFromEnv: options.tokenFromEnv },
   );
   say(row("config", configFile));
-  say(row("credentials", credentialsPath(deps.env), "mode 600"));
+  say(row("credentials", credentialsFile, "mode 600"));
   if (options.tokenFromEnv !== undefined) {
     say(row("", "", `token read from ${options.tokenFromEnv} at launch and not saved; export it before starting an agent`));
   }

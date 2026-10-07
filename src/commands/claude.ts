@@ -25,15 +25,16 @@
  */
 import { mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
-import { readConfig, emptyConfig, type SuiteConfig } from "../config.ts";
+import type { SuiteConfig } from "../config.ts";
+import { agentConfig, agentConfigFor, readAgentConnection } from "../agent_connections.ts";
 import { resolveTmux } from "../halt.ts";
 import { statePath } from "../paths.ts";
 import { createStore, spawnWithSecrets, ttyPrompter, type CredentialStore, type Prompter } from "../secrets.ts";
-import { ensureConnection, ensureToken, hasConnection } from "../connection.ts";
-import { ensureClaudeWiring, needsRegistration, planMcp } from "../claude_wiring.ts";
+import { ensureConnection, ensureToken, loadSavedSecrets } from "../connection.ts";
+import { ensureClaudeWiring, localEntries, needsRegistration, planMcp } from "../claude_wiring.ts";
 import { type RestoreDeps, liveRestoreDeps, recordLaunch } from "./restore.ts";
 import { type SupervisorIo, ensureSupervision, liveSupervisorIo } from "../supervisor.ts";
-import { confirm, defaultCheckout, type InstallPlan, type Runner } from "./init.ts";
+import { CHANNEL_SERVER, TOOLS_SERVER, confirm, defaultCheckout, type InstallPlan, type Runner } from "./init.ts";
 import { CLAUDE_CODE_URL } from "./doctor.ts";
 import { colorEnabled } from "../ui.ts";
 import { answerLaunchDialogs, liveDialogIo, sessionLogPath, type AnswerResult, type DialogIo } from "../claude_dialogs.ts";
@@ -844,7 +845,21 @@ export interface WiringIo {
 }
 
 /**
- * Connect (if needed) and wire this folder's Claude Code to the install.
+ * Connect (if needed) and wire this folder's Claude Code to ITS install.
+ *
+ * The connection is THIS FOLDER's record (src/agent_connections.ts), never the
+ * machine-level one: a machine hosts several agents, each federated as its own
+ * runtime, and planning against one machine connection is what rewrote one
+ * agent's entries with another's runtime and token.
+ *
+ *   (a) the folder has a record: plan against it; register what is missing or
+ *       stale, from it.
+ *   (b) no record, but the folder already has Suite entries (or ~/.claude.json
+ *       cannot be read): register NOTHING. Those entries may be the only
+ *       correct statement of who this agent is; launch with them as they are.
+ *   (c) no record, no entries, a person to ask: prompt inline, save this
+ *       folder's record, wire.
+ *   (d) no record, no entries, nobody to ask: launch unwired, as before.
  *
  * Returns the connection to launch with, or an exit code to stop with. All
  * output goes to stderr, so a `-p` caller's captured stdout stays Claude's.
@@ -853,20 +868,42 @@ export async function wireClaude(deps: ClaudeDeps, wiring: WiringIo): Promise<Su
   const io = { env: deps.env, prompter: deps.prompter, store: deps.store, out: deps.err };
   const unwired = (why: string): SuiteConfig => {
     deps.err(`suite: ${why}; starting Claude Code without Suite wiring.`);
-    deps.err("suite: run `suite init`, or `suite claude` from a terminal, to connect it.");
+    deps.err("suite: run `suite init` in this folder, or `suite claude` from a terminal, to connect it.");
     return deps.config;
   };
   try {
-    if (!wiring.canPrompt && !hasConnection(await readConfig({ env: deps.env }))) {
-      return unwired("this machine is not connected to a Suite install and there is no terminal to ask in");
+    const found = readAgentConnection(deps.env, deps.cwd).connection;
+    let config: SuiteConfig;
+    let dir: string;
+    if (found !== null) {
+      // (a)
+      config = agentConfig(deps.env, found.record);
+      dir = found.record.dir;
+      loadSavedSecrets(deps.env, dir, config, deps.store);
+    } else {
+      const entries = localEntries(deps.env, deps.cwd);
+      if (entries === null || entries[CHANNEL_SERVER] !== undefined || entries[TOOLS_SERVER] !== undefined) {
+        // (b)
+        deps.err(
+          `suite: no saved connection for ${deps.cwd}; its Claude entries were left as they are. Run suite init in this folder`,
+        );
+        return deps.config;
+      }
+      // (d)
+      if (!wiring.canPrompt) {
+        return unwired("this folder is not connected to a Suite install and there is no terminal to ask in");
+      }
+      // (c)
+      const ensured = await ensureConnection(io, deps.cwd);
+      config = ensured.config;
+      dir = ensured.dir;
     }
-    let { config } = await ensureConnection(io);
     // The token is needed only to WRITE an entry. Asked for at most once, and
-    // only on a machine set up before it was saved — never on a wired folder.
+    // only for a folder whose record has none — never on a wired folder.
     const plan = planMcp({ env: deps.env, cwd: deps.cwd, store: deps.store }, config, defaultCheckout(deps.env));
     if (needsRegistration(plan) && plan.want.tokenLiteral === null) {
-      if (!wiring.canPrompt) return unwired("the Claude MCP entries need writing and no token is saved");
-      config = await ensureToken(io, config);
+      if (!wiring.canPrompt) return unwired("the Claude MCP entries need writing and no token is saved for this folder");
+      config = await ensureToken(io, dir, config);
     }
     await ensureClaudeWiring(
       { env: deps.env, run: wiring.run, cwd: deps.cwd, isTTY: wiring.isTTY, store: deps.store, out: deps.err },
@@ -887,7 +924,8 @@ export async function liveClaudeDeps(
   env: Record<string, string | undefined> = process.env,
   prompter: Prompter = ttyPrompter(),
 ): Promise<ClaudeDeps> {
-  const config = (await readConfig({ env })) ?? emptyConfig();
+  // Session naming: the machine's sessionNaming, this folder's runtime id.
+  const config = agentConfigFor(env, process.cwd());
   const store = createStore();
   return {
     wiring: {

@@ -12,8 +12,14 @@ import { existsSync, mkdirSync, statSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { runClaude, type ClaudeDeps } from "../src/commands/claude.ts";
 import { CHANNEL_SERVER, TOOLS_SERVER, channelWsUrl, defaultCheckout, runInit, toolsHttpUrl } from "../src/commands/init.ts";
-import { credentialsPath, readCredentials } from "../src/connection.ts";
-import { emptyConfig, readConfig } from "../src/config.ts";
+import {
+  agentConfigPath,
+  agentCredentialsPath,
+  readAgentConnection,
+  readAgentSecrets,
+  writeAgentConnection,
+} from "../src/agent_connections.ts";
+import { emptyConfig } from "../src/config.ts";
 import { createStore, spawnWithSecrets, type Prompter } from "../src/secrets.ts";
 import type { RunResult, TmuxDeps } from "../src/tmux.ts";
 import { cleanupCleanEnvs, createCleanEnv, stubsFor, type CleanEnv } from "./clean-env/fixture.ts";
@@ -145,16 +151,27 @@ function currentTools(): unknown {
   return { type: "http", url: toolsHttpUrl(SUITE_URL), headers: { Authorization: `Bearer ${TOKEN}` } };
 }
 
+/** This folder's saved runtime id and token, from its own record (agent_connections.ts). */
+function savedRuntime(fx: CleanEnv): string | undefined {
+  return readAgentConnection(fx.env, fx.root).connection?.record.runtimeId;
+}
+function savedToken(fx: CleanEnv): string | undefined {
+  return readAgentSecrets(fx.env, fx.root)?.token;
+}
+
 describe("init saves the connection where every harness can read it", () => {
-  test("the token is in a 0600 credentials file, never in config.json", async () => {
+  test("the token is in this folder's 0600 credentials file, never in its record", async () => {
     const fx = machine();
     await init(fx);
-    const path = credentialsPath(fx.env);
+    const path = agentCredentialsPath(fx.env, fx.root);
     expect(statSync(path).mode & 0o777).toBe(0o600);
-    expect(readCredentials(fx.env)?.token).toBe(TOKEN);
-    const config = await Bun.file(resolve(fx.home, ".config/suite/config.json")).text();
+    expect(savedToken(fx)).toBe(TOKEN);
+    const config = await Bun.file(agentConfigPath(fx.env, fx.root)).text();
     expect(config).toContain(RUNTIME_ID);
     expect(config).not.toContain(TOKEN);
+    // And the legacy machine-level files are not written at all.
+    expect(existsSync(resolve(fx.home, ".config/suite/config.json"))).toBe(false);
+    expect(existsSync(resolve(fx.home, ".config/suite/credentials.json"))).toBe(false);
   });
 });
 
@@ -233,7 +250,7 @@ describe("suite claude wires this folder from the saved connection", () => {
 describe("no saved connection: suite claude asks the init questions itself", () => {
   test("claude straight away: prompts url, runtime id, token; saves them; wires; launches", async () => {
     const fx = machine();
-    expect(await readConfig({ env: fx.env })).toBeNull();
+    expect(readAgentConnection(fx.env, fx.root).connection).toBeNull();
     const prompter = scripted([SUITE_URL, RUNTIME_ID, TOKEN, ""]);
     const deps = claudeDeps(fx, prompter);
 
@@ -246,8 +263,8 @@ describe("no saved connection: suite claude asks the init questions itself", () 
     // Never the old refusal.
     expect(deps.errLines.join("\n")).not.toContain("run suite init first");
     // Saved, so the next harness (or the next launch) asks nothing.
-    expect((await readConfig({ env: fx.env }))?.runtimeId).toBe(RUNTIME_ID);
-    expect(readCredentials(fx.env)?.token).toBe(TOKEN);
+    expect(savedRuntime(fx)).toBe(RUNTIME_ID);
+    expect(savedToken(fx)).toBe(TOKEN);
     // Wired: plugin cloned, CLAUDE.md written, both entries registered.
     expect(fx.log().some((l) => l.startsWith("git\tclone"))).toBe(true);
     expect(existsSync(resolve(fx.root, "CLAUDE.md"))).toBe(true);
@@ -265,17 +282,14 @@ describe("no saved connection: suite claude asks the init questions itself", () 
     expect(prompter.asked).toEqual([]);
     expect(adds(fx)).toEqual([]);
     expect(deps.errLines.join("\n")).toContain("not connected to a Suite install");
+    expect(deps.errLines.join("\n")).toContain("suite init");
     expect(deps.execed).toHaveLength(1);
   });
 
-  test("a machine connected by an older CLI (no saved token) is asked for the token only, once", async () => {
+  test("a folder whose record has no saved token is asked for the token only, once", async () => {
     const fx = machine();
-    // config.json without credentials.json: what 0.5.x left behind.
-    mkdirSync(resolve(fx.home, ".config/suite"), { recursive: true });
-    writeFileSync(
-      resolve(fx.home, ".config/suite/config.json"),
-      JSON.stringify({ suiteUrl: SUITE_URL, runtimeId: RUNTIME_ID, headerNames: [], sessionNaming: "cwd" }),
-    );
+    // A record with an empty secrets file: the folder is identified, the token is not saved.
+    writeAgentConnection(fx.env, fx.root, { suiteUrl: SUITE_URL, runtimeId: RUNTIME_ID, headerNames: [] }, { token: "", headers: {} });
     const prompter = scripted([TOKEN, ""]);
     const deps = claudeDeps(fx, prompter);
 
@@ -284,7 +298,7 @@ describe("no saved connection: suite claude asks the init questions itself", () 
     expect(prompter.asked.some((q) => q.startsWith("suite url"))).toBe(false);
     expect(prompter.asked.some((q) => q.startsWith("runtime id"))).toBe(false);
     expect(prompter.asked.some((q) => q.startsWith("token"))).toBe(true);
-    expect(readCredentials(fx.env)?.token).toBe(TOKEN);
+    expect(savedToken(fx)).toBe(TOKEN);
   });
 });
 
@@ -303,7 +317,7 @@ describe("re-running init", () => {
       out: () => {},
       run: (argv, opts) => spawnWithSecrets(argv, store, { ...opts, env: fx.env }),
     });
-    expect(readCredentials(fx.env)?.token).toBe(TOKEN);
-    expect((await readConfig({ env: fx.env }))?.suiteUrl).toBe(SUITE_URL);
+    expect(savedToken(fx)).toBe(TOKEN);
+    expect(readAgentConnection(fx.env, fx.root).connection?.record.suiteUrl).toBe(SUITE_URL);
   });
 });

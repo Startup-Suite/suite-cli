@@ -34,7 +34,7 @@ import {
 import { CLAUDE_MD } from "../src/claude_md.ts";
 import { ensureClaudeWiring, type WiringResult } from "../src/claude_wiring.ts";
 import { loadSavedSecrets } from "../src/connection.ts";
-import { readConfig } from "../src/config.ts";
+import { agentConfig, readAgentConnection } from "../src/agent_connections.ts";
 import { createStore, spawnWithSecrets, type Prompter } from "../src/secrets.ts";
 import {
   STUBBED_NOT_PROVEN,
@@ -172,10 +172,12 @@ async function initThenWire(
   deps: InitDeps & { lines: string[] },
 ): Promise<{ init: Awaited<ReturnType<typeof runInit>>; wiring: WiringResult }> {
   const init = await runInit(deps);
-  const config = await readConfig({ env: deps.env });
-  if (config === null) throw new Error("init saved no config");
+  // init saved THIS folder's connection, not a machine-level one.
+  const found = readAgentConnection(deps.env, deps.cwd).connection;
+  if (found === null) throw new Error("init saved no connection for this folder");
+  const config = agentConfig(deps.env, found.record);
   const store = createStore();
-  loadSavedSecrets(deps.env, config, store);
+  loadSavedSecrets(deps.env, deps.cwd, config, store);
   const wiring = await ensureClaudeWiring(
     {
       env: deps.env,
