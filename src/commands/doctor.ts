@@ -1543,9 +1543,9 @@ export async function runDoctor(deps: DoctorDeps): Promise<number> {
 
 export async function liveDoctorDeps(
   env: Record<string, string | undefined> = process.env,
+  cwd: string = process.cwd(),
 ): Promise<DoctorDeps> {
   const tmux = liveTmuxDeps(env);
-  const cwd = process.cwd();
   // THIS folder's record: identity never comes from the legacy machine connection.
   const own = readAgentConnection(env, cwd).connection;
   return {

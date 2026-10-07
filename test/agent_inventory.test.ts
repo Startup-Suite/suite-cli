@@ -28,6 +28,7 @@ import {
 import { AGENT_CONFIG_FILE } from "../src/commands/deepseek.ts";
 import {
   agentsVerdict,
+  liveDoctorDeps,
   liveInventorySource,
   runChecks,
   type CheckResult,
@@ -282,6 +283,25 @@ describe("doctor: the agents check", () => {
     const deps = doctorDeps(bx, bx.a);
     delete (deps as Partial<DoctorDeps>).inventory;
     expect(byId(await runChecks(deps), "agents").status).toBe("skip");
+  });
+
+  test("the LIVE doctor deps read the agent inventory, and this folder's record — never the legacy connection", async () => {
+    const bx = box();
+    const { A, B } = agents();
+    writeLegacy(bx, B);
+    record(bx, bx.a, A);
+    writeClaudeJson(bx, { [bx.a]: B });
+    const live = await liveDoctorDeps(bx.fx.env, bx.a);
+    expect(live.inventory).toBeDefined();
+    expect(live.config?.runtimeId).toBe(A.runtime);
+    expect(live.tokenSaved).toBe(true);
+    // An unrecorded folder is NOT connected, whatever the legacy connection says.
+    const elsewhere = await liveDoctorDeps(bx.fx.env, bx.elsewhere);
+    expect(elsewhere.config?.runtimeId).toBe("");
+    expect(elsewhere.tokenSaved).toBe(false);
+    const quiet = { which: () => null, run: async () => ({ exitCode: 1, stdout: "", stderr: "" }), out: () => {} };
+    const c = byId(await runChecks({ ...live, ...quiet }), "agents");
+    expect(c.status === "fail" && c.value).toBe("cross-wired");
   });
 
   test("agentsVerdict is fail on cross-wiring and pass on match, from rows alone", () => {
