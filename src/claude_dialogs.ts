@@ -49,13 +49,37 @@ export const SUITE_CHANNEL = "server:suite-channel";
 /** What the cursor glyph looks like in Claude Code's select lists. */
 const CURSOR = "❯";
 
-export type DialogName = "trust-folder" | "dev-channels" | "bypass-permissions" | "mcp-server";
+export type DialogName =
+  | "trust-folder"
+  | "dev-channels"
+  | "bypass-permissions"
+  | "mcp-server"
+  | "theme"
+  | "security-notes"
+  | "api-key-confirm";
 
 export interface DialogContext {
   /** The folder the agent was launched in. The trust dialog must name it. */
   cwd?: string;
   /** `$HOME`, so a `~/…` rendering of the folder also matches. */
   home?: string;
+  /**
+   * The `ANTHROPIC_API_KEY` this agent was launched with, if any. The API-key
+   * confirmation is answered only when the key it shows is this one. Never
+   * logged, never written anywhere: it is only compared.
+   */
+  apiKey?: string;
+}
+
+/**
+ * How Claude Code 2.1.295 shows an `ANTHROPIC_API_KEY` in its confirmation:
+ * `sk-ant-...` and the key's last 20 characters (measured on moon with a fake
+ * key, 2026-10-09). Null for anything that is not an Anthropic key, so a
+ * screen naming some other key is never answered.
+ */
+export function maskedApiKey(key: string | undefined): string | null {
+  if (key === undefined || !key.startsWith("sk-ant-") || key.length < 28 || /\s/.test(key)) return null;
+  return `sk-ant-...${key.slice(-20)}`;
 }
 
 interface DialogSpec {
@@ -108,6 +132,16 @@ function folderMatches(shown: string, ctx: DialogContext): boolean {
  *    this dialog, and with `--dangerously-skip-permissions` 2.1.288 did not
  *    show it at all — it is here so a project `.mcp.json` cannot park an
  *    agent.)
+ *  - api-key-confirm: Claude Code asks whether to use the `ANTHROPIC_API_KEY`
+ *    it found in its environment, and the cursor starts on "No (recommended)".
+ *    Up moves it to "Yes"; Enter confirms only once it is there. Answered ONLY
+ *    when the key it shows is the one this agent was launched with
+ *    (`DialogContext.apiKey`): on a Suite native agent that key reached the
+ *    environment because a person who manages the agent saved it in Suite for
+ *    exactly this, so "Yes" carries out their choice rather than making one.
+ *    It is an API key, not a Claude account login: nothing here ever touches
+ *    the subscription login screens, which stay the person's, in Anthropic's
+ *    own flow.
  */
 export const DIALOGS: readonly DialogSpec[] = [
   {
@@ -153,6 +187,18 @@ export const DIALOGS: readonly DialogSpec[] = [
     options: ["Use this MCP server", "Use this and all future MCP servers in this project", "Continue without using this MCP server"],
     check: (f) => /^\S+$/.test(f.server ?? ""),
     keys: (cursor) => (cursor === "Continue without using this MCP server" ? ["Enter"] : null),
+  },
+  {
+    name: "api-key-confirm",
+    template:
+      "Detected a custom API key in your environment ANTHROPIC_API_KEY: {masked} " +
+      `Do you want to use this API key? Yes No (recommended) ${DIALOG_FOOTER}`,
+    options: ["Yes", "No (recommended)"],
+    check: (f, ctx) => {
+      const want = maskedApiKey(ctx.apiKey);
+      return want !== null && f.masked === want;
+    },
+    keys: (cursor) => (cursor === "No (recommended)" ? ["Up"] : ["Enter"]),
   },
 ];
 
@@ -209,6 +255,11 @@ export function classifyPane(pane: string, ctx: DialogContext = {}): DialogStep 
   while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   if (lines.length === 0) return { kind: "none" };
 
+  const theme = classifyThemePicker(lines);
+  if (theme !== null) return theme;
+  const notes = classifySecurityNotes(lines);
+  if (notes !== null) return notes;
+
   const last = lines[lines.length - 1]!.trim();
   if (last !== DIALOG_FOOTER) return isReady(lines) ? { kind: "ready" } : { kind: "none" };
 
@@ -245,6 +296,98 @@ export function classifyPane(pane: string, ctx: DialogContext = {}): DialogStep 
     return { kind: "answer", dialog: spec.name, keys };
   }
   return { kind: "unknown", title };
+}
+
+/* ------------------------------------------------------------------------- */
+/* The first-run theme picker                                                 */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The text-style picker Claude Code shows on the very FIRST launch under a
+ * home it has not seen, before the login screens. It has no
+ * "Enter to confirm" footer, so the dialog table above cannot see it, and an
+ * agent nobody can type into (a native agent run by Suite's agent host) would
+ * sit on it forever.
+ *
+ * Choosing a colour scheme grants nothing and consents to nothing, so it is
+ * answered: Enter, which keeps whichever entry is highlighted (the default).
+ * Recognised by the same rule as every dialog here — the heading, the hint
+ * line and the seven options word for word, in order, with exactly one cursor
+ * on one of them. Anything else is not answered.
+ *
+ * Captured from Claude Code 2.1.295 at 80 and 120 columns; fixtures under
+ * test/fixtures/claude-code-2.1.295-login/.
+ */
+export const THEME_HEADING = "Choose the text style that looks best with your terminal";
+export const THEME_HINT = "To change this later, run /theme";
+export const THEME_OPTIONS = [
+  "Auto (match terminal)",
+  "Dark mode",
+  "Light mode",
+  "Dark mode (colorblind-friendly)",
+  "Light mode (colorblind-friendly)",
+  "Dark mode (ANSI colors only)",
+  "Light mode (ANSI colors only)",
+] as const;
+
+/** The check mark Claude Code puts before the currently applied theme. */
+const APPLIED = "✔";
+
+function classifyThemePicker(lines: string[]): DialogStep | null {
+  const start = lines.findIndex((l) => l.trim() === THEME_HEADING);
+  if (start === -1) return null;
+  const rest = lines.slice(start + 1).filter((l) => l.trim() !== "");
+  if (rest[0]?.trim() !== THEME_HINT) return null;
+  const optionLines = rest.slice(1, 1 + THEME_OPTIONS.length);
+  if (optionLines.length !== THEME_OPTIONS.length) return null;
+  let cursors = 0;
+  for (let i = 0; i < THEME_OPTIONS.length; i++) {
+    let text = optionLines[i]!.trim();
+    if (text.startsWith(`${CURSOR} `)) {
+      cursors++;
+      text = text.slice(CURSOR.length).trim();
+    }
+    if (text.startsWith(`${APPLIED} `)) text = text.slice(APPLIED.length).trim();
+    if (text !== THEME_OPTIONS[i]) return null;
+  }
+  if (cursors !== 1) return { kind: "hold", dialog: "theme", reason: "no single cursor on a known option" };
+  return { kind: "answer", dialog: "theme", keys: ["Enter"] };
+}
+
+/* ------------------------------------------------------------------------- */
+/* The first-run security notes                                               */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The last step of Claude Code 2.1.295's first-run onboarding, pushed with no
+ * condition after theme / api-key / oauth. An unattended launch never sees it,
+ * because `SUITE_UNATTENDED=1` seeds `hasCompletedOnboarding` first
+ * (claude_onboarding.ts). This is the FALLBACK for a Claude Code that shows it
+ * anyway (a seed that did not take, or a future CLI).
+ *
+ * It is a notice with one action, "Press Enter to continue…": no choice,
+ * nothing granted, nothing consented to beyond reading it. Answered with
+ * Enter, and only when the whole block is on screen word for word, in order,
+ * with the prompt as the LAST line (so an agent quoting it in a transcript is
+ * not it). Captured at 80 and 120 columns: Claude draws it 70 wide at both.
+ */
+export const SECURITY_NOTES_LINES = [
+  "Security notes:",
+  "1. Claude can make mistakes.",
+  "You're responsible for Claude's actions and should always",
+  "review them, especially when running code.",
+  "2. Due to prompt injection risks, only use it with code you trust",
+  "Learn more: https://code.claude.com/docs/en/security",
+  "Press Enter to continue…",
+] as const;
+
+function classifySecurityNotes(lines: string[]): DialogStep | null {
+  const block = lines.map((l) => l.trim()).filter((l) => l !== "");
+  const n = SECURITY_NOTES_LINES.length;
+  if (block.length < n) return null;
+  const tail = block.slice(-n);
+  for (let i = 0; i < n; i++) if (tail[i] !== SECURITY_NOTES_LINES[i]) return null;
+  return { kind: "answer", dialog: "security-notes", keys: ["Enter"] };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -290,6 +433,8 @@ export interface AnswerOptions {
   session: string;
   cwd: string;
   home?: string;
+  /** See `DialogContext.apiKey`. */
+  apiKey?: string;
   windowMs?: number;
   pollMs?: number;
 }
@@ -302,6 +447,8 @@ export interface Answer {
 export interface AnswerResult {
   outcome: "ready" | "timeout" | "gone";
   answered: Answer[];
+  /** For `ready`: the frame on which the input box was seen. */
+  pane?: string;
 }
 
 /** tmux's exact-match target for a session's active pane. See rule 3. */
@@ -329,7 +476,7 @@ export async function answerLaunchDialogs(io: DialogIo, opts: AnswerOptions): Pr
   const tmux = resolveTmux(io.tmux.which);
   const windowMs = opts.windowMs ?? DIALOG_WINDOW_MS;
   const pollMs = opts.pollMs ?? DIALOG_POLL_MS;
-  const ctx: DialogContext = { cwd: opts.cwd, home: opts.home };
+  const ctx: DialogContext = { cwd: opts.cwd, home: opts.home, apiKey: opts.apiKey };
   const deadline = io.now() + windowMs;
   const answered: Answer[] = [];
   let lastSent: { pane: string; at: number } | null = null;
@@ -347,7 +494,7 @@ export async function answerLaunchDialogs(io: DialogIo, opts: AnswerOptions): Pr
     // --continue fallback relaunches Claude.
     if (lastSent !== null && cap.stdout !== lastSent.pane) lastSent = null;
     const step = classifyPane(cap.stdout, ctx);
-    if (step.kind === "ready") return { outcome: "ready", answered };
+    if (step.kind === "ready") return { outcome: "ready", answered, pane: cap.stdout };
 
     if (step.kind === "answer") {
       const fresh = lastSent === null || io.now() - lastSent.at >= DIALOG_RESEND_MS;
@@ -385,7 +532,7 @@ export async function answerOnce(io: DialogIo, opts: AnswerOptions): Promise<Ans
   const tmux = resolveTmux(io.tmux.which);
   const cap = await io.tmux.run(dialogCaptureArgv(opts.session, tmux));
   if (cap.exitCode !== 0) return null;
-  const step = classifyPane(cap.stdout, { cwd: opts.cwd, home: opts.home });
+  const step = classifyPane(cap.stdout, { cwd: opts.cwd, home: opts.home, apiKey: opts.apiKey });
   if (step.kind !== "answer") return null;
   await io.tmux.run(dialogKeysArgv(opts.session, step.keys, tmux));
   io.log(opts.session, `launch dialogs: answered ${step.dialog} with ${step.keys.join(" ")} (watchdog)`);

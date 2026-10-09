@@ -39,6 +39,10 @@ import { CHANNEL_SERVER, TOOLS_SERVER, confirm, defaultCheckout, type InstallPla
 import { CLAUDE_CODE_URL } from "./doctor.ts";
 import { colorEnabled } from "../ui.ts";
 import { answerLaunchDialogs, liveDialogIo, sessionLogPath, type AnswerResult, type DialogIo } from "../claude_dialogs.ts";
+import { launchRecordPath, writeLaunchRecord, type LaunchRecord } from "../claude_launch.ts";
+import { authError } from "../claude_login.ts";
+import { isUnattended, seedLogLine, seedOnboarding, type SeedOutcome } from "../claude_onboarding.ts";
+import { claudeJsonPath } from "./init.ts";
 import {
   attachArgv,
   composeNewSession,
@@ -606,6 +610,18 @@ export interface ClaudeDeps {
    */
   dialogs?: DialogIo;
   /**
+   * Seeds Claude Code's `hasCompletedOnboarding` before an UNATTENDED launch
+   * (`SUITE_UNATTENDED=1`, see claude_onboarding.ts). Optional for the same
+   * reason `dialogs` is: a caller that supplies nothing seeds nothing, so the
+   * launch tests never write a ~/.claude.json.
+   */
+  seedOnboarding?(claudeJson: string): SeedOutcome;
+  /**
+   * Writes the session's launch record (claude_launch.ts), which pane-status
+   * reads. Optional: a caller that supplies nothing records nothing.
+   */
+  writeLaunch?(path: string, record: LaunchRecord): void;
+  /**
    * Injected so the settle wait is instant in tests and real on a machine.
    * Optional: a caller that supplies nothing gets the real one.
    */
@@ -691,6 +707,11 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
   if (plan.direct !== undefined) return deps.exec(plan.direct);
 
   if (plan.kill !== undefined) await deps.tmux.run(plan.kill);
+  if (plan.create !== undefined && isUnattended(deps.env) && deps.seedOnboarding !== undefined) {
+    // Nobody will see Claude's first-run screens, so mark them done first.
+    const claudeJson = claudeJsonPath(deps.env);
+    deps.err(seedLogLine(deps.seedOnboarding(claudeJson), claudeJson));
+  }
   if (plan.create !== undefined) {
     const created = await deps.tmux.run(plan.create);
     if (created.exitCode !== 0) {
@@ -808,9 +829,41 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
   let answering: Promise<AnswerResult> | null = null;
   let answeringDone = false;
   if (plan.create !== undefined && deps.dialogs !== undefined) {
-    answering = answerLaunchDialogs(deps.dialogs, { session, cwd: deps.cwd, home: deps.env.HOME }).finally(() => {
-      answeringDone = true;
-    });
+    const home = deps.env.HOME ?? "";
+    const recordPath = launchRecordPath(home, session);
+    const startedAt = new Date().toISOString();
+    const record = (r: LaunchRecord): void => {
+      try {
+        deps.writeLaunch?.(recordPath, r);
+      } catch (error) {
+        deps.err(`suite: could not write ${recordPath}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    };
+    record({ version: 1, session, outcome: "pending", started_at: startedAt });
+    answering = answerLaunchDialogs(deps.dialogs, {
+      session,
+      cwd: deps.cwd,
+      home: deps.env.HOME,
+      apiKey: deps.env.ANTHROPIC_API_KEY,
+    })
+      .then((result) => {
+        // What the launch saw, for pane-status: a timeout turns a lasting
+        // `starting` into `stuck`; the baseline keeps a pre-restart auth error
+        // (re-rendered by --continue) from reading as a new one.
+        record({
+          version: 1,
+          session,
+          outcome: result.outcome,
+          started_at: startedAt,
+          finished_at: new Date().toISOString(),
+          answered: result.answered.map((a) => a.dialog),
+          baseline: result.pane === undefined ? null : (authError(result.pane)?.signature ?? null),
+        });
+        return result;
+      })
+      .finally(() => {
+        answeringDone = true;
+      });
   }
   const finish = async (code: number): Promise<number> => {
     if (answering === null) return code;
@@ -990,6 +1043,8 @@ export async function liveClaudeDeps(
     // File only, no echo: while the attach owns the terminal, a line on stderr
     // would draw across the tmux client. The summary is printed after it.
     dialogs: liveDialogIo(liveTmuxDeps(env), env.HOME ?? "", () => {}),
+    seedOnboarding: (claudeJson) => seedOnboarding(claudeJson),
+    writeLaunch: writeLaunchRecord,
     tmux: liveTmuxDeps(env),
     platform: process.platform,
     prompter,

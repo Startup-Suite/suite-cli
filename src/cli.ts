@@ -59,6 +59,7 @@ import { liveOpenclawDeps, runOpenclaw } from "./commands/openclaw.ts";
 import { liveUpdateDeps, runUpdate } from "./commands/update.ts";
 import { liveCodexDeps, runCodex } from "./commands/codex.ts";
 import { ttyPrompter } from "./secrets.ts";
+import { livePaneStatusDeps, runPaneStatus } from "./commands/pane_status.ts";
 
 export type Verb =
   | "init"
@@ -72,7 +73,8 @@ export type Verb =
   | "status"
   | "update"
   | "watch"
-  | "restore";
+  | "restore"
+  | "pane-status";
 
 export interface Dispatch {
   verb: Verb | null;
@@ -80,7 +82,7 @@ export interface Dispatch {
   args: string[];
 }
 
-const VERBS = new Set(["init", "claude", "deepseek", "hermes", "openclaw", "codex", "doctor", "status", "update", "watch", "restore"]);
+const VERBS = new Set(["init", "claude", "deepseek", "hermes", "openclaw", "codex", "doctor", "status", "update", "watch", "restore", "pane-status"]);
 
 /**
  * Pure: map argv to a verb plus untouched passthrough arguments.
@@ -177,6 +179,7 @@ export function usage(): string {
     row("status", "show every agent folder, session state and stamped agents (kind, root, live/stale, last verdict)"),
     row("", "--json [--dir PATH]: one JSON document on stdout (see README, Status contract)"),
     row("watch", "recover halted agent sessions (--dry-run, --once, --interval N, --force SESSION)"),
+    row("pane-status", "one agent session's state as JSON, for a supervisor (--session NAME, --answer)"),
     row("restore", "bring recorded agents back up (--adopt, --dry-run, --forget NAME)"),
     row("update", "install the latest suite CLI"),
     "",
@@ -331,6 +334,10 @@ export async function run(argv: string[]): Promise<number> {
     // Failing to restore an agent is a real failure; a fully-skipped run on a
     // healthy box is a success, which is what makes this safe to run at boot.
     return res.failed.length > 0 ? 1 : 0;
+  }
+  if (verb === "pane-status") {
+    const { args } = parse(argv);
+    return runPaneStatus(livePaneStatusDeps(), args);
   }
   if (verb === "update") return runUpdate(liveUpdateDeps());
   if (verb === "doctor") return runDoctor(await liveDoctorDeps());
