@@ -1,0 +1,24 @@
+No conversation found to continue
+suite: exit 1 with --continue; starting a fresh session (no conversation here to
+ continue)
+ ▐▛███▛█   Claude Code v2.1.295
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   ~/work
+
+▎ --dangerously-load-development-channels ignored (server:suite-channel)
+▎ Channels are not currently available
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents
+                                                    Not logged in · Run /login
+                                                            ◐ medium · /effort
+
+
+
+
+
+
+
+

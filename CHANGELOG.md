@@ -25,6 +25,13 @@ behaviour anyone was relying on.
   (`~/.local/state/suite/sessions/<session>.launch.json`, 0600). Once its
   launch poll has timed out, a pane that is still not usable reads `stuck`
   with a `reason`, not `starting` forever.
+- **A credential rejected at startup reads `needs_login`** (`auth_error`):
+  2.1.295 shows "⚠ Remote managed settings failed to load (authentication
+  rejected (401))" and then DROPS every development-channel message, so no
+  turn ever runs. pane-status records `auth_rejected` on the launch record
+  the first time it sees it. **No credential at all** (the input box marked
+  "Not logged in · Run /login", which a seeded launch reaches) reads
+  `needs_login` with `login.step: "not_logged_in"`.
 - **A turn that failed on its credential reads `needs_login`** with
   `login.step: "auth_error"` (2.1.295's "Invalid API key · Fix external API
   key" and its siblings, measured / read from the binary). The failure

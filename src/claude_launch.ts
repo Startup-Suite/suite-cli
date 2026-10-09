@@ -19,6 +19,9 @@
  * on the first frame where Claude's input box was up; only a different one is
  * a new failure (claude_login.ts `authError`).
  *
+ * pane-status adds one fact to it: `auth_rejected`, once this launch's startup
+ * notice said its credential was rejected.
+ *
  * The record holds no secret, no pane text beyond those few signature lines,
  * and is written 0600 in a 0700 directory.
  */
@@ -37,6 +40,12 @@ export interface LaunchRecord {
   answered?: string[];
   /** The auth-error signature on screen when the input box first appeared, or null. */
   baseline?: string | null;
+  /**
+   * Set by pane-status the first time it sees this launch's startup notice
+   * that the credential was REJECTED (claude_login.ts AUTH_REJECTED_NOTICE).
+   * The notice can scroll away; the launch's credential stays rejected.
+   */
+  auth_rejected?: boolean;
 }
 
 /** `~/.local/state/suite/sessions/<session>.launch.json`. */

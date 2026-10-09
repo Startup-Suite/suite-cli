@@ -18,8 +18,8 @@
  * Exit status: 0 when the session exists, 1 when it is gone, 2 for bad usage.
  */
 import { answerOnce, dialogCaptureArgv, sessionLogger, type DialogIo } from "../claude_dialogs.ts";
-import { launchRecordPath, readLaunchRecord, type LaunchRecord } from "../claude_launch.ts";
-import { paneStatus, sessionStatusPath, writePaneStatus, type PaneStatus } from "../claude_login.ts";
+import { launchRecordPath, readLaunchRecord, writeLaunchRecord, type LaunchRecord } from "../claude_launch.ts";
+import { authRejected, paneStatus, sessionStatusPath, writePaneStatus, type PaneStatus } from "../claude_login.ts";
 import { resolveTmux } from "../halt.ts";
 import { liveTmuxDeps, type TmuxDeps } from "../tmux.ts";
 
@@ -54,6 +54,8 @@ export interface PaneStatusDeps {
   write(path: string, status: PaneStatus): void;
   /** The session's launch record (claude_launch.ts), or null. Optional: none read. */
   readLaunch?(path: string): LaunchRecord | null;
+  /** Records `auth_rejected` on the launch record. Optional: none written. */
+  writeLaunch?(path: string, record: LaunchRecord): void;
   dialogs: DialogIo;
 }
 
@@ -71,7 +73,16 @@ export async function runPaneStatus(deps: PaneStatusDeps, args: string[]): Promi
 
   const tmux = resolveTmux(deps.tmux.which);
   const cap = await deps.tmux.run(dialogCaptureArgv(session, tmux));
-  const launch = deps.readLaunch?.(launchRecordPath(home, session)) ?? null;
+  const launchPath = launchRecordPath(home, session);
+  let launch = deps.readLaunch?.(launchPath) ?? null;
+  if (launch !== null && launch.auth_rejected !== true && cap.exitCode === 0 && authRejected(cap.stdout)) {
+    launch = { ...launch, auth_rejected: true };
+    try {
+      deps.writeLaunch?.(launchPath, launch);
+    } catch (error) {
+      deps.err(`suite pane-status: could not write the launch record: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   const status = paneStatus(session, cap.exitCode === 0 ? cap.stdout : null, { cwd: deps.cwd, home, apiKey }, deps.now(), launch);
   try {
     deps.write(sessionStatusPath(home, session), status);
@@ -96,6 +107,7 @@ export function livePaneStatusDeps(): PaneStatusDeps {
     err: (line) => console.error(line),
     write: writePaneStatus,
     readLaunch: readLaunchRecord,
+    writeLaunch: writeLaunchRecord,
     dialogs: { tmux, now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)), log },
   };
 }

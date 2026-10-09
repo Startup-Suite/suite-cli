@@ -29,7 +29,7 @@ import { dirname } from "node:path";
 import { classifyPane, type DialogContext, type DialogName } from "./claude_dialogs.ts";
 import type { LaunchRecord } from "./claude_launch.ts";
 
-export type LoginStep = "login_method" | "login_url" | "api_key_confirm" | "auth_error";
+export type LoginStep = "login_method" | "login_url" | "api_key_confirm" | "auth_error" | "not_logged_in";
 
 export interface LoginScreen {
   step: LoginStep;
@@ -150,14 +150,9 @@ const ERROR_LINE = /^⎿\s+(.+)$/;
 export function authError(pane: string): AuthError | null {
   const lines = pane.split("\n").map((l) => l.trimEnd());
   // The input box: `❯` at column 0 between two rules. Search from the bottom.
-  let top = -1;
-  for (let i = lines.length - 2; i >= 1; i--) {
-    if (lines[i]!.startsWith("❯") && RULE_LINE.test(lines[i - 1]!.trim()) && RULE_LINE.test(lines[i + 1]!.trim())) {
-      top = i - 1;
-      break;
-    }
-  }
-  if (top === -1) return null;
+  const box = inputBox(lines);
+  if (box === null) return null;
+  const top = box.top;
   for (let e = top - 1; e >= 0; e--) {
     const line = lines[e]!;
     if (line.startsWith("❯ ") || line.trim().startsWith("●")) return null;
@@ -176,6 +171,57 @@ export function authError(pane: string): AuthError | null {
     return { error, signature: [before, line.trim(), (done ?? "").trim()].join("\n") };
   }
   return null;
+}
+
+/**
+ * The input box's status line when Claude has no credential at all (measured
+ * on 2.1.295 in Suite's agent host, `hasCompletedOnboarding` seeded, no key:
+ * the onboarding's login-method step is skipped, so this is where it shows).
+ */
+export const NOT_LOGGED_IN_MARK = "Not logged in · Run /login";
+
+/**
+ * The startup notice 2.1.295 shows when the credential it was given is
+ * REJECTED: its remote managed-settings fetch gets a 401 (measured on moon with
+ * a well-formed invalid ANTHROPIC_API_KEY, in Suite's agent host). Claude then
+ * holds the development channel "waiting for your organization's policy" and
+ * DROPS every inbound message, so no turn ever runs and the per-turn error
+ * below never appears. This notice is the only sign. It belongs to the running
+ * process, not the transcript, so `--continue` does not re-render it.
+ */
+export const AUTH_REJECTED_NOTICE = "⚠ Remote managed settings failed to load (authentication rejected (401))";
+
+function inputBox(lines: string[]): { top: number; bottom: number } | null {
+  for (let i = lines.length - 2; i >= 1; i--) {
+    if (lines[i]!.startsWith("❯") && RULE_LINE.test(lines[i - 1]!.trim()) && RULE_LINE.test(lines[i + 1]!.trim())) {
+      return { top: i - 1, bottom: i + 1 };
+    }
+  }
+  return null;
+}
+
+/** True when the input box's status area says Claude has no credential. Pure. */
+export function notLoggedIn(pane: string): boolean {
+  const lines = pane.split("\n").map((l) => l.trimEnd());
+  const box = inputBox(lines);
+  if (box === null) return false;
+  return lines.slice(box.bottom + 1).some((l) => l.trim().endsWith(NOT_LOGGED_IN_MARK));
+}
+
+/** True when this process's startup notice says its credential was rejected. Pure. */
+export function authRejected(pane: string): boolean {
+  const lines = pane.split("\n").map((l) => l.trimEnd());
+  const box = inputBox(lines);
+  if (box === null) return false;
+  const head = lines.slice(0, box.top);
+  for (let i = 0; i < head.length; i++) {
+    if (!head[i]!.startsWith("⚠ ")) continue;
+    // The notice wraps at the pane width; its continuation lines are indented.
+    let text = head[i]!;
+    for (let j = i + 1; j < head.length && /^\s+\S/.test(head[j]!); j++) text += ` ${head[j]!.trim()}`;
+    if (text.replace(/\s+/g, " ").startsWith(AUTH_REJECTED_NOTICE)) return true;
+  }
+  return false;
 }
 
 /** (captured pane) → the login screen it shows, or null. Pure. */
@@ -246,6 +292,13 @@ export function paneStatus(
   // Any other login screen, or that confirmation for a different key, is.
   const ownKey = login?.step === "api_key_confirm" && step.kind === "answer" && step.dialog === "api-key-confirm";
   if (login !== null && !ownKey) return { ...base, state: "needs_login", login };
+  // This launch's credential was rejected at startup (the record keeps it
+  // once seen, so a scrolled-off notice does not read as recovered), or there
+  // is no credential at all.
+  if (launch?.auth_rejected === true || authRejected(pane)) {
+    return { ...base, state: "needs_login", login: { step: "auth_error" } };
+  }
+  if (notLoggedIn(pane)) return { ...base, state: "needs_login", login: { step: "not_logged_in" } };
   // A turn that failed for want of a working credential, unless it is the one
   // that was already on screen when this launch's input box came up.
   const auth = authError(pane);
