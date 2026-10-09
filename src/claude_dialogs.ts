@@ -49,7 +49,7 @@ export const SUITE_CHANNEL = "server:suite-channel";
 /** What the cursor glyph looks like in Claude Code's select lists. */
 const CURSOR = "❯";
 
-export type DialogName = "trust-folder" | "dev-channels" | "bypass-permissions" | "mcp-server";
+export type DialogName = "trust-folder" | "dev-channels" | "bypass-permissions" | "mcp-server" | "theme";
 
 export interface DialogContext {
   /** The folder the agent was launched in. The trust dialog must name it. */
@@ -209,6 +209,9 @@ export function classifyPane(pane: string, ctx: DialogContext = {}): DialogStep 
   while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   if (lines.length === 0) return { kind: "none" };
 
+  const theme = classifyThemePicker(lines);
+  if (theme !== null) return theme;
+
   const last = lines[lines.length - 1]!.trim();
   if (last !== DIALOG_FOOTER) return isReady(lines) ? { kind: "ready" } : { kind: "none" };
 
@@ -245,6 +248,62 @@ export function classifyPane(pane: string, ctx: DialogContext = {}): DialogStep 
     return { kind: "answer", dialog: spec.name, keys };
   }
   return { kind: "unknown", title };
+}
+
+/* ------------------------------------------------------------------------- */
+/* The first-run theme picker                                                 */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The text-style picker Claude Code shows on the very FIRST launch under a
+ * home it has not seen, before the login screens. It has no
+ * "Enter to confirm" footer, so the dialog table above cannot see it, and an
+ * agent nobody can type into (a native agent run by Suite's agent host) would
+ * sit on it forever.
+ *
+ * Choosing a colour scheme grants nothing and consents to nothing, so it is
+ * answered: Enter, which keeps whichever entry is highlighted (the default).
+ * Recognised by the same rule as every dialog here — the heading, the hint
+ * line and the seven options word for word, in order, with exactly one cursor
+ * on one of them. Anything else is not answered.
+ *
+ * Captured from Claude Code 2.1.295 at 80 and 120 columns; fixtures under
+ * test/fixtures/claude-code-2.1.295-login/.
+ */
+export const THEME_HEADING = "Choose the text style that looks best with your terminal";
+export const THEME_HINT = "To change this later, run /theme";
+export const THEME_OPTIONS = [
+  "Auto (match terminal)",
+  "Dark mode",
+  "Light mode",
+  "Dark mode (colorblind-friendly)",
+  "Light mode (colorblind-friendly)",
+  "Dark mode (ANSI colors only)",
+  "Light mode (ANSI colors only)",
+] as const;
+
+/** The check mark Claude Code puts before the currently applied theme. */
+const APPLIED = "✔";
+
+function classifyThemePicker(lines: string[]): DialogStep | null {
+  const start = lines.findIndex((l) => l.trim() === THEME_HEADING);
+  if (start === -1) return null;
+  const rest = lines.slice(start + 1).filter((l) => l.trim() !== "");
+  if (rest[0]?.trim() !== THEME_HINT) return null;
+  const optionLines = rest.slice(1, 1 + THEME_OPTIONS.length);
+  if (optionLines.length !== THEME_OPTIONS.length) return null;
+  let cursors = 0;
+  for (let i = 0; i < THEME_OPTIONS.length; i++) {
+    let text = optionLines[i]!.trim();
+    if (text.startsWith(`${CURSOR} `)) {
+      cursors++;
+      text = text.slice(CURSOR.length).trim();
+    }
+    if (text.startsWith(`${APPLIED} `)) text = text.slice(APPLIED.length).trim();
+    if (text !== THEME_OPTIONS[i]) return null;
+  }
+  if (cursors !== 1) return { kind: "hold", dialog: "theme", reason: "no single cursor on a known option" };
+  return { kind: "answer", dialog: "theme", keys: ["Enter"] };
 }
 
 /* ------------------------------------------------------------------------- */

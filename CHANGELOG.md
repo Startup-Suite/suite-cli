@@ -10,6 +10,29 @@ that matters in the field: is this one newer than what I had?
 Minor for a new capability or a changed default; patch for a fix that changes no
 behaviour anyone was relying on.
 
+## 0.8.0
+
+- **`suite pane-status --session NAME [--answer]`: one look at an agent's
+  Claude Code pane, as JSON**, for a supervisor with no terminal (Suite's
+  agent host, which runs native agents as their own OS users). It prints one
+  document and writes the same one to
+  `~/.local/state/suite/sessions/<session>.status.json` (0600, atomic):
+  `state` is `ready`, `dialog`, `needs_login`, `unknown_dialog`, `starting` or
+  `gone`. There is still ONE pane classifier, and it is this CLI's.
+- **Login screens are recognised and reported, never answered.** The
+  login-method chooser, the sign-in URL screen and the API-key confirmation
+  read as `needs_login` with `login.step` (`login_method`, `login_url`,
+  `api_key_confirm`); on the URL screen the status carries the sign-in URL
+  Claude Code printed, re-joined across its wrapping. The CLI never chooses a
+  login method, never types into a login screen, and never reads, stores or
+  relays a credential or a login code: logging in is Anthropic's flow,
+  completed by the person.
+- **The first-run theme picker is answered** (Enter, keeping the highlighted
+  default), by the same word-for-word rule as the launch dialogs. Choosing a
+  colour scheme grants nothing, and without an answer an agent nobody can
+  type into stopped there for good. `--answer` answers one known screen
+  through `answerOnce`, as `suite watch` does.
+
 ## 0.7.2
 
 - **dsh `usage_event` names the task and stage it belongs to.** The
