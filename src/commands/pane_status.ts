@@ -18,6 +18,7 @@
  * Exit status: 0 when the session exists, 1 when it is gone, 2 for bad usage.
  */
 import { answerOnce, dialogCaptureArgv, sessionLogger, type DialogIo } from "../claude_dialogs.ts";
+import { launchRecordPath, readLaunchRecord, type LaunchRecord } from "../claude_launch.ts";
 import { paneStatus, sessionStatusPath, writePaneStatus, type PaneStatus } from "../claude_login.ts";
 import { resolveTmux } from "../halt.ts";
 import { liveTmuxDeps, type TmuxDeps } from "../tmux.ts";
@@ -51,6 +52,8 @@ export interface PaneStatusDeps {
   out(line: string): void;
   err(line: string): void;
   write(path: string, status: PaneStatus): void;
+  /** The session's launch record (claude_launch.ts), or null. Optional: none read. */
+  readLaunch?(path: string): LaunchRecord | null;
   dialogs: DialogIo;
 }
 
@@ -68,7 +71,8 @@ export async function runPaneStatus(deps: PaneStatusDeps, args: string[]): Promi
 
   const tmux = resolveTmux(deps.tmux.which);
   const cap = await deps.tmux.run(dialogCaptureArgv(session, tmux));
-  const status = paneStatus(session, cap.exitCode === 0 ? cap.stdout : null, { cwd: deps.cwd, home, apiKey }, deps.now());
+  const launch = deps.readLaunch?.(launchRecordPath(home, session)) ?? null;
+  const status = paneStatus(session, cap.exitCode === 0 ? cap.stdout : null, { cwd: deps.cwd, home, apiKey }, deps.now(), launch);
   try {
     deps.write(sessionStatusPath(home, session), status);
   } catch (error) {
@@ -91,6 +95,7 @@ export function livePaneStatusDeps(): PaneStatusDeps {
     out: (line) => console.log(line),
     err: (line) => console.error(line),
     write: writePaneStatus,
+    readLaunch: readLaunchRecord,
     dialogs: { tmux, now: () => Date.now(), sleep: (ms) => new Promise((r) => setTimeout(r, ms)), log },
   };
 }

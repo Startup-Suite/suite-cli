@@ -26,6 +26,8 @@ import { emptyConfig } from "../src/config.ts";
 import { detectState, killSessionArgv, liveTmuxDeps, sessionNameFromConfig } from "../src/tmux.ts";
 import { runClaude, type ClaudeDeps } from "../src/commands/claude.ts";
 import { liveDialogIo, sessionLogPath } from "../src/claude_dialogs.ts";
+import { launchRecordPath, readLaunchRecord, writeLaunchRecord } from "../src/claude_launch.ts";
+import { seedOnboarding } from "../src/claude_onboarding.ts";
 
 const ROOT = mkdtempSync(resolve(tmpdir(), "suite-cli-dlg-e2e-"));
 const SOCKET_DIR = resolve(ROOT, "sock");
@@ -169,4 +171,52 @@ describe.if(HAVE_TMUX)("suite claude answers the pre-launch dialogs in its own s
     },
     45_000,
   );
+});
+
+describe.if(HAVE_TMUX)("an UNATTENDED launch (core task 01a10322 stage 7)", () => {
+  test(
+    "seeds hasCompletedOnboarding before Claude starts and records the launch as ready",
+    async () => {
+      const cwd = resolve(ROOT, "agent-unattended");
+      mkdirSync(cwd);
+      const keysLog = resolve(ROOT, "keys-unattended.log");
+      const ready = resolve(ROOT, "ready-unattended");
+      writeFakeClaude(keysLog, ready);
+      const session = sessionNameFromConfig(emptyConfig(), cwd);
+      sessions.add(session);
+      const errs: string[] = [];
+      const deps: ClaudeDeps = {
+        ...depsFor(cwd),
+        env: { ...ENV, SUITE_UNATTENDED: "1" },
+        err: (l) => void errs.push(l),
+        seedOnboarding,
+        writeLaunch: writeLaunchRecord,
+      };
+
+      await runClaude(deps, { userArgs: [], force: false });
+
+      expect(JSON.parse(readFileSync(resolve(HOME, ".claude.json"), "utf8")).hasCompletedOnboarding).toBe(true);
+      expect(errs.some((l) => l.startsWith("onboarding: set hasCompletedOnboarding"))).toBe(true);
+      const record = readLaunchRecord(launchRecordPath(HOME, session));
+      expect(record).toMatchObject({ version: 1, session, outcome: "ready", baseline: null });
+      expect(record?.answered).toEqual(["trust-folder", "trust-folder", "dev-channels", "dev-channels"]);
+    },
+    45_000,
+  );
+
+  test("POSITIVE CONTROL: without SUITE_UNATTENDED nothing is seeded", async () => {
+    const cwd = resolve(ROOT, "agent-attended");
+    mkdirSync(cwd);
+    writeFakeClaude(resolve(ROOT, "keys-attended.log"), resolve(ROOT, "ready-attended"));
+    const session = sessionNameFromConfig(emptyConfig(), cwd);
+    sessions.add(session);
+    rmSync(resolve(HOME, ".claude.json"), { force: true });
+    const seeded: string[] = [];
+    await runClaude(
+      { ...depsFor(cwd), seedOnboarding: (p) => (seeded.push(p), "seeded") },
+      { userArgs: [], force: false },
+    );
+    expect(seeded).toEqual([]);
+    expect(existsSync(resolve(HOME, ".claude.json"))).toBe(false);
+  }, 45_000);
 });

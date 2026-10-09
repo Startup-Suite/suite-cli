@@ -27,8 +27,9 @@
 import { chmodSync, mkdirSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { classifyPane, type DialogContext, type DialogName } from "./claude_dialogs.ts";
+import type { LaunchRecord } from "./claude_launch.ts";
 
-export type LoginStep = "login_method" | "login_url" | "api_key_confirm";
+export type LoginStep = "login_method" | "login_url" | "api_key_confirm" | "auth_error";
 
 export interface LoginScreen {
   step: LoginStep;
@@ -111,6 +112,72 @@ function apiKeyConfirm(lines: string[]): LoginScreen | null {
   return { step: "api_key_confirm" };
 }
 
+/* ------------------------------------------------------------------------- */
+/* A turn that failed for want of a working credential                        */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Claude Code 2.1.295's auth failures, as it prints them under the turn that
+ * failed (`  ⎿  <text>`). The first was MEASURED on moon with a well-formed
+ * invalid ANTHROPIC_API_KEY (fixtures claude-code-2.1.295-onboarding/
+ * invalid-key-turn.*): Claude reaches its input box (the key is not checked at
+ * launch) and the first turn prints it. The rest are the sibling constants
+ * next to it in the 2.1.295 binary; recognised word for word, never guessed.
+ */
+export const AUTH_ERRORS = [
+  "Invalid API key · Fix external API key",
+  "Invalid auth token · Fix external auth token",
+  "Not logged in · Please run /login",
+  "Authentication required · Sign in again to continue",
+  "OAuth token revoked · Please run /login",
+  "Login expired · Please run /login",
+] as const;
+
+export interface AuthError {
+  error: (typeof AUTH_ERRORS)[number];
+  /** The failed turn's lines (the line before, the error, the "✻ … done" line), trimmed, for the launch baseline. */
+  signature: string;
+}
+
+const RULE_LINE = /^─{10,}$/;
+const ERROR_LINE = /^⎿\s+(.+)$/;
+
+/**
+ * The auth error of the LAST turn above Claude's input box, or null. Only the
+ * last turn counts: once a later prompt (`❯ ` at column 0) or a reply (`●`)
+ * follows the error, it is history. Pure.
+ */
+export function authError(pane: string): AuthError | null {
+  const lines = pane.split("\n").map((l) => l.trimEnd());
+  // The input box: `❯` at column 0 between two rules. Search from the bottom.
+  let top = -1;
+  for (let i = lines.length - 2; i >= 1; i--) {
+    if (lines[i]!.startsWith("❯") && RULE_LINE.test(lines[i - 1]!.trim()) && RULE_LINE.test(lines[i + 1]!.trim())) {
+      top = i - 1;
+      break;
+    }
+  }
+  if (top === -1) return null;
+  for (let e = top - 1; e >= 0; e--) {
+    const line = lines[e]!;
+    if (line.startsWith("❯ ") || line.trim().startsWith("●")) return null;
+    const m = ERROR_LINE.exec(line.trim());
+    if (m === null) continue;
+    const error = AUTH_ERRORS.find((a) => a === m[1]!.trim());
+    if (error === undefined) return null;
+    let before = "";
+    for (let b = e - 1; b >= 0; b--) {
+      if (lines[b]!.trim() !== "") {
+        before = lines[b]!.trim();
+        break;
+      }
+    }
+    const done = lines.slice(e + 1, top).find((l) => l.trim().startsWith("✻"));
+    return { error, signature: [before, line.trim(), (done ?? "").trim()].join("\n") };
+  }
+  return null;
+}
+
 /** (captured pane) → the login screen it shows, or null. Pure. */
 export function classifyLogin(pane: string): LoginScreen | null {
   const lines = nonBlank(pane);
@@ -130,6 +197,12 @@ export type PaneState =
   | "needs_login"
   /** Something with a dialog footer this CLI does not know. Nobody answers it. */
   | "unknown_dialog"
+  /**
+   * The launch poll gave up (its record says `timeout`) and the pane is STILL
+   * not usable: no input box, no login screen, nothing this CLI will answer.
+   * Terminal until something changes; `reason` says what is on screen.
+   */
+  | "stuck"
   /** Still drawing, or a screen nothing here recognises. */
   | "starting"
   /** No such tmux session. */
@@ -145,11 +218,25 @@ export interface PaneStatus {
   title?: string;
   /** For `needs_login`. */
   login?: LoginScreen;
+  /** For `stuck`: what the pane shows instead of Claude's input box. */
+  reason?: string;
   observed_at: string;
 }
 
-/** (captured pane, or null when the session is gone) → status. Pure. */
-export function paneStatus(session: string, pane: string | null, ctx: DialogContext, now: Date): PaneStatus {
+/**
+ * (captured pane, or null when the session is gone) → status. Pure.
+ *
+ * `launch` is the session's launch record (claude_launch.ts), when there is
+ * one: it turns a lasting `starting` into `stuck` after the launch timed out,
+ * and holds the auth-error baseline.
+ */
+export function paneStatus(
+  session: string,
+  pane: string | null,
+  ctx: DialogContext,
+  now: Date,
+  launch: LaunchRecord | null = null,
+): PaneStatus {
   const base = { version: 1 as const, session, observed_at: now.toISOString() };
   if (pane === null) return { ...base, state: "gone" };
   const login = classifyLogin(pane);
@@ -159,15 +246,26 @@ export function paneStatus(session: string, pane: string | null, ctx: DialogCont
   // Any other login screen, or that confirmation for a different key, is.
   const ownKey = login?.step === "api_key_confirm" && step.kind === "answer" && step.dialog === "api-key-confirm";
   if (login !== null && !ownKey) return { ...base, state: "needs_login", login };
+  // A turn that failed for want of a working credential, unless it is the one
+  // that was already on screen when this launch's input box came up.
+  const auth = authError(pane);
+  if (auth !== null && auth.signature !== (launch?.baseline ?? null)) {
+    return { ...base, state: "needs_login", login: { step: "auth_error" } };
+  }
+  const timedOut = launch?.outcome === "timeout";
   switch (step.kind) {
     case "ready":
       return { ...base, state: "ready" };
     case "answer":
+      return { ...base, state: "dialog", dialog: step.dialog };
     case "hold":
+      if (timedOut) return { ...base, state: "stuck", dialog: step.dialog, reason: `${step.dialog}: ${step.reason}` };
       return { ...base, state: "dialog", dialog: step.dialog };
     case "unknown":
+      if (timedOut) return { ...base, state: "stuck", title: step.title, reason: `an unrecognised screen: ${step.title}` };
       return { ...base, state: "unknown_dialog", title: step.title };
     default:
+      if (timedOut) return { ...base, state: "stuck", reason: "Claude's input box did not appear" };
       return { ...base, state: "starting" };
   }
 }

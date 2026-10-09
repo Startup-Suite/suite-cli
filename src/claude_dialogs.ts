@@ -49,7 +49,14 @@ export const SUITE_CHANNEL = "server:suite-channel";
 /** What the cursor glyph looks like in Claude Code's select lists. */
 const CURSOR = "❯";
 
-export type DialogName = "trust-folder" | "dev-channels" | "bypass-permissions" | "mcp-server" | "theme" | "api-key-confirm";
+export type DialogName =
+  | "trust-folder"
+  | "dev-channels"
+  | "bypass-permissions"
+  | "mcp-server"
+  | "theme"
+  | "security-notes"
+  | "api-key-confirm";
 
 export interface DialogContext {
   /** The folder the agent was launched in. The trust dialog must name it. */
@@ -250,6 +257,8 @@ export function classifyPane(pane: string, ctx: DialogContext = {}): DialogStep 
 
   const theme = classifyThemePicker(lines);
   if (theme !== null) return theme;
+  const notes = classifySecurityNotes(lines);
+  if (notes !== null) return notes;
 
   const last = lines[lines.length - 1]!.trim();
   if (last !== DIALOG_FOOTER) return isReady(lines) ? { kind: "ready" } : { kind: "none" };
@@ -346,6 +355,42 @@ function classifyThemePicker(lines: string[]): DialogStep | null {
 }
 
 /* ------------------------------------------------------------------------- */
+/* The first-run security notes                                               */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * The last step of Claude Code 2.1.295's first-run onboarding, pushed with no
+ * condition after theme / api-key / oauth. An unattended launch never sees it,
+ * because `SUITE_UNATTENDED=1` seeds `hasCompletedOnboarding` first
+ * (claude_onboarding.ts). This is the FALLBACK for a Claude Code that shows it
+ * anyway (a seed that did not take, or a future CLI).
+ *
+ * It is a notice with one action, "Press Enter to continue…": no choice,
+ * nothing granted, nothing consented to beyond reading it. Answered with
+ * Enter, and only when the whole block is on screen word for word, in order,
+ * with the prompt as the LAST line (so an agent quoting it in a transcript is
+ * not it). Captured at 80 and 120 columns: Claude draws it 70 wide at both.
+ */
+export const SECURITY_NOTES_LINES = [
+  "Security notes:",
+  "1. Claude can make mistakes.",
+  "You're responsible for Claude's actions and should always",
+  "review them, especially when running code.",
+  "2. Due to prompt injection risks, only use it with code you trust",
+  "Learn more: https://code.claude.com/docs/en/security",
+  "Press Enter to continue…",
+] as const;
+
+function classifySecurityNotes(lines: string[]): DialogStep | null {
+  const block = lines.map((l) => l.trim()).filter((l) => l !== "");
+  const n = SECURITY_NOTES_LINES.length;
+  if (block.length < n) return null;
+  const tail = block.slice(-n);
+  for (let i = 0; i < n; i++) if (tail[i] !== SECURITY_NOTES_LINES[i]) return null;
+  return { kind: "answer", dialog: "security-notes", keys: ["Enter"] };
+}
+
+/* ------------------------------------------------------------------------- */
 /* Driving a real pane                                                        */
 /* ------------------------------------------------------------------------- */
 
@@ -402,6 +447,8 @@ export interface Answer {
 export interface AnswerResult {
   outcome: "ready" | "timeout" | "gone";
   answered: Answer[];
+  /** For `ready`: the frame on which the input box was seen. */
+  pane?: string;
 }
 
 /** tmux's exact-match target for a session's active pane. See rule 3. */
@@ -447,7 +494,7 @@ export async function answerLaunchDialogs(io: DialogIo, opts: AnswerOptions): Pr
     // --continue fallback relaunches Claude.
     if (lastSent !== null && cap.stdout !== lastSent.pane) lastSent = null;
     const step = classifyPane(cap.stdout, ctx);
-    if (step.kind === "ready") return { outcome: "ready", answered };
+    if (step.kind === "ready") return { outcome: "ready", answered, pane: cap.stdout };
 
     if (step.kind === "answer") {
       const fresh = lastSent === null || io.now() - lastSent.at >= DIALOG_RESEND_MS;

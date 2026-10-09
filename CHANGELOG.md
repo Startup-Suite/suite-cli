@@ -12,6 +12,24 @@ behaviour anyone was relying on.
 
 ## 0.8.0
 
+- **Unattended launches skip Claude Code's first-run onboarding.** With
+  `SUITE_UNATTENDED=1` (Suite's agent host sets it), `suite claude` sets
+  `hasCompletedOnboarding: true` in Claude's config (`~/.claude.json`, or
+  `$CLAUDE_CONFIG_DIR/.claude.json`) before creating the session, and writes
+  nothing else there. Read from the pinned 2.1.295 binary: that key alone
+  gates the Onboarding component, whose last step (the security notes) is
+  otherwise shown unconditionally. It logs nobody in.
+- **The 2.1.295 security notes are answered (Enter) as a fallback**, word for
+  word, for a CLI that shows them anyway.
+- **`stuck`:** `suite claude` writes a launch record
+  (`~/.local/state/suite/sessions/<session>.launch.json`, 0600). Once its
+  launch poll has timed out, a pane that is still not usable reads `stuck`
+  with a `reason`, not `starting` forever.
+- **A turn that failed on its credential reads `needs_login`** with
+  `login.step: "auth_error"` (2.1.295's "Invalid API key · Fix external API
+  key" and its siblings, measured / read from the binary). The failure
+  `--continue` re-renders from before this launch is the launch record's
+  baseline and does not count.
 - **`suite pane-status --session NAME [--answer]`: one look at an agent's
   Claude Code pane, as JSON**, for a supervisor with no terminal (Suite's
   agent host, which runs native agents as their own OS users). It prints one
