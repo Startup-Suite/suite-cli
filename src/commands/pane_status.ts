@@ -11,7 +11,9 @@
  * `--answer` additionally answers ONE known launch dialog (the same answers
  * `suite claude` and `suite watch` give, through `answerOnce`) before
  * reporting. It never answers a login screen: logging in is the person's,
- * through Anthropic's own flow.
+ * through Anthropic's own flow. The one confirmation it does answer is "use
+ * this ANTHROPIC_API_KEY?", and only for the key in this process's own
+ * environment (see `api-key-confirm` in claude_dialogs.ts).
  *
  * Exit status: 0 when the session exists, 1 when it is gone, 2 for bad usage.
  */
@@ -60,11 +62,13 @@ export async function runPaneStatus(deps: PaneStatusDeps, args: string[]): Promi
   }
   const session = parsed.session!;
   const home = deps.env.HOME ?? "";
-  if (parsed.answer) await answerOnce(deps.dialogs, { session, cwd: deps.cwd, home });
+  // The agent's own key, from its environment: compared, never printed.
+  const apiKey = deps.env.ANTHROPIC_API_KEY;
+  if (parsed.answer) await answerOnce(deps.dialogs, { session, cwd: deps.cwd, home, apiKey });
 
   const tmux = resolveTmux(deps.tmux.which);
   const cap = await deps.tmux.run(dialogCaptureArgv(session, tmux));
-  const status = paneStatus(session, cap.exitCode === 0 ? cap.stdout : null, { cwd: deps.cwd, home }, deps.now());
+  const status = paneStatus(session, cap.exitCode === 0 ? cap.stdout : null, { cwd: deps.cwd, home, apiKey }, deps.now());
   try {
     deps.write(sessionStatusPath(home, session), status);
   } catch (error) {

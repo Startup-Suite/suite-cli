@@ -136,7 +136,7 @@ describe("the status file", () => {
 });
 
 describe("suite pane-status", () => {
-  const harness = (pane: string | null) => {
+  const harness = (pane: string | null, env: Record<string, string> = { HOME: "/home/agent" }) => {
     const sent: string[][] = [];
     const out: string[] = [];
     const written: PaneStatus[] = [];
@@ -148,18 +148,20 @@ describe("suite pane-status", () => {
       return { exitCode: 0, stdout: "", stderr: "" };
     };
     const tmux = { run, which: () => "tmux" } as unknown as PaneStatusDeps["tmux"];
-    const dialogs: DialogIo = { tmux, now: () => 0, sleep: async () => {}, log: () => {} };
+    const logged: string[] = [];
+    const errs: string[] = [];
+    const dialogs: DialogIo = { tmux, now: () => 0, sleep: async () => {}, log: (_s, l) => void logged.push(l) };
     const deps: PaneStatusDeps = {
       tmux,
-      env: { HOME: "/home/agent" },
+      env,
       cwd: "/srv/agents/work",
       now: () => NOW,
       out: (l) => out.push(l),
-      err: () => {},
+      err: (l) => void errs.push(l),
       write: (_p, s) => void written.push(s),
       dialogs,
     };
-    return { deps, sent, out, written };
+    return { deps, sent, out, written, logged, errs };
   };
 
   test("--session is required", () => {
@@ -192,5 +194,110 @@ describe("suite pane-status", () => {
     const h = harness(null);
     expect(await runPaneStatus(h.deps, ["--session", "suite-agent"])).toBe(1);
     expect(JSON.parse(h.out[0]!).state).toBe("gone");
+  });
+});
+
+/*
+ * The API-key confirmation (core task 01a10322 stage 6). A Suite native agent
+ * gets ANTHROPIC_API_KEY in its environment only because a person who manages
+ * it saved that key in Suite, so the CLI says "Yes" for them, and only for
+ * THAT key. The fixture's key is shown as `sk-ant-...` plus 20 `A`s.
+ */
+describe("api-key-confirm: answered only for the agent's own key", () => {
+  const OWN = `sk-ant-api03-${"x".repeat(60)}${"A".repeat(20)}`;
+  const OTHER = `sk-ant-api03-${"x".repeat(60)}${"B".repeat(20)}`;
+  const onYes = (): string =>
+    fixture("api-key-confirm.120").replace("    Yes", "  ❯ Yes").replace("  ❯ No (recommended)", "    No (recommended)");
+
+  test("cursor on No, own key → Up", () => {
+    expect(classifyPane(fixture("api-key-confirm.120"), { ...CTX, apiKey: OWN })).toEqual({
+      kind: "answer",
+      dialog: "api-key-confirm",
+      keys: ["Up"],
+    });
+  });
+
+  test("cursor on Yes, own key → Enter", () => {
+    expect(classifyPane(onYes(), { ...CTX, apiKey: OWN })).toEqual({ kind: "answer", dialog: "api-key-confirm", keys: ["Enter"] });
+  });
+
+  test("a different key is held, not answered", () => {
+    expect(classifyPane(fixture("api-key-confirm.120"), { ...CTX, apiKey: OTHER }).kind).toBe("hold");
+  });
+
+  test("no key in the environment is held, not answered", () => {
+    expect(classifyPane(fixture("api-key-confirm.120"), CTX).kind).toBe("hold");
+  });
+
+  test("a key that is not an Anthropic key is never matched", () => {
+    expect(classifyPane(fixture("api-key-confirm.120"), { ...CTX, apiKey: `sk-proj-${"A".repeat(40)}` }).kind).toBe("hold");
+  });
+
+  test("status: own key reads as a dialog; without it, needs_login", () => {
+    expect(paneStatus("s", fixture("api-key-confirm.120"), { ...CTX, apiKey: OWN }, NOW)).toMatchObject({
+      state: "dialog",
+      dialog: "api-key-confirm",
+    });
+    expect(paneStatus("s", fixture("api-key-confirm.120"), CTX, NOW)).toMatchObject({
+      state: "needs_login",
+      login: { step: "api_key_confirm" },
+    });
+  });
+
+  test("the subscription login screens stay unanswered even with a key set", () => {
+    for (const name of ["login-method.120", "login-url.120", "login-url.80"]) {
+      expect(classifyPane(fixture(name), { ...CTX, apiKey: OWN }).kind).not.toBe("answer");
+      expect(paneStatus("s", fixture(name), { ...CTX, apiKey: OWN }, NOW).state).toBe("needs_login");
+    }
+  });
+});
+
+describe("suite pane-status --answer with ANTHROPIC_API_KEY", () => {
+  const OWN = `sk-ant-api03-${"x".repeat(60)}${"A".repeat(20)}`;
+  const harness = (pane: string, env: Record<string, string>) => {
+    const sent: string[][] = [];
+    const out: string[] = [];
+    const errs: string[] = [];
+    const logged: string[] = [];
+    const written: PaneStatus[] = [];
+    const run = async (argv: string[]): Promise<RunResult> => {
+      sent.push(argv);
+      return argv[1] === "capture-pane" ? { exitCode: 0, stdout: pane, stderr: "" } : { exitCode: 0, stdout: "", stderr: "" };
+    };
+    const tmux = { run, which: () => "tmux" } as unknown as PaneStatusDeps["tmux"];
+    const deps: PaneStatusDeps = {
+      tmux,
+      env,
+      cwd: "/srv/agents/work",
+      now: () => NOW,
+      out: (l) => void out.push(l),
+      err: (l) => void errs.push(l),
+      write: (_p, s) => void written.push(s),
+      dialogs: { tmux, now: () => 0, sleep: async () => {}, log: (_s, l) => void logged.push(l) },
+    };
+    return { deps, sent, out, errs, logged, written };
+  };
+
+  test("sends Up for the agent's own key", async () => {
+    const h = harness(fixture("api-key-confirm.120"), { HOME: "/home/agent", ANTHROPIC_API_KEY: OWN });
+    await runPaneStatus(h.deps, ["--session", "suite-agent", "--answer"]);
+    expect(h.sent).toContainEqual(["tmux", "send-keys", "-t", "=suite-agent:", "Up"]);
+  });
+
+  test("the API key is never logged, printed, written or put in argv", async () => {
+    const h = harness(fixture("api-key-confirm.120"), { HOME: "/home/agent", ANTHROPIC_API_KEY: OWN });
+    await runPaneStatus(h.deps, ["--session", "suite-agent", "--answer"]);
+    const everything = [
+      ...h.out,
+      ...h.errs,
+      ...h.logged,
+      ...h.written.map((w) => JSON.stringify(w)),
+      ...h.sent.map((a) => a.join(" ")),
+    ].join("\n");
+    expect(everything).not.toContain(OWN);
+    expect(everything).not.toContain(OWN.slice(-20));
+    expect(everything).not.toContain("sk-ant-");
+    // Positive control: the harness does see what was sent.
+    expect(everything).toContain("send-keys");
   });
 });

@@ -153,8 +153,12 @@ export function paneStatus(session: string, pane: string | null, ctx: DialogCont
   const base = { version: 1 as const, session, observed_at: now.toISOString() };
   if (pane === null) return { ...base, state: "gone" };
   const login = classifyLogin(pane);
-  if (login !== null) return { ...base, state: "needs_login", login };
   const step = classifyPane(pane, ctx);
+  // The API-key confirmation for the key this agent was launched with is a
+  // dialog the CLI answers (claude_dialogs.ts), not a login a person owes.
+  // Any other login screen, or that confirmation for a different key, is.
+  const ownKey = login?.step === "api_key_confirm" && step.kind === "answer" && step.dialog === "api-key-confirm";
+  if (login !== null && !ownKey) return { ...base, state: "needs_login", login };
   switch (step.kind) {
     case "ready":
       return { ...base, state: "ready" };

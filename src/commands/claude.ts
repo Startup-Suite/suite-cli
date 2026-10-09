@@ -808,7 +808,12 @@ export async function runClaude(deps: ClaudeDeps, options: ClaudeOptions): Promi
   let answering: Promise<AnswerResult> | null = null;
   let answeringDone = false;
   if (plan.create !== undefined && deps.dialogs !== undefined) {
-    answering = answerLaunchDialogs(deps.dialogs, { session, cwd: deps.cwd, home: deps.env.HOME }).finally(() => {
+    answering = answerLaunchDialogs(deps.dialogs, {
+      session,
+      cwd: deps.cwd,
+      home: deps.env.HOME,
+      apiKey: deps.env.ANTHROPIC_API_KEY,
+    }).finally(() => {
       answeringDone = true;
     });
   }

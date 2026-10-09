@@ -27,6 +27,17 @@ behaviour anyone was relying on.
   login method, never types into a login screen, and never reads, stores or
   relays a credential or a login code: logging in is Anthropic's flow,
   completed by the person.
+- **The API-key confirmation is answered for the agent's own key only.**
+  When Claude Code asks "Do you want to use this API key?" about an
+  `ANTHROPIC_API_KEY` whose masked form (`sk-ant-...` plus the last 20
+  characters) is the key in this process's own environment, `--answer` (and
+  `suite claude`'s launch poll) moves to "Yes" and confirms; the status then
+  reads `dialog` / `api-key-confirm`, not `needs_login`. For a different key,
+  or no key, it is held and reported as before. On a Suite native agent that
+  key is in the environment because a person who manages the agent saved it
+  in Suite, so this carries out their choice. The key is only compared: never
+  logged, printed, written to the status file or put in an argv. The
+  subscription login screens are still never answered.
 - **The first-run theme picker is answered** (Enter, keeping the highlighted
   default), by the same word-for-word rule as the launch dialogs. Choosing a
   colour scheme grants nothing, and without an answer an agent nobody can

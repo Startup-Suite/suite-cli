@@ -49,13 +49,30 @@ export const SUITE_CHANNEL = "server:suite-channel";
 /** What the cursor glyph looks like in Claude Code's select lists. */
 const CURSOR = "❯";
 
-export type DialogName = "trust-folder" | "dev-channels" | "bypass-permissions" | "mcp-server" | "theme";
+export type DialogName = "trust-folder" | "dev-channels" | "bypass-permissions" | "mcp-server" | "theme" | "api-key-confirm";
 
 export interface DialogContext {
   /** The folder the agent was launched in. The trust dialog must name it. */
   cwd?: string;
   /** `$HOME`, so a `~/…` rendering of the folder also matches. */
   home?: string;
+  /**
+   * The `ANTHROPIC_API_KEY` this agent was launched with, if any. The API-key
+   * confirmation is answered only when the key it shows is this one. Never
+   * logged, never written anywhere: it is only compared.
+   */
+  apiKey?: string;
+}
+
+/**
+ * How Claude Code 2.1.295 shows an `ANTHROPIC_API_KEY` in its confirmation:
+ * `sk-ant-...` and the key's last 20 characters (measured on moon with a fake
+ * key, 2026-10-09). Null for anything that is not an Anthropic key, so a
+ * screen naming some other key is never answered.
+ */
+export function maskedApiKey(key: string | undefined): string | null {
+  if (key === undefined || !key.startsWith("sk-ant-") || key.length < 28 || /\s/.test(key)) return null;
+  return `sk-ant-...${key.slice(-20)}`;
 }
 
 interface DialogSpec {
@@ -108,6 +125,16 @@ function folderMatches(shown: string, ctx: DialogContext): boolean {
  *    this dialog, and with `--dangerously-skip-permissions` 2.1.288 did not
  *    show it at all — it is here so a project `.mcp.json` cannot park an
  *    agent.)
+ *  - api-key-confirm: Claude Code asks whether to use the `ANTHROPIC_API_KEY`
+ *    it found in its environment, and the cursor starts on "No (recommended)".
+ *    Up moves it to "Yes"; Enter confirms only once it is there. Answered ONLY
+ *    when the key it shows is the one this agent was launched with
+ *    (`DialogContext.apiKey`): on a Suite native agent that key reached the
+ *    environment because a person who manages the agent saved it in Suite for
+ *    exactly this, so "Yes" carries out their choice rather than making one.
+ *    It is an API key, not a Claude account login: nothing here ever touches
+ *    the subscription login screens, which stay the person's, in Anthropic's
+ *    own flow.
  */
 export const DIALOGS: readonly DialogSpec[] = [
   {
@@ -153,6 +180,18 @@ export const DIALOGS: readonly DialogSpec[] = [
     options: ["Use this MCP server", "Use this and all future MCP servers in this project", "Continue without using this MCP server"],
     check: (f) => /^\S+$/.test(f.server ?? ""),
     keys: (cursor) => (cursor === "Continue without using this MCP server" ? ["Enter"] : null),
+  },
+  {
+    name: "api-key-confirm",
+    template:
+      "Detected a custom API key in your environment ANTHROPIC_API_KEY: {masked} " +
+      `Do you want to use this API key? Yes No (recommended) ${DIALOG_FOOTER}`,
+    options: ["Yes", "No (recommended)"],
+    check: (f, ctx) => {
+      const want = maskedApiKey(ctx.apiKey);
+      return want !== null && f.masked === want;
+    },
+    keys: (cursor) => (cursor === "No (recommended)" ? ["Up"] : ["Enter"]),
   },
 ];
 
@@ -349,6 +388,8 @@ export interface AnswerOptions {
   session: string;
   cwd: string;
   home?: string;
+  /** See `DialogContext.apiKey`. */
+  apiKey?: string;
   windowMs?: number;
   pollMs?: number;
 }
@@ -388,7 +429,7 @@ export async function answerLaunchDialogs(io: DialogIo, opts: AnswerOptions): Pr
   const tmux = resolveTmux(io.tmux.which);
   const windowMs = opts.windowMs ?? DIALOG_WINDOW_MS;
   const pollMs = opts.pollMs ?? DIALOG_POLL_MS;
-  const ctx: DialogContext = { cwd: opts.cwd, home: opts.home };
+  const ctx: DialogContext = { cwd: opts.cwd, home: opts.home, apiKey: opts.apiKey };
   const deadline = io.now() + windowMs;
   const answered: Answer[] = [];
   let lastSent: { pane: string; at: number } | null = null;
@@ -444,7 +485,7 @@ export async function answerOnce(io: DialogIo, opts: AnswerOptions): Promise<Ans
   const tmux = resolveTmux(io.tmux.which);
   const cap = await io.tmux.run(dialogCaptureArgv(opts.session, tmux));
   if (cap.exitCode !== 0) return null;
-  const step = classifyPane(cap.stdout, { cwd: opts.cwd, home: opts.home });
+  const step = classifyPane(cap.stdout, { cwd: opts.cwd, home: opts.home, apiKey: opts.apiKey });
   if (step.kind !== "answer") return null;
   await io.tmux.run(dialogKeysArgv(opts.session, step.keys, tmux));
   io.log(opts.session, `launch dialogs: answered ${step.dialog} with ${step.keys.join(" ")} (watchdog)`);
